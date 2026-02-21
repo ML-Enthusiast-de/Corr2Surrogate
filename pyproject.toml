@@ -1,0 +1,17 @@
+[project]
+name = "corr2surrogate"
+version = "0.1.0"
+description = "Local-first agentic framework from real-world data to surrogate models"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.25",
+  "pandas>=2.0",
+  "openpyxl>=3.1",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]

@@ -179,3 +179,12 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Corr2Surrogate local private data
+data/private/
+
+# Corr2Surrogate generated outputs (can contain derived sensitive info)
+artifacts/*
+!artifacts/.gitkeep
+reports/*
+!reports/.gitkeep

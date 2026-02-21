@@ -1,0 +1,38 @@
+project:
+  name: corr2surrogate
+
+privacy:
+  local_only: true
+
+data:
+  private_dir: data/private
+  allowed_extensions:
+    - .csv
+    - .xlsx
+    - .xls
+
+ingestion:
+  infer_header: true
+  header_confidence_threshold: 0.7
+  prompt_on_uncertain_header: true
+  prompt_on_multi_sheet: true
+
+preprocessing:
+  normalization:
+    enabled: optional
+    method: minmax
+    feature_range:
+      - 0.0
+      - 1.0
+    normalize_target: true
+    persist_state: true
+    inverse_target_on_inference: true
+
+modeling:
+  optimizer: optuna
+  save_best_params: true
+  persist_artifacts: true
+
+agent_behavior:
+  always_inform_user: true
+  ask_when_ambiguous: true
