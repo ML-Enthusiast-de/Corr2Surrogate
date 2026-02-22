@@ -1,10 +1,7 @@
-"""Agent modules."""
+"""Agent modules.
 
-from .agent1_analyst import build_ingestion_status_message
-from .agent2_modeler import build_artifact_saved_message, build_training_plan_message
+Keep this package init lightweight to avoid circular imports between
+orchestration and agent helper modules.
+"""
 
-__all__ = [
-    "build_artifact_saved_message",
-    "build_ingestion_status_message",
-    "build_training_plan_message",
-]
+__all__: list[str] = []

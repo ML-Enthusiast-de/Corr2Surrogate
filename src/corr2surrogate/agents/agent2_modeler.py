@@ -1,6 +1,8 @@
-"""Agent 2 helpers for training/inference status communication."""
+"""Agent 2 helpers for training, iteration, and inference communication."""
 
 from __future__ import annotations
+
+from corr2surrogate.orchestration.workflow import LoopEvaluation
 
 
 def build_training_plan_message(
@@ -27,3 +29,13 @@ def build_artifact_saved_message(
     if normalization_path is not None:
         parts.append(f"Saved normalization state to `{normalization_path}`.")
     return " ".join(parts)
+
+
+def build_loop_feedback_message(loop_eval: LoopEvaluation) -> str:
+    """Create a user-facing update after each optimization iteration."""
+    unmet = ", ".join(loop_eval.unmet_criteria) if loop_eval.unmet_criteria else "none"
+    guidance = " ".join(loop_eval.recommendations)
+    return (
+        f"Iteration {loop_eval.attempt}/{loop_eval.max_attempts}: {loop_eval.summary} "
+        f"Unmet criteria: {unmet}. {guidance}"
+    )

@@ -1,7 +1,8 @@
-"""Agent 1 helpers for user-facing ingestion/science communication."""
+"""Agent 1 helpers for user-facing ingestion and analysis communication."""
 
 from __future__ import annotations
 
+from corr2surrogate.analytics.ranking import ForcedModelingDirective, RankedSignal
 from corr2surrogate.ingestion import IngestionResult
 
 
@@ -20,3 +21,26 @@ def build_ingestion_status_message(result: IngestionResult) -> str:
             "I am not fully confident about the header/data start. Please confirm or provide row indices."
         )
     return "\n".join(lines)
+
+
+def build_forced_request_message(directive: ForcedModelingDirective) -> str:
+    """Explain that a user-defined signal pair/modeling request will be honored."""
+    predictors = ", ".join(directive.predictor_signals)
+    reason = f" Reason: {directive.user_reason}" if directive.user_reason else ""
+    return (
+        f"Forced modeling request acknowledged: target `{directive.target_signal}` "
+        f"will be modeled using `{predictors}` regardless of correlation strength.{reason}"
+    )
+
+
+def build_dependency_risk_message(ranked_signal: RankedSignal) -> str:
+    """Explain dependency risks in candidate ranking."""
+    if ranked_signal.feasible:
+        return (
+            f"`{ranked_signal.target_signal}` is feasible with adjusted score "
+            f"{ranked_signal.adjusted_score:.3f}. {ranked_signal.rationale}"
+        )
+    return (
+        f"`{ranked_signal.target_signal}` is currently infeasible: {ranked_signal.rationale} "
+        "Consider keeping some required inputs physical."
+    )

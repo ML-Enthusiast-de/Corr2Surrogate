@@ -28,10 +28,26 @@ preprocessing:
     persist_state: true
     inverse_target_on_inference: true
 
+system_knowledge:
+  critical_signals: []
+  physically_required_signals: []
+  non_virtualizable_signals: []
+  notes: ""
+
 modeling:
   optimizer: optuna
   save_best_params: true
   persist_artifacts: true
+  forced_requests_allowed: true
+  dependency_aware_ranking: true
+  require_physical_dependency_for_virtual_signal: true
+  agentic_loops:
+    enabled: true
+    max_attempts: 3
+    min_relative_improvement: 0.02
+    allow_architecture_switch: true
+    allow_feature_set_expansion: true
+    suggest_more_data_when_stalled: true
 
 agent_behavior:
   always_inform_user: true
