@@ -188,3 +188,19 @@ artifacts/*
 !artifacts/.gitkeep
 reports/*
 !reports/.gitkeep
+
+# OS/editor local files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+
+# Local secret material
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+secrets/

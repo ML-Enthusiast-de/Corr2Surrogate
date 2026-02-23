@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "corr2surrogate"
 version = "0.1.0"
@@ -11,7 +15,20 @@ dependencies = [
   "pyyaml>=6.0",
 ]
 
+[project.scripts]
+corr2surrogate = "corr2surrogate.ui.cli:main"
+c2s-guard = "corr2surrogate.security.git_guard:main"
+
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
 ]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"corr2surrogate.agents.prompts" = ["*.txt"]

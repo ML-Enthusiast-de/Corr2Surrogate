@@ -3,6 +3,8 @@ project:
 
 privacy:
   local_only: true
+  api_calls_allowed: false
+  telemetry_allowed: false
 
 data:
   private_dir: data/private
@@ -52,3 +54,33 @@ modeling:
 agent_behavior:
   always_inform_user: true
   ask_when_ambiguous: true
+
+prompts:
+  analyst_system_path: ""
+  modeler_system_path: ""
+  extra_instructions: ""
+
+runtime:
+  provider: ollama
+  require_local_models: true
+  block_remote_endpoints: true
+  offline_mode: true
+  temperature: 0.0
+  timeout_seconds: 120
+  endpoints:
+    ollama: http://127.0.0.1:11434/api/chat
+    llama_cpp: http://127.0.0.1:8000/v1/chat/completions
+  profiles:
+    small_cpu:
+      model: qwen2.5:3b-instruct-q4_K_M
+      cpu_only: true
+      n_gpu_layers: 0
+      max_context: 4096
+    balanced:
+      model: qwen2.5:7b-instruct-q4_K_M
+      cpu_only: false
+      n_gpu_layers: auto
+      max_context: 8192
+  default_profile: small_cpu
+  fallback_order:
+    - small_cpu
