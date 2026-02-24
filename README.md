@@ -12,6 +12,13 @@ Local-first, privacy-preserving framework that converts real-world sensor data i
 - Header/data-start inference with user confirmation on low confidence
 - Optional Min-Max normalization with saved state for inference de-normalization
 - Saved optimization outputs (`model_params.json`) and normalization state
+- Model savepoints/checkpoints:
+  - Load an existing trained model
+  - Add additional data and retrain from checkpoint
+  - Create child checkpoints for traceable model evolution
+- Post-test diagnostics:
+  - Detect where model performs poorly
+  - Suggest concrete new lab/testbench data trajectories to improve coverage
 - User-forced modeling directives:
   - Model target signal `A` with user-defined predictors `[B, C, ...]`
   - Run even if correlation ranking is weak

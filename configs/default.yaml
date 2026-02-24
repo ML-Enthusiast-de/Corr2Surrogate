@@ -40,9 +40,18 @@ modeling:
   optimizer: optuna
   save_best_params: true
   persist_artifacts: true
+  checkpoints:
+    enabled: true
+    dir: artifacts/checkpoints
+    auto_save_after_training: true
+    allow_resume_retraining: true
   forced_requests_allowed: true
   dependency_aware_ranking: true
   require_physical_dependency_for_virtual_signal: true
+  post_test_feedback:
+    enabled: true
+    top_k_regions: 3
+    trajectory_budget: 3
   agentic_loops:
     enabled: true
     max_attempts: 3

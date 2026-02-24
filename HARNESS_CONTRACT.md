@@ -69,8 +69,10 @@ Example minimal tool set:
 - `compute_correlations`
 - `rank_surrogate_candidates`
 - `build_modeling_directives`
-- `train_candidate_model`
-- `evaluate_candidate_model`
+- `train_incremental_linear_surrogate`
+- `resume_incremental_linear_surrogate`
+- `list_model_checkpoints`
+- `analyze_model_checkpoint_performance`
 - `save_artifacts`
 
 ## 5. Orchestration Loop Contract
@@ -96,7 +98,9 @@ Agent 1 (`Analyst`) terminal outputs:
 Agent 2 (`Modeler`) terminal outputs:
 - selected model strategy,
 - loop evaluation status,
-- artifact paths + recommendations if quality unmet.
+- artifact paths + recommendations if quality unmet,
+- savepoint/checkpoint ids for resume-retraining,
+- post-test bad-region diagnostics + suggested lab trajectories.
 
 ## 7. Handoff Schema Requirements
 The Agent 1 to Agent 2 handoff must include:
@@ -135,6 +139,8 @@ Recommended next files:
 - `src/corr2surrogate/orchestration/tool_registry.py`
 - `src/corr2surrogate/orchestration/agent_loop.py`
 - `src/corr2surrogate/orchestration/runtime_policy.py`
+- `src/corr2surrogate/orchestration/default_tools.py`
+- `src/corr2surrogate/orchestration/harness_runner.py`
 
 ## 10. LangChain Decision
 Recommendation: do not use LangChain for MVP.

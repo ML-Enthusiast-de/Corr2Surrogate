@@ -39,3 +39,14 @@ def build_loop_feedback_message(loop_eval: LoopEvaluation) -> str:
         f"Iteration {loop_eval.attempt}/{loop_eval.max_attempts}: {loop_eval.summary} "
         f"Unmet criteria: {unmet}. {guidance}"
     )
+
+
+def build_post_test_feedback_message(feedback: dict) -> str:
+    """Summarize post-test diagnostics and new data trajectory suggestions."""
+    payload = feedback.get("feedback", feedback)
+    summary = str(payload.get("summary", "No summary available."))
+    suggestions = payload.get("trajectory_suggestions", [])
+    if not suggestions:
+        return f"{summary} No additional trajectory recommendations were generated."
+    top_titles = ", ".join(str(item.get("title", "trajectory")) for item in suggestions[:3])
+    return f"{summary} Suggested next data trajectories: {top_titles}."

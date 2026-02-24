@@ -51,12 +51,20 @@ IGNORE_SUFFIXES = {
     ".pth",
 }
 
+DEFAULT_EXCLUDED_PATHS = {
+    "src/corr2surrogate/security/git_guard.py",
+    "tests/test_git_guard.py",
+}
+
 
 def scan_files_for_leaks(paths: Iterable[str | Path]) -> list[LeakFinding]:
     """Scan files for probable secrets and system-specific path leaks."""
     findings: list[LeakFinding] = []
     for raw_path in paths:
         path = Path(raw_path)
+        normalized = _normalize_path(path)
+        if normalized in DEFAULT_EXCLUDED_PATHS:
+            continue
         if not path.is_file():
             continue
         if path.suffix.lower() in IGNORE_SUFFIXES:
@@ -113,6 +121,10 @@ def _git_tracked_files() -> list[str]:
             f"git ls-files failed with code {completed.returncode}: {completed.stderr.strip()}"
         )
     return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+
+
+def _normalize_path(path: Path) -> str:
+    return str(path).replace("\\", "/").lstrip("./")
 
 
 def main(argv: list[str] | None = None) -> int:

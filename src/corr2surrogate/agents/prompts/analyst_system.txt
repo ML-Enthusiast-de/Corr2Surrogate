@@ -17,3 +17,4 @@ Scientific behavior:
 - Correlation findings are evidence, not causality.
 - Respect system knowledge constraints (critical/non-virtualizable signals).
 - Support user-forced target/predictor requests even when correlation is weak.
+- If user asks to reuse an existing model, route to checkpoint listing/loading and retraining flow.

@@ -4,6 +4,7 @@ Primary responsibilities:
 - Build and evaluate surrogate models using deterministic tools.
 - Respect acceptance criteria, split safety, and normalization policy.
 - Save artifacts for reproducibility (params, metrics, scaler state).
+- Maintain savepoints/checkpoints and support load+retrain with additional data.
 - Keep user informed about progress and model quality.
 
 Tool behavior:
@@ -16,3 +17,4 @@ Tool behavior:
 Iteration behavior:
 - If criteria are unmet and attempts remain, continue loop with concrete next action.
 - If stalled, recommend: more data, architecture change, or feature redesign.
+- After test evaluation, analyze where error is high and propose concrete lab/testbench data trajectories.

@@ -3,7 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
+
+from corr2surrogate.analytics.ranking import ForcedModelingDirective, RankedSignal
+from corr2surrogate.ingestion import load_tabular_data
+from corr2surrogate.modeling.baselines import IncrementalLinearSurrogate
+from corr2surrogate.modeling.checkpoints import ModelCheckpointStore
+from corr2surrogate.modeling.performance_feedback import analyze_model_performance
+from corr2surrogate.persistence.artifact_store import ArtifactStore
 
 from .tool_registry import ToolRegistry
 from .workflow import (
@@ -79,6 +87,90 @@ def build_default_registry() -> ToolRegistry:
         risk_level="low",
     )
 
+    registry.register_function(
+        name="train_incremental_linear_surrogate",
+        description=(
+            "Train a baseline surrogate, create a savepoint, and persist model metadata."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "data_path": {"type": "string"},
+                "target_column": {"type": "string"},
+                "feature_columns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "sheet_name": {"type": "string"},
+                "run_id": {"type": "string"},
+                "checkpoint_tag": {"type": "string"},
+            },
+            "required": ["data_path", "target_column", "feature_columns"],
+            "additionalProperties": False,
+        },
+        handler=_tool_train_incremental_linear_surrogate,
+        risk_level="low",
+    )
+
+    registry.register_function(
+        name="resume_incremental_linear_surrogate",
+        description=(
+            "Load a savepoint, add new data, retrain model statistics, and create child savepoint."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "checkpoint_id": {"type": "string"},
+                "additional_data_path": {"type": "string"},
+                "sheet_name": {"type": "string"},
+                "run_id": {"type": "string"},
+                "note": {"type": "string"},
+            },
+            "required": ["checkpoint_id", "additional_data_path"],
+            "additionalProperties": False,
+        },
+        handler=_tool_resume_incremental_linear_surrogate,
+        risk_level="low",
+    )
+
+    registry.register_function(
+        name="list_model_checkpoints",
+        description="List available model savepoints/checkpoints.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "model_name": {"type": "string"},
+                "target_column": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+        handler=_tool_list_model_checkpoints,
+        risk_level="low",
+    )
+
+    registry.register_function(
+        name="analyze_model_checkpoint_performance",
+        description=(
+            "Evaluate checkpoint performance on provided data and suggest new lab trajectories."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "checkpoint_id": {"type": "string"},
+                "data_path": {"type": "string"},
+                "sheet_name": {"type": "string"},
+                "top_k_regions": {"type": "integer"},
+                "trajectory_budget": {"type": "integer"},
+            },
+            "required": ["checkpoint_id", "data_path"],
+            "additionalProperties": False,
+        },
+        handler=_tool_analyze_model_checkpoint_performance,
+        risk_level="low",
+    )
+
     return registry
 
 
@@ -128,9 +220,173 @@ def _tool_build_modeling_directives(
     ranked_signals: list[dict[str, Any]],
     forced_requests: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    from corr2surrogate.analytics.ranking import ForcedModelingDirective, RankedSignal
-
     ranked = [RankedSignal(**item) for item in ranked_signals]
     forced = [ForcedModelingDirective(**item) for item in (forced_requests or [])]
     directives = build_modeling_directives(ranked_signals=ranked, forced_requests=forced)
     return {"directives": [asdict(item) for item in directives]}
+
+
+def _tool_train_incremental_linear_surrogate(
+    *,
+    data_path: str,
+    target_column: str,
+    feature_columns: list[str],
+    sheet_name: str | None = None,
+    run_id: str | None = None,
+    checkpoint_tag: str | None = None,
+) -> dict[str, Any]:
+    frame = _load_frame(data_path=data_path, sheet_name=sheet_name)
+    model = IncrementalLinearSurrogate(
+        feature_columns=feature_columns,
+        target_column=target_column,
+    )
+    rows_used = model.fit_dataframe(frame)
+    metrics = model.evaluate_dataframe(frame)
+
+    artifact_store = ArtifactStore()
+    run_dir = artifact_store.create_run_dir(run_id=run_id)
+    model_state_path = model.save(Path(run_dir) / "model_state.json")
+    params_path = artifact_store.save_model_params(
+        run_dir=run_dir,
+        model_name="incremental_linear_surrogate",
+        best_params={"ridge": model.ridge, "training_rows_used": rows_used},
+        metrics=metrics,
+        feature_columns=feature_columns,
+        target_column=target_column,
+        split_strategy="full_dataset_baseline",
+        extra={"data_path": data_path},
+    )
+
+    checkpoint_store = ModelCheckpointStore()
+    checkpoint = checkpoint_store.create_checkpoint(
+        model_name="incremental_linear_surrogate",
+        run_dir=run_dir,
+        model_state_path=model_state_path,
+        target_column=target_column,
+        feature_columns=feature_columns,
+        metrics=metrics,
+        data_references=[data_path],
+        notes=checkpoint_tag or "",
+        tags=[checkpoint_tag] if checkpoint_tag else [],
+    )
+    return {
+        "status": "ok",
+        "checkpoint_id": checkpoint.checkpoint_id,
+        "run_dir": str(run_dir),
+        "model_state_path": str(model_state_path),
+        "model_params_path": str(params_path),
+        "metrics": metrics,
+        "rows_used": rows_used,
+    }
+
+
+def _tool_resume_incremental_linear_surrogate(
+    *,
+    checkpoint_id: str,
+    additional_data_path: str,
+    sheet_name: str | None = None,
+    run_id: str | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    checkpoint_store = ModelCheckpointStore()
+    parent = checkpoint_store.load_checkpoint(checkpoint_id)
+    model = IncrementalLinearSurrogate.load(parent.model_state_path)
+
+    frame = _load_frame(data_path=additional_data_path, sheet_name=sheet_name)
+    rows_added = model.update_from_dataframe(frame)
+    metrics_new_data = model.evaluate_dataframe(frame)
+
+    artifact_store = ArtifactStore()
+    run_dir = artifact_store.create_run_dir(run_id=run_id)
+    model_state_path = model.save(Path(run_dir) / "model_state.json")
+    params_path = artifact_store.save_model_params(
+        run_dir=run_dir,
+        model_name=parent.model_name,
+        best_params={
+            "ridge": model.ridge,
+            "parent_checkpoint_id": parent.checkpoint_id,
+            "rows_added": rows_added,
+        },
+        metrics=metrics_new_data,
+        feature_columns=parent.feature_columns,
+        target_column=parent.target_column,
+        split_strategy="incremental_retrain",
+        extra={"additional_data_path": additional_data_path},
+    )
+
+    child = checkpoint_store.create_checkpoint(
+        model_name=parent.model_name,
+        run_dir=run_dir,
+        model_state_path=model_state_path,
+        target_column=parent.target_column,
+        feature_columns=parent.feature_columns,
+        metrics=metrics_new_data,
+        parent_checkpoint_id=parent.checkpoint_id,
+        data_references=parent.data_references + [additional_data_path],
+        notes=note or "",
+        tags=["retrain"],
+    )
+
+    plan = checkpoint_store.build_retrain_plan(
+        checkpoint_id=parent.checkpoint_id,
+        additional_data_references=[additional_data_path],
+        notes=note or "",
+    )
+    return {
+        "status": "ok",
+        "parent_checkpoint_id": parent.checkpoint_id,
+        "new_checkpoint_id": child.checkpoint_id,
+        "run_dir": str(run_dir),
+        "model_state_path": str(model_state_path),
+        "model_params_path": str(params_path),
+        "rows_added": rows_added,
+        "metrics_on_additional_data": metrics_new_data,
+        "retrain_plan": plan.to_dict(),
+    }
+
+
+def _tool_list_model_checkpoints(
+    *,
+    model_name: str | None = None,
+    target_column: str | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    checkpoint_store = ModelCheckpointStore()
+    items = checkpoint_store.list_checkpoints(
+        model_name=model_name,
+        target_column=target_column,
+        limit=limit,
+    )
+    return {"checkpoints": [item.to_dict() for item in items]}
+
+
+def _tool_analyze_model_checkpoint_performance(
+    *,
+    checkpoint_id: str,
+    data_path: str,
+    sheet_name: str | None = None,
+    top_k_regions: int = 3,
+    trajectory_budget: int = 3,
+) -> dict[str, Any]:
+    checkpoint_store = ModelCheckpointStore()
+    checkpoint = checkpoint_store.load_checkpoint(checkpoint_id)
+    model = IncrementalLinearSurrogate.load(checkpoint.model_state_path)
+    frame = _load_frame(data_path=data_path, sheet_name=sheet_name)
+    predictions = model.predict_dataframe(frame)
+    feedback = analyze_model_performance(
+        y_true=frame[checkpoint.target_column].to_numpy(dtype=float),
+        y_pred=predictions,
+        feature_frame=frame[checkpoint.feature_columns],
+        top_k_regions=top_k_regions,
+        trajectory_budget=trajectory_budget,
+    )
+    return {
+        "status": "ok",
+        "checkpoint_id": checkpoint.checkpoint_id,
+        "feedback": feedback.to_dict(),
+    }
+
+
+def _load_frame(*, data_path: str, sheet_name: str | None) -> Any:
+    loaded = load_tabular_data(path=data_path, sheet_name=sheet_name)
+    return loaded.frame
