@@ -272,11 +272,14 @@ def _score_header_candidate(row: pd.Series) -> float:
     alpha_ratio = sum(alpha_flags) / len(alpha_flags)
     non_empty_ratio = len(values) / max(len(row), 1)
 
+    # Prefer dense textual rows over sparse description rows. This helps
+    # wide lab exports where one sparse row contains long descriptions and
+    # the dense row above contains actual signal tags.
     score = (
-        (1.0 - numeric_ratio) * 0.45
-        + alpha_ratio * 0.25
-        + unique_ratio * 0.20
-        + non_empty_ratio * 0.10
+        (1.0 - numeric_ratio) * 0.35
+        + alpha_ratio * 0.20
+        + unique_ratio * 0.15
+        + non_empty_ratio * 0.30
     )
     return max(0.0, min(score, 1.0))
 
@@ -311,8 +314,25 @@ def _finalize_raw_table(raw: pd.DataFrame, header_row: int, data_start_row: int)
     frame = frame.dropna(how="all").reset_index(drop=True)
 
     for column in frame.columns:
-        frame[column] = pd.to_numeric(frame[column], errors="ignore")
+        frame[column] = _coerce_numeric_when_mostly_numeric(frame[column])
     return frame
+
+
+def _coerce_numeric_when_mostly_numeric(series: pd.Series, *, threshold: float = 0.80) -> pd.Series:
+    """Convert to numeric only when most non-null rows are parseable as numbers.
+
+    This avoids pandas>=3 incompatibility with `errors="ignore"` while keeping
+    text-like channels intact.
+    """
+    non_null = series.dropna()
+    if non_null.empty:
+        return series
+
+    coerced = pd.to_numeric(non_null, errors="coerce")
+    numeric_ratio = float(coerced.notna().sum()) / float(len(non_null))
+    if numeric_ratio < threshold:
+        return series
+    return pd.to_numeric(series, errors="coerce")
 
 
 def _make_unique_columns(values: list[object]) -> list[str]:

@@ -188,6 +188,8 @@ artifacts/*
 !artifacts/.gitkeep
 reports/*
 !reports/.gitkeep
+models/
+*.gguf
 
 # OS/editor local files
 .DS_Store

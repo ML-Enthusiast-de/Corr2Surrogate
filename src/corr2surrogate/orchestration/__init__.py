@@ -17,6 +17,7 @@ from .handoff_contract import (
 )
 from .harness_runner import run_local_agent_once
 from .local_provider import LocalLLMResponder, LocalProviderError, LocalResponderConfig
+from .local_llm_setup import setup_local_llm
 from .runtime_policy import (
     ModelProfile,
     RuntimePolicy,
@@ -52,6 +53,7 @@ __all__ = [
     "LocalLLMResponder",
     "LocalProviderError",
     "LocalResponderConfig",
+    "setup_local_llm",
     "LoopEvaluation",
     "ModelProfile",
     "ModelingDirective",

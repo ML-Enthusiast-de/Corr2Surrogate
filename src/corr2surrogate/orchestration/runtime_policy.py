@@ -39,6 +39,7 @@ class RuntimePolicy:
     profiles: dict[str, ModelProfile]
     default_profile: str
     fallback_order: list[str] = field(default_factory=list)
+    model_override: str | None = None
 
     def ensure_local_only(self, endpoint: str | None = None) -> None:
         """Validate runtime settings against local-only policy."""
@@ -90,7 +91,7 @@ class RuntimePolicy:
             profile = self.select_profile(prefer_cpu=prefer_cpu)
         return {
             "provider": self.provider,
-            "model": profile.model,
+            "model": self.model_override or profile.model,
             "cpu_only": profile.cpu_only,
             "n_gpu_layers": profile.n_gpu_layers,
             "max_context": profile.max_context,
@@ -128,6 +129,7 @@ def load_runtime_policy(config: dict[str, Any]) -> RuntimePolicy:
         profiles=profiles,
         default_profile=default_profile,
         fallback_order=fallback_order,
+        model_override=None,
     )
     _validate_policy(policy)
     return policy
@@ -141,6 +143,7 @@ def apply_environment_overrides(
     provider = values.get("C2S_PROVIDER", policy.provider)
     default_profile = values.get("C2S_PROFILE", policy.default_profile)
     offline_mode = values.get("C2S_OFFLINE_MODE")
+    model_override = values.get("C2S_MODEL")
     resolved_offline = (
         policy.offline_mode
         if offline_mode is None
@@ -156,6 +159,7 @@ def apply_environment_overrides(
         profiles=policy.profiles,
         default_profile=default_profile,
         fallback_order=policy.fallback_order,
+        model_override=model_override or None,
     )
     _validate_policy(updated)
     return updated

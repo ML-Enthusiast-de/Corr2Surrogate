@@ -1,5 +1,6 @@
 from corr2surrogate.orchestration.runtime_policy import (
     RuntimePolicyError,
+    apply_environment_overrides,
     load_runtime_policy,
 )
 
@@ -89,3 +90,29 @@ def test_runtime_policy_rejects_unknown_profile_name() -> None:
     except RuntimePolicyError:
         return
     raise AssertionError("Expected RuntimePolicyError for unknown profile.")
+
+
+def test_runtime_policy_applies_model_override_from_env() -> None:
+    config = {
+        "privacy": {"api_calls_allowed": False, "telemetry_allowed": False},
+        "runtime": {
+            "provider": "ollama",
+            "require_local_models": True,
+            "block_remote_endpoints": True,
+            "offline_mode": True,
+            "profiles": {
+                "small_cpu": {
+                    "model": "qwen:3b",
+                    "cpu_only": True,
+                    "n_gpu_layers": 0,
+                    "max_context": 4096,
+                },
+            },
+            "default_profile": "small_cpu",
+            "fallback_order": ["small_cpu"],
+        },
+    }
+    policy = load_runtime_policy(config)
+    overridden = apply_environment_overrides(policy, env={"C2S_MODEL": "local-override"})
+    options = overridden.runtime_options(profile_name="small_cpu")
+    assert options["model"] == "local-override"

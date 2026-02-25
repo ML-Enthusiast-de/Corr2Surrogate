@@ -65,6 +65,7 @@ Each tool is registered with:
 
 Example minimal tool set:
 - `load_tabular_data`
+- `run_agent1_analysis`
 - `run_quality_checks`
 - `compute_correlations`
 - `rank_surrogate_candidates`

@@ -32,6 +32,7 @@ class AgentLoopLimits:
 
     max_turns_per_phase: int = 20
     max_invalid_actions: int = 3
+    max_consecutive_tool_errors: int = 4
 
 
 @dataclass(frozen=True)
@@ -160,10 +161,78 @@ class AgentLoop:
     ) -> AgentTurnEvent:
         """Run loop until a terminal condition is reached."""
         state = dict(context or {})
+        consecutive_tool_errors = 0
+        repeated_tool_result_error_count = 0
+        last_tool_result_error_signature = ""
+        repeated_tool_result_count = 0
+        last_tool_result_signature = ""
         while True:
             raw_action = responder(history=list(self.history), context=state)
             event = self.step(raw_action)
             state["last_event"] = event.to_dict()
+            if event.status == "tool_error":
+                consecutive_tool_errors += 1
+                if consecutive_tool_errors >= self.limits.max_consecutive_tool_errors:
+                    fallback_message = (
+                        "I am stopping after repeated tool argument errors. "
+                        "Please provide a clearer request or explicit inputs "
+                        "(for example: data path, target signal, predictor signals)."
+                    )
+                    fallback = AgentTurnEvent(
+                        turn=len(self.history) + 1,
+                        status="respond",
+                        action=AgentAction(action="respond", message=fallback_message),
+                        message=fallback_message,
+                    )
+                    self.history.append(fallback)
+                    return fallback
+            else:
+                consecutive_tool_errors = 0
+            if event.status == "tool_result":
+                signature = _tool_result_error_signature(event)
+                if signature:
+                    if signature == last_tool_result_error_signature:
+                        repeated_tool_result_error_count += 1
+                    else:
+                        repeated_tool_result_error_count = 1
+                        last_tool_result_error_signature = signature
+                    if repeated_tool_result_error_count >= 2:
+                        fallback_message = (
+                            "I am repeating the same failing tool call result. "
+                            "Please provide clearer input values "
+                            "(for example: a valid data file path and sheet name)."
+                        )
+                        fallback = AgentTurnEvent(
+                            turn=len(self.history) + 1,
+                            status="respond",
+                            action=AgentAction(action="respond", message=fallback_message),
+                            message=fallback_message,
+                        )
+                        self.history.append(fallback)
+                        return fallback
+                else:
+                    repeated_tool_result_error_count = 0
+                    last_tool_result_error_signature = ""
+                repeat_signature = _tool_result_signature(event)
+                if repeat_signature:
+                    if repeat_signature == last_tool_result_signature:
+                        repeated_tool_result_count += 1
+                    else:
+                        repeated_tool_result_count = 1
+                        last_tool_result_signature = repeat_signature
+                    if repeated_tool_result_count >= 2:
+                        fallback_message = _summarize_repeated_tool_result(event)
+                        fallback = AgentTurnEvent(
+                            turn=len(self.history) + 1,
+                            status="respond",
+                            action=AgentAction(action="respond", message=fallback_message),
+                            message=fallback_message,
+                        )
+                        self.history.append(fallback)
+                        return fallback
+                else:
+                    repeated_tool_result_count = 0
+                    last_tool_result_signature = ""
             if event.status in {"respond", "needs_user_confirmation", "blocked"}:
                 return event
 
@@ -219,3 +288,71 @@ def _coerce_payload(raw_action: dict[str, Any] | str) -> dict[str, Any]:
     if not isinstance(loaded, dict):
         raise InvalidAgentActionError("Agent JSON must decode to an object.")
     return loaded
+
+
+def _tool_result_error_signature(event: AgentTurnEvent) -> str:
+    output = event.tool_output
+    if not isinstance(output, dict):
+        return ""
+    status = str(output.get("status", "")).lower().strip()
+    if status != "error":
+        return ""
+    message = str(output.get("message", "")).strip()
+    args = json.dumps(event.action.arguments, sort_keys=True, ensure_ascii=True)
+    return f"{event.action.tool_name}|{args}|{message}"
+
+
+def _tool_result_signature(event: AgentTurnEvent) -> str:
+    output = event.tool_output
+    if output is None:
+        return ""
+    normalized_output = _normalize_tool_output_for_repeat_check(output)
+    try:
+        output_payload = json.dumps(normalized_output, sort_keys=True, ensure_ascii=True)
+    except TypeError:
+        output_payload = str(normalized_output)
+    args = json.dumps(event.action.arguments, sort_keys=True, ensure_ascii=True)
+    return f"{event.action.tool_name}|{args}|{output_payload}"
+
+
+def _summarize_repeated_tool_result(event: AgentTurnEvent) -> str:
+    if event.action.tool_name == "run_agent1_analysis" and isinstance(event.tool_output, dict):
+        output = event.tool_output
+        data_mode = output.get("data_mode", "unknown")
+        candidate_count = output.get("candidate_count", "unknown")
+        report_path = output.get("report_path", "")
+        return (
+            "Agent 1 analysis already completed for the provided data. "
+            f"Mode: {data_mode}; candidate_count: {candidate_count}; "
+            f"report: {report_path or 'n/a'}. "
+            "If you want deeper output, specify target signals or forced predictor mappings."
+        )
+    return (
+        f"Tool '{event.action.tool_name}' already returned the same result repeatedly. "
+        "Please provide more specific next-step instructions."
+    )
+
+
+def _normalize_tool_output_for_repeat_check(value: Any) -> Any:
+    if isinstance(value, dict):
+        dynamic_keys = {
+            "report_path",
+            "report_markdown",
+            "run_dir",
+            "model_state_path",
+            "model_params_path",
+            "checkpoint_id",
+            "new_checkpoint_id",
+            "parent_checkpoint_id",
+            "created_at",
+            "timestamp",
+        }
+        normalized: dict[str, Any] = {}
+        for key, item in value.items():
+            if str(key) in dynamic_keys:
+                continue
+            normalized[str(key)] = _normalize_tool_output_for_repeat_check(item)
+        return normalized
+    if isinstance(value, list):
+        return [_normalize_tool_output_for_repeat_check(item) for item in value]
+    return value

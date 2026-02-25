@@ -12,6 +12,12 @@ Local-first, privacy-preserving framework that converts real-world sensor data i
 - Header/data-start inference with user confirmation on low confidence
 - Optional Min-Max normalization with saved state for inference de-normalization
 - Saved optimization outputs (`model_params.json`) and normalization state
+- Agent 1 complete analysis pipeline:
+  - quality checks (missingness, duplicates, outliers, timestamp integrity)
+  - stationarity assessment per signal
+  - multi-technique correlation scan (Pearson/Spearman/Kendall/distance/lagged)
+  - feature-engineering opportunity detection (transforms/interactions/lag features)
+  - dependency-aware surrogate ranking
 - Model savepoints/checkpoints:
   - Load an existing trained model
   - Add additional data and retrain from checkpoint
@@ -101,11 +107,74 @@ These modules are OS-agnostic and avoid machine-specific paths. Runtime behavior
 - `C2S_PROVIDER`
 - `C2S_PROFILE`
 - `C2S_OFFLINE_MODE`
+- `C2S_MODEL`
+- `C2S_ENDPOINT`
 
 ## CLI
+Set up local LLM runtime (recommended before first agent run):
+```bash
+# Use configured provider/profile from config
+corr2surrogate setup-local-llm
+
+# Lightweight CPU path (llama.cpp + small GGUF)
+corr2surrogate setup-local-llm --provider llama_cpp --install-provider
+```
+
 Run one local agent turn:
 ```bash
+# Optional provider/model overrides (PowerShell)
+$env:C2S_PROVIDER="llama_cpp"
+$env:C2S_MODEL="c2s-local"
+
 corr2surrogate run-agent-once --agent analyst --message "Load data/private/run1.csv and tell me next step"
+```
+
+Run interactive multi-turn session:
+```bash
+corr2surrogate run-agent-session --agent analyst
+```
+Session commands:
+- `/help`
+- `/context`
+- `/reset`
+- `/exit`
+
+Run Analyst on XLSX (PowerShell):
+```powershell
+.\.venv\Scripts\Activate.ps1
+corr2surrogate run-agent-session --agent analyst
+# then paste:
+# C:\path\to\Corr2Surrogate\data\private\your_data.xlsx
+```
+Behavior:
+- Agent detects the file path and runs deterministic ingestion + Agent 1 analysis.
+- If sheet/header is ambiguous, Agent asks in CLI and continues after your input.
+- For wide datasets, Agent asks for target focus; type `list` (or `list <filter>`) to show signal names.
+- Report is saved in dataset-related folder:
+  - `reports/<dataset_slug>/agent1_<timestamp>.md`
+  - example: `reports/rde_v19_1_143_kopie/agent1_20260225_120501.md`
+
+Run deterministic Agent 1 analysis directly:
+```bash
+corr2surrogate run-agent1-analysis --data-path data/private/run1.csv --timestamp-column time
+```
+
+## Troubleshooting (Windows)
+If PowerShell says `corr2surrogate` is not recognized:
+1. Make sure you are using Python 3.10+ (project requires `>=3.10`).
+2. Create a local venv and install:
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+```
+3. Run CLI:
+```powershell
+corr2surrogate --help
+```
+If execution policy blocks activation, run without activation:
+```powershell
+.\.venv\Scripts\corr2surrogate.exe run-agent-session --agent analyst
 ```
 
 Run leak scan before commit/push:

@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import asdict
 from typing import Any
 
 from corr2surrogate.agents.prompt_manager import load_system_prompt
 from corr2surrogate.core.config import load_config
 
-from .agent_loop import AgentLoop, AgentLoopLimits, AgentTurnEvent
+from .agent_loop import (
+    AgentAction,
+    AgentLoop,
+    AgentLoopLimits,
+    AgentTurnEvent,
+    InvalidAgentActionError,
+    MaxTurnsExceededError,
+)
 from .default_tools import build_default_registry
 from .local_provider import LocalLLMResponder, LocalResponderConfig
 from .runtime_policy import apply_environment_overrides, load_runtime_policy
@@ -25,7 +34,9 @@ def run_local_agent_once(
     config = load_config(config_path)
     policy = apply_environment_overrides(load_runtime_policy(config))
     runtime_cfg = config.get("runtime", {})
-    endpoint = _resolve_endpoint(policy.provider, runtime_cfg)
+    endpoint = os.getenv("C2S_ENDPOINT", "").strip() or _resolve_endpoint(
+        policy.provider, runtime_cfg
+    )
     options = policy.runtime_options(endpoint=endpoint)
 
     prompts_cfg = config.get("prompts", {})
@@ -51,10 +62,48 @@ def run_local_agent_once(
         system_prompt=prompt.content,
         tool_catalog=registry.list_tools(),
     )
-    loop = AgentLoop(registry=registry, limits=AgentLoopLimits())
+    loop = AgentLoop(
+        registry=registry,
+        limits=AgentLoopLimits(
+            max_turns_per_phase=4,
+            max_invalid_actions=2,
+            max_consecutive_tool_errors=2,
+        ),
+    )
     start_context = dict(context or {})
     start_context["user_message"] = user_message
-    final_event = loop.run(responder=responder, context=start_context)
+    detected_paths = _extract_data_path_hints(user_message)
+    if detected_paths:
+        start_context["path_hints"] = detected_paths
+    try:
+        final_event = loop.run(responder=responder, context=start_context)
+    except MaxTurnsExceededError as exc:
+        fallback_message = (
+            "Agent loop reached the turn limit before a stable answer. "
+            "Please provide a more specific request or prefill required inputs "
+            "(for example: data path, sheet, target signal)."
+        )
+        final_event = AgentTurnEvent(
+            turn=len(loop.history) + 1,
+            status="respond",
+            action=AgentAction(action="respond", message=fallback_message),
+            message=fallback_message,
+            error=str(exc),
+        )
+        loop.history.append(final_event)
+    except InvalidAgentActionError as exc:
+        fallback_message = (
+            "Agent produced too many invalid actions. "
+            "Please retry with a more direct instruction."
+        )
+        final_event = AgentTurnEvent(
+            turn=len(loop.history) + 1,
+            status="respond",
+            action=AgentAction(action="respond", message=fallback_message),
+            message=fallback_message,
+            error=str(exc),
+        )
+        loop.history.append(final_event)
     return {
         "agent": agent,
         "prompt_source": prompt.source,
@@ -82,3 +131,8 @@ def _resolve_endpoint(provider: str, runtime_cfg: dict[str, Any]) -> str:
 def _event_to_dict(event: AgentTurnEvent) -> dict[str, Any]:
     payload = asdict(event)
     return payload
+
+
+def _extract_data_path_hints(user_message: str) -> list[str]:
+    pattern = re.compile(r"([^\s\"']+\.(?:csv|xlsx|xls))", re.IGNORECASE)
+    return [item.strip() for item in pattern.findall(user_message)]

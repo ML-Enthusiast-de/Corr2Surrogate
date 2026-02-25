@@ -1,5 +1,9 @@
 from corr2surrogate.orchestration.agent_loop import AgentTurnEvent, AgentAction
-from corr2surrogate.orchestration.local_provider import LocalLLMResponder, LocalResponderConfig
+from corr2surrogate.orchestration.local_provider import (
+    LocalLLMResponder,
+    LocalResponderConfig,
+    _parse_action_payload,
+)
 
 
 def test_local_responder_ollama_path(monkeypatch) -> None:
@@ -61,3 +65,18 @@ def test_local_responder_includes_recent_history(monkeypatch) -> None:
     messages = captured["payload"]["messages"]
     assert messages[0]["role"] == "system"
     assert "tool_catalog" in messages[1]["content"]
+
+
+def test_parse_action_payload_wraps_plain_text_as_respond() -> None:
+    parsed = _parse_action_payload("I need a file path to continue.")
+    assert isinstance(parsed, dict)
+    assert parsed["action"] == "respond"
+    assert "file path" in parsed["message"]
+
+
+def test_parse_action_payload_extracts_markdown_json() -> None:
+    raw = "```json\n{\"action\":\"respond\",\"message\":\"ok\"}\n```"
+    parsed = _parse_action_payload(raw)
+    assert isinstance(parsed, dict)
+    assert parsed["action"] == "respond"
+    assert parsed["message"] == "ok"

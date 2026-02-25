@@ -70,7 +70,7 @@ prompts:
   extra_instructions: ""
 
 runtime:
-  provider: ollama
+  provider: llama_cpp
   require_local_models: true
   block_remote_endpoints: true
   offline_mode: true
@@ -81,12 +81,12 @@ runtime:
     llama_cpp: http://127.0.0.1:8000/v1/chat/completions
   profiles:
     small_cpu:
-      model: qwen2.5:3b-instruct-q4_K_M
+      model: c2s-local
       cpu_only: true
       n_gpu_layers: 0
-      max_context: 4096
+      max_context: 8192
     balanced:
-      model: qwen2.5:7b-instruct-q4_K_M
+      model: c2s-balanced
       cpu_only: false
       n_gpu_layers: auto
       max_context: 8192

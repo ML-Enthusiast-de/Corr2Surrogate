@@ -69,14 +69,16 @@ def _build_messages(
     context: dict[str, Any],
     tool_catalog: list[dict[str, str]],
 ) -> list[dict[str, str]]:
-    history_payload = [event.to_dict() for event in history[-8:]]
+    history_payload = [_sanitize_for_prompt(event.to_dict()) for event in history[-8:]]
     user_prompt = {
         "instruction": (
             "Return exactly one JSON action. Do not include markdown. "
-            "Use action='tool_call' or action='respond'."
+            "Use action='tool_call' or action='respond'. "
+            "If calling run_agent1_analysis, always include required field data_path. "
+            "If context.path_hints exists, use the first entry as data_path."
         ),
         "tool_catalog": tool_catalog,
-        "context": context,
+        "context": _sanitize_for_prompt(context),
         "recent_history": history_payload,
     }
     return [
@@ -112,6 +114,7 @@ def _call_openai_compatible(
         "messages": messages,
         "temperature": config.temperature,
         "max_tokens": 700,
+        "response_format": {"type": "json_object"},
     }
     data = _http_post_json(config.endpoint, payload, timeout_seconds=config.timeout_seconds)
     choices = data.get("choices") or []
@@ -153,21 +156,89 @@ def _http_post_json(
 
 
 def _parse_action_payload(text: str) -> dict[str, Any] | str:
+    normalized = _strip_markdown_fences(text.strip())
     try:
-        parsed = json.loads(text)
+        parsed = json.loads(normalized)
         if isinstance(parsed, dict):
             return parsed
     except json.JSONDecodeError:
         pass
 
-    start = text.find("{")
-    end = text.rfind("}")
-    if 0 <= start < end:
-        snippet = text[start : end + 1]
-        try:
-            parsed = json.loads(snippet)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
+    parsed_snippet = _extract_first_json_object(normalized)
+    if parsed_snippet is not None:
+        return parsed_snippet
+
+    if normalized:
+        # Fail closed into a plain respond action to keep loop behavior deterministic.
+        return {"action": "respond", "message": normalized[:2000]}
     return text
+
+
+def _strip_markdown_fences(text: str) -> str:
+    if not text.startswith("```"):
+        return text
+    lines = text.splitlines()
+    if len(lines) >= 3 and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1]).strip()
+    return text
+
+
+def _extract_first_json_object(text: str) -> dict[str, Any] | None:
+    for start in range(len(text)):
+        if text[start] != "{":
+            continue
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                    continue
+                if char == "\\":
+                    escaped = True
+                    continue
+                if char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+                continue
+            if char == "{":
+                depth += 1
+                continue
+            if char == "}":
+                depth -= 1
+                if depth == 0:
+                    snippet = text[start : index + 1]
+                    try:
+                        parsed = json.loads(snippet)
+                    except json.JSONDecodeError:
+                        break
+                    if isinstance(parsed, dict):
+                        return parsed
+                    break
+    return None
+
+
+def _sanitize_for_prompt(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 5:
+        return "<truncated>"
+    if isinstance(value, dict):
+        skipped = {
+            "report_markdown",
+        }
+        normalized: dict[str, Any] = {}
+        for key, item in value.items():
+            if str(key) in skipped:
+                continue
+            normalized[str(key)] = _sanitize_for_prompt(item, depth=depth + 1)
+        return normalized
+    if isinstance(value, list):
+        return [_sanitize_for_prompt(item, depth=depth + 1) for item in value[:30]]
+    if isinstance(value, str):
+        if len(value) <= 1000:
+            return value
+        return value[:997] + "..."
+    return value

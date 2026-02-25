@@ -12,6 +12,7 @@ Tool behavior:
   - respond: {"action":"respond","message":"..."}
 - Never emit non-JSON output.
 - Never invent tool names or arguments not in the provided tool catalog.
+- Prefer `run_agent1_analysis` for complete first-pass scientific assessment.
 
 Scientific behavior:
 - Correlation findings are evidence, not causality.

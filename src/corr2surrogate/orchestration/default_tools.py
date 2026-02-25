@@ -6,7 +6,22 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from corr2surrogate.analytics.ranking import ForcedModelingDirective, RankedSignal
+import pandas as pd
+
+from corr2surrogate.analytics import (
+    assess_stationarity,
+    build_agent1_report_payload,
+    build_candidate_signals_from_correlations,
+    run_correlation_analysis,
+    run_quality_checks,
+    save_agent1_markdown_report,
+)
+from corr2surrogate.analytics.ranking import (
+    ForcedModelingDirective,
+    RankedSignal,
+    build_forced_directive,
+    rank_surrogate_candidates,
+)
 from corr2surrogate.ingestion import load_tabular_data
 from corr2surrogate.modeling.baselines import IncrementalLinearSurrogate
 from corr2surrogate.modeling.checkpoints import ModelCheckpointStore
@@ -40,6 +55,50 @@ def build_default_registry() -> ToolRegistry:
             "additionalProperties": False,
         },
         handler=_tool_prepare_ingestion_step,
+        risk_level="low",
+    )
+
+    registry.register_function(
+        name="run_agent1_analysis",
+        description=(
+            "Run full Agent 1 analysis: quality checks, stationarity, multi-technique "
+            "correlations, feature opportunities, and dependency-aware ranking."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "data_path": {"type": "string"},
+                "sheet_name": {"type": "string"},
+                "header_row": {"type": "integer"},
+                "data_start_row": {"type": "integer"},
+                "timestamp_column": {"type": "string"},
+                "target_signals": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "predictor_signals_by_target": {
+                    "type": "object",
+                    "additionalProperties": True,
+                },
+                "forced_requests": {"type": "array"},
+                "physically_available_signals": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "non_virtualizable_signals": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "max_lag": {"type": "integer"},
+                "include_feature_engineering": {"type": "boolean"},
+                "feature_gain_threshold": {"type": "number"},
+                "save_report": {"type": "boolean"},
+                "run_id": {"type": "string"},
+            },
+            "required": ["data_path"],
+            "additionalProperties": False,
+        },
+        handler=_tool_run_agent1_analysis,
         risk_level="low",
     )
 
@@ -187,10 +246,32 @@ def _tool_prepare_ingestion_step(
         header_row=header_row,
         data_start_row=data_start_row,
     )
+    ingestion = result.ingestion_result
+    inferred = ingestion.inferred_header if ingestion is not None else None
+    available_sheets = list(ingestion.available_sheets) if ingestion is not None else list(
+        result.options or []
+    )
+    signal_columns = list(ingestion.frame.columns) if ingestion is not None else []
+    numeric_signal_columns = (
+        _detect_numeric_signal_columns(ingestion.frame) if ingestion is not None else []
+    )
     payload = {
         "status": result.status,
         "message": result.message,
         "options": result.options or [],
+        "selected_sheet": ingestion.selected_sheet if ingestion is not None else None,
+        "available_sheets": available_sheets,
+        "row_count": int(len(ingestion.frame)) if ingestion is not None else 0,
+        "column_count": int(len(signal_columns)) if ingestion is not None else 0,
+        "signal_columns": signal_columns,
+        "numeric_signal_columns": numeric_signal_columns,
+        "header_row": inferred.header_row if inferred is not None else None,
+        "data_start_row": inferred.data_start_row if inferred is not None else None,
+        "header_confidence": inferred.confidence if inferred is not None else None,
+        "candidate_header_rows": inferred.candidate_rows if inferred is not None else [],
+        "needs_user_confirmation": (
+            inferred.needs_user_confirmation if inferred is not None else False
+        ),
     }
     return payload
 
@@ -213,6 +294,85 @@ def _tool_evaluate_training_iteration(
         previous_best_score=previous_best_score,
     )
     return asdict(result)
+
+
+def _tool_run_agent1_analysis(
+    *,
+    data_path: str,
+    sheet_name: str | None = None,
+    header_row: int | None = None,
+    data_start_row: int | None = None,
+    timestamp_column: str | None = None,
+    target_signals: list[str] | None = None,
+    predictor_signals_by_target: dict[str, list[str]] | None = None,
+    forced_requests: list[dict[str, Any]] | None = None,
+    physically_available_signals: list[str] | None = None,
+    non_virtualizable_signals: list[str] | None = None,
+    max_lag: int = 8,
+    include_feature_engineering: bool = True,
+    feature_gain_threshold: float = 0.05,
+    save_report: bool = True,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    loaded = load_tabular_data(
+        path=data_path,
+        sheet_name=sheet_name,
+        header_row=header_row,
+        data_start_row=data_start_row,
+    )
+    frame = loaded.frame
+
+    quality = run_quality_checks(frame, timestamp_column=timestamp_column)
+    correlations = run_correlation_analysis(
+        frame=frame,
+        target_signals=target_signals,
+        predictor_signals_by_target=predictor_signals_by_target,
+        timestamp_column=timestamp_column,
+        max_lag=max_lag,
+        include_feature_engineering=include_feature_engineering,
+        feature_gain_threshold=feature_gain_threshold,
+    )
+    stationarity_columns = [item.target_signal for item in correlations.target_analyses]
+    stationarity = assess_stationarity(frame, signal_columns=stationarity_columns)
+
+    candidates = build_candidate_signals_from_correlations(correlations)
+    ranking = rank_surrogate_candidates(
+        candidates=candidates,
+        physically_available_signals=physically_available_signals,
+        non_virtualizable_signals=non_virtualizable_signals,
+    )
+
+    forced_directives = _normalize_forced_requests(forced_requests)
+    report_payload = build_agent1_report_payload(
+        data_path=data_path,
+        quality=quality,
+        stationarity=stationarity,
+        correlations=correlations,
+        ranking=ranking,
+        forced_requests=[asdict(item) for item in forced_directives],
+    )
+    report_path: str | None = None
+    if save_report:
+        report_path = save_agent1_markdown_report(
+            markdown=report_payload["markdown"],
+            data_path=data_path,
+            run_id=run_id,
+        )
+
+    return {
+        "status": "ok",
+        "data_mode": correlations.data_mode,
+        "timestamp_column": correlations.timestamp_column,
+        "target_count": len(correlations.target_analyses),
+        "candidate_count": len(candidates),
+        "ranking": [asdict(item) for item in ranking],
+        "forced_requests": [asdict(item) for item in forced_directives],
+        "quality": quality.to_dict(),
+        "stationarity": stationarity.to_dict(),
+        "correlations": correlations.to_dict(),
+        "report_path": report_path,
+        "report_markdown": report_payload["markdown"],
+    }
 
 
 def _tool_build_modeling_directives(
@@ -390,3 +550,35 @@ def _tool_analyze_model_checkpoint_performance(
 def _load_frame(*, data_path: str, sheet_name: str | None) -> Any:
     loaded = load_tabular_data(path=data_path, sheet_name=sheet_name)
     return loaded.frame
+
+
+def _normalize_forced_requests(
+    forced_requests: list[dict[str, Any]] | None,
+) -> list[ForcedModelingDirective]:
+    directives: list[ForcedModelingDirective] = []
+    for item in forced_requests or []:
+        target = item.get("target_signal")
+        predictors = item.get("predictor_signals")
+        reason = item.get("user_reason", "")
+        if not isinstance(target, str) or not isinstance(predictors, list):
+            continue
+        predictor_signals = [str(value) for value in predictors if str(value).strip()]
+        if not predictor_signals:
+            continue
+        directives.append(
+            build_forced_directive(
+                target_signal=target,
+                predictor_signals=predictor_signals,
+                user_reason=str(reason),
+            )
+        )
+    return directives
+
+
+def _detect_numeric_signal_columns(frame: Any) -> list[str]:
+    numeric_signals: list[str] = []
+    for col in frame.columns:
+        numeric = pd.to_numeric(frame[col], errors="coerce")
+        if int(numeric.notna().sum()) >= 8 and int(numeric.nunique(dropna=True)) > 1:
+            numeric_signals.append(str(col))
+    return numeric_signals
