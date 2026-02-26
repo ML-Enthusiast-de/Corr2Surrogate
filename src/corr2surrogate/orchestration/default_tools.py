@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from corr2surrogate.analytics import (
     assess_stationarity,
     build_agent1_report_payload,
     build_candidate_signals_from_correlations,
+    recommend_data_trajectories,
+    recommendations_to_dict,
     run_correlation_analysis,
     run_quality_checks,
+    run_sensor_diagnostics,
+    save_agent1_artifacts,
     save_agent1_markdown_report,
 )
 from corr2surrogate.analytics.ranking import (
@@ -27,6 +33,7 @@ from corr2surrogate.modeling.baselines import IncrementalLinearSurrogate
 from corr2surrogate.modeling.checkpoints import ModelCheckpointStore
 from corr2surrogate.modeling.performance_feedback import analyze_model_performance
 from corr2surrogate.persistence.artifact_store import ArtifactStore
+from corr2surrogate.persistence.run_store import RunStore
 
 from .tool_registry import ToolRegistry
 from .workflow import (
@@ -92,6 +99,23 @@ def build_default_registry() -> ToolRegistry:
                 "max_lag": {"type": "integer"},
                 "include_feature_engineering": {"type": "boolean"},
                 "feature_gain_threshold": {"type": "number"},
+                "top_k_predictors": {"type": "integer"},
+                "feature_scan_predictors": {"type": "integer"},
+                "max_feature_opportunities": {"type": "integer"},
+                "confidence_top_k": {"type": "integer"},
+                "bootstrap_rounds": {"type": "integer"},
+                "stability_windows": {"type": "integer"},
+                "max_samples": {"type": "integer"},
+                "sample_selection": {"type": "string"},
+                "missing_data_strategy": {"type": "string"},
+                "fill_constant_value": {"type": "number"},
+                "row_coverage_strategy": {"type": "string"},
+                "sparse_row_min_fraction": {"type": "number"},
+                "row_range_start": {"type": "integer"},
+                "row_range_end": {"type": "integer"},
+                "enable_strategy_search": {"type": "boolean"},
+                "strategy_search_candidates": {"type": "integer"},
+                "save_artifacts": {"type": "boolean"},
                 "save_report": {"type": "boolean"},
                 "run_id": {"type": "string"},
             },
@@ -255,6 +279,36 @@ def _tool_prepare_ingestion_step(
     numeric_signal_columns = (
         _detect_numeric_signal_columns(ingestion.frame) if ingestion is not None else []
     )
+    timestamp_hint = _infer_timestamp_column_hint(ingestion.frame) if ingestion is not None else None
+    estimated_sample_period_seconds = (
+        _estimate_sample_period_seconds(ingestion.frame, timestamp_hint)
+        if ingestion is not None and timestamp_hint is not None
+        else None
+    )
+    missing_overall_fraction = (
+        float(ingestion.frame.isna().mean().mean()) if ingestion is not None else 0.0
+    )
+    missing_by_column = (
+        ingestion.frame.isna().mean().sort_values(ascending=False) if ingestion is not None else None
+    )
+    columns_with_missing = (
+        [str(col) for col, frac in missing_by_column.items() if float(frac) > 0.0][:30]
+        if missing_by_column is not None
+        else []
+    )
+    row_non_null_fraction = (
+        ingestion.frame.notna().mean(axis=1) if ingestion is not None else pd.Series(dtype=float)
+    )
+    row_non_null_min = (
+        float(row_non_null_fraction.min()) if len(row_non_null_fraction) > 0 else 1.0
+    )
+    row_non_null_median = (
+        float(row_non_null_fraction.median()) if len(row_non_null_fraction) > 0 else 1.0
+    )
+    row_non_null_max = (
+        float(row_non_null_fraction.max()) if len(row_non_null_fraction) > 0 else 1.0
+    )
+    potential_length_mismatch = bool(row_non_null_min < 0.999 and row_non_null_max > row_non_null_min)
     payload = {
         "status": result.status,
         "message": result.message,
@@ -265,6 +319,15 @@ def _tool_prepare_ingestion_step(
         "column_count": int(len(signal_columns)) if ingestion is not None else 0,
         "signal_columns": signal_columns,
         "numeric_signal_columns": numeric_signal_columns,
+        "timestamp_column_hint": timestamp_hint,
+        "estimated_sample_period_seconds": estimated_sample_period_seconds,
+        "missing_overall_fraction": missing_overall_fraction,
+        "columns_with_missing": columns_with_missing,
+        "columns_with_missing_count": int(len(columns_with_missing)),
+        "row_non_null_fraction_min": row_non_null_min,
+        "row_non_null_fraction_median": row_non_null_median,
+        "row_non_null_fraction_max": row_non_null_max,
+        "potential_length_mismatch": potential_length_mismatch,
         "header_row": inferred.header_row if inferred is not None else None,
         "data_start_row": inferred.data_start_row if inferred is not None else None,
         "header_confidence": inferred.confidence if inferred is not None else None,
@@ -311,6 +374,23 @@ def _tool_run_agent1_analysis(
     max_lag: int = 8,
     include_feature_engineering: bool = True,
     feature_gain_threshold: float = 0.05,
+    top_k_predictors: int = 10,
+    feature_scan_predictors: int = 10,
+    max_feature_opportunities: int = 20,
+    confidence_top_k: int = 10,
+    bootstrap_rounds: int = 40,
+    stability_windows: int = 4,
+    max_samples: int | None = None,
+    sample_selection: str = "uniform",
+    missing_data_strategy: str = "keep",
+    fill_constant_value: float | None = None,
+    row_coverage_strategy: str = "keep",
+    sparse_row_min_fraction: float = 0.8,
+    row_range_start: int | None = None,
+    row_range_end: int | None = None,
+    enable_strategy_search: bool = True,
+    strategy_search_candidates: int = 4,
+    save_artifacts: bool = True,
     save_report: bool = True,
     run_id: str | None = None,
 ) -> dict[str, Any]:
@@ -320,9 +400,56 @@ def _tool_run_agent1_analysis(
         header_row=header_row,
         data_start_row=data_start_row,
     )
-    frame = loaded.frame
+    source_frame = loaded.frame
+
+    user_plan = {
+        "max_samples": max_samples,
+        "sample_selection": sample_selection,
+        "missing_data_strategy": missing_data_strategy,
+        "fill_constant_value": fill_constant_value,
+        "row_coverage_strategy": row_coverage_strategy,
+        "sparse_row_min_fraction": sparse_row_min_fraction,
+        "row_range_start": row_range_start,
+        "row_range_end": row_range_end,
+    }
+    planner_trace: list[dict[str, Any]] = []
+    critic_decision: dict[str, Any] = {}
+
+    if enable_strategy_search:
+        candidate_plans = _planner_generate_strategy_candidates(
+            user_plan=user_plan,
+            max_candidates=max(1, int(strategy_search_candidates)),
+        )
+        planner_trace = _planner_evaluate_candidates(
+            frame=source_frame,
+            candidate_plans=candidate_plans,
+            timestamp_column=timestamp_column,
+            target_signals=target_signals,
+            predictor_signals_by_target=predictor_signals_by_target,
+            max_lag=max_lag,
+        )
+        chosen = _critic_choose_strategy(planner_trace)
+        critic_decision = chosen
+        selected_plan = _candidate_plan_by_id(candidate_plans, chosen.get("selected_candidate_id")) or user_plan
+    else:
+        selected_plan = user_plan
+        planner_trace = []
+        critic_decision = {"selected_candidate_id": "user_plan", "rationale": "strategy_search_disabled"}
+
+    frame, preprocessing = _apply_preprocessing_plan(
+        frame=source_frame,
+        max_samples=selected_plan.get("max_samples"),
+        sample_selection=str(selected_plan.get("sample_selection", "uniform")),
+        missing_data_strategy=str(selected_plan.get("missing_data_strategy", "keep")),
+        fill_constant_value=selected_plan.get("fill_constant_value"),
+        row_coverage_strategy=str(selected_plan.get("row_coverage_strategy", "keep")),
+        sparse_row_min_fraction=float(selected_plan.get("sparse_row_min_fraction", 0.8)),
+        row_range_start=selected_plan.get("row_range_start"),
+        row_range_end=selected_plan.get("row_range_end"),
+    )
 
     quality = run_quality_checks(frame, timestamp_column=timestamp_column)
+    diagnostics = run_sensor_diagnostics(frame, timestamp_column=timestamp_column)
     correlations = run_correlation_analysis(
         frame=frame,
         target_signals=target_signals,
@@ -331,9 +458,20 @@ def _tool_run_agent1_analysis(
         max_lag=max_lag,
         include_feature_engineering=include_feature_engineering,
         feature_gain_threshold=feature_gain_threshold,
+        top_k_predictors=top_k_predictors,
+        feature_scan_predictors=feature_scan_predictors,
+        max_feature_opportunities=max_feature_opportunities,
+        confidence_top_k=confidence_top_k,
+        bootstrap_rounds=bootstrap_rounds,
+        stability_windows=stability_windows,
     )
     stationarity_columns = [item.target_signal for item in correlations.target_analyses]
     stationarity = assess_stationarity(frame, signal_columns=stationarity_columns)
+    recommendations = recommend_data_trajectories(
+        frame=frame,
+        correlations=correlations.to_dict(),
+        sensor_diagnostics=diagnostics.to_dict(),
+    )
 
     candidates = build_candidate_signals_from_correlations(correlations)
     ranking = rank_surrogate_candidates(
@@ -342,7 +480,35 @@ def _tool_run_agent1_analysis(
         non_virtualizable_signals=non_virtualizable_signals,
     )
 
+    resolved_run_id = run_id or datetime.now(timezone.utc).strftime("agent1_%Y%m%d_%H%M%S")
+    dataset_slug = _dataset_slug_from_path(data_path)
     forced_directives = _normalize_forced_requests(forced_requests)
+    lineage_store = RunStore(base_dir="reports")
+    lineage_path = lineage_store.save_lineage(
+        dataset_slug=dataset_slug,
+        run_id=resolved_run_id,
+        data_path=data_path,
+        analysis_config={
+            "timestamp_column": timestamp_column,
+            "target_signals": target_signals,
+            "predictor_signals_by_target": predictor_signals_by_target,
+            "max_lag": max_lag,
+            "include_feature_engineering": include_feature_engineering,
+            "feature_gain_threshold": feature_gain_threshold,
+            "top_k_predictors": top_k_predictors,
+            "feature_scan_predictors": feature_scan_predictors,
+            "max_feature_opportunities": max_feature_opportunities,
+            "confidence_top_k": confidence_top_k,
+            "bootstrap_rounds": bootstrap_rounds,
+            "stability_windows": stability_windows,
+            "enable_strategy_search": enable_strategy_search,
+            "strategy_search_candidates": strategy_search_candidates,
+        },
+        selected_strategy=selected_plan,
+        planner_trace=planner_trace,
+        critic_decision=critic_decision,
+    )
+
     report_payload = build_agent1_report_payload(
         data_path=data_path,
         quality=quality,
@@ -350,13 +516,43 @@ def _tool_run_agent1_analysis(
         correlations=correlations,
         ranking=ranking,
         forced_requests=[asdict(item) for item in forced_directives],
+        preprocessing=preprocessing,
+        sensor_diagnostics=diagnostics.to_dict(),
+        experiment_recommendations=recommendations_to_dict(recommendations),
+        planner_trace=planner_trace,
+        critic_decision=critic_decision,
+        lineage_path=lineage_path,
+    )
+
+    artifact_paths: dict[str, Any] | None = None
+    if save_artifacts:
+        artifact_paths = save_agent1_artifacts(
+            structured=report_payload["structured"],
+            data_path=data_path,
+            run_id=resolved_run_id,
+        )
+
+    report_payload = build_agent1_report_payload(
+        data_path=data_path,
+        quality=quality,
+        stationarity=stationarity,
+        correlations=correlations,
+        ranking=ranking,
+        forced_requests=[asdict(item) for item in forced_directives],
+        preprocessing=preprocessing,
+        sensor_diagnostics=diagnostics.to_dict(),
+        experiment_recommendations=recommendations_to_dict(recommendations),
+        planner_trace=planner_trace,
+        critic_decision=critic_decision,
+        lineage_path=lineage_path,
+        artifact_paths=artifact_paths or {},
     )
     report_path: str | None = None
     if save_report:
         report_path = save_agent1_markdown_report(
             markdown=report_payload["markdown"],
             data_path=data_path,
-            run_id=run_id,
+            run_id=resolved_run_id,
         )
 
     return {
@@ -370,6 +566,13 @@ def _tool_run_agent1_analysis(
         "quality": quality.to_dict(),
         "stationarity": stationarity.to_dict(),
         "correlations": correlations.to_dict(),
+        "sensor_diagnostics": diagnostics.to_dict(),
+        "experiment_recommendations": recommendations_to_dict(recommendations),
+        "planner_trace": planner_trace,
+        "critic_decision": critic_decision,
+        "lineage_path": lineage_path,
+        "artifact_paths": artifact_paths or {},
+        "preprocessing": preprocessing,
         "report_path": report_path,
         "report_markdown": report_payload["markdown"],
     }
@@ -582,3 +785,375 @@ def _detect_numeric_signal_columns(frame: Any) -> list[str]:
         if int(numeric.notna().sum()) >= 8 and int(numeric.nunique(dropna=True)) > 1:
             numeric_signals.append(str(col))
     return numeric_signals
+
+
+def _infer_timestamp_column_hint(frame: pd.DataFrame) -> str | None:
+    candidates = [
+        str(col)
+        for col in frame.columns
+        if any(token in str(col).lower() for token in ("time", "timestamp", "date"))
+    ]
+    for col in candidates:
+        series = frame[col]
+        parsed_dt = pd.to_datetime(series, errors="coerce")
+        if float(parsed_dt.notna().mean()) >= 0.8 and bool(parsed_dt.dropna().is_monotonic_increasing):
+            return col
+        numeric = pd.to_numeric(series, errors="coerce")
+        valid = numeric.dropna()
+        if len(valid) < 8:
+            continue
+        diffs = valid.diff().dropna()
+        positive = diffs[diffs > 0]
+        if len(positive) >= 5:
+            return col
+    return None
+
+
+def _estimate_sample_period_seconds(frame: pd.DataFrame, timestamp_column: str) -> float | None:
+    if timestamp_column not in frame.columns:
+        return None
+    series = frame[timestamp_column]
+    parsed_dt = pd.to_datetime(series, errors="coerce")
+    if float(parsed_dt.notna().mean()) >= 0.8:
+        diffs = parsed_dt.dropna().diff().dt.total_seconds().dropna()
+        diffs = diffs[diffs > 0]
+        if len(diffs) >= 5:
+            return float(diffs.median())
+
+    numeric = pd.to_numeric(series, errors="coerce").dropna()
+    if len(numeric) < 8:
+        return None
+    diffs_num = numeric.diff().dropna()
+    diffs_num = diffs_num[diffs_num > 0]
+    if len(diffs_num) < 5:
+        return None
+    median_step = float(diffs_num.median())
+    name = timestamp_column.lower()
+    if "ms" in name:
+        return median_step / 1000.0
+    if "us" in name:
+        return median_step / 1_000_000.0
+    if "ns" in name:
+        return median_step / 1_000_000_000.0
+    return median_step
+
+
+def _apply_preprocessing_plan(
+    *,
+    frame: pd.DataFrame,
+    max_samples: int | None,
+    sample_selection: str,
+    missing_data_strategy: str,
+    fill_constant_value: float | None,
+    row_coverage_strategy: str,
+    sparse_row_min_fraction: float,
+    row_range_start: int | None,
+    row_range_end: int | None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    prepared = frame.copy()
+    initial_rows = int(len(prepared))
+    metadata: dict[str, Any] = {
+        "initial_rows": initial_rows,
+        "sample_plan": {
+            "requested_max_samples": int(max_samples) if max_samples is not None else None,
+            "selection": sample_selection,
+            "applied": False,
+            "rows_after": initial_rows,
+        },
+        "missing_data_plan": {
+            "strategy": missing_data_strategy,
+            "fill_constant_value": fill_constant_value,
+            "applied": False,
+            "rows_after": initial_rows,
+        },
+        "row_coverage_plan": {
+            "strategy": row_coverage_strategy,
+            "sparse_row_min_fraction": float(sparse_row_min_fraction),
+            "row_range_start": row_range_start,
+            "row_range_end": row_range_end,
+            "applied": False,
+            "rows_after": initial_rows,
+        },
+    }
+
+    if max_samples is not None and int(max_samples) > 0 and int(max_samples) < len(prepared):
+        count = int(max_samples)
+        method = sample_selection.strip().lower()
+        if method == "head":
+            prepared = prepared.head(count).copy()
+        elif method == "tail":
+            prepared = prepared.tail(count).copy()
+        else:
+            indices = np.linspace(0, len(prepared) - 1, count, dtype=int)
+            prepared = prepared.iloc[indices].copy()
+            method = "uniform"
+        metadata["sample_plan"]["applied"] = True
+        metadata["sample_plan"]["selection"] = method
+        metadata["sample_plan"]["rows_after"] = int(len(prepared))
+
+    missing_strategy = missing_data_strategy.strip().lower()
+    if missing_strategy == "drop_rows":
+        prepared = prepared.dropna(axis=0).reset_index(drop=True)
+        metadata["missing_data_plan"]["applied"] = True
+    elif missing_strategy in {"fill_median", "median"}:
+        numeric_cols = [
+            col
+            for col in prepared.columns
+            if pd.to_numeric(prepared[col], errors="coerce").notna().sum() >= 3
+        ]
+        for col in numeric_cols:
+            numeric = pd.to_numeric(prepared[col], errors="coerce")
+            median = float(numeric.median()) if numeric.notna().any() else 0.0
+            prepared[col] = numeric.fillna(median)
+        metadata["missing_data_plan"]["applied"] = True
+        metadata["missing_data_plan"]["strategy"] = "fill_median"
+    elif missing_strategy in {"fill_constant", "constant"}:
+        fill_value = 0.0 if fill_constant_value is None else float(fill_constant_value)
+        numeric_cols = [
+            col
+            for col in prepared.columns
+            if pd.to_numeric(prepared[col], errors="coerce").notna().sum() >= 3
+        ]
+        for col in numeric_cols:
+            numeric = pd.to_numeric(prepared[col], errors="coerce")
+            prepared[col] = numeric.fillna(fill_value)
+        metadata["missing_data_plan"]["applied"] = True
+        metadata["missing_data_plan"]["strategy"] = "fill_constant"
+        metadata["missing_data_plan"]["fill_constant_value"] = fill_value
+    metadata["missing_data_plan"]["rows_after"] = int(len(prepared))
+
+    coverage_strategy = row_coverage_strategy.strip().lower()
+    if coverage_strategy in {"drop_sparse_rows", "drop_sparse"}:
+        row_cov = prepared.notna().mean(axis=1)
+        prepared = prepared.loc[row_cov >= float(sparse_row_min_fraction)].reset_index(drop=True)
+        metadata["row_coverage_plan"]["applied"] = True
+        metadata["row_coverage_plan"]["strategy"] = "drop_sparse_rows"
+    elif coverage_strategy in {"trim_dense_window", "trim"}:
+        row_cov = prepared.notna().mean(axis=1)
+        keep = np.where(row_cov.to_numpy(dtype=float) >= float(sparse_row_min_fraction))[0]
+        if len(keep) > 0:
+            prepared = prepared.iloc[int(keep[0]) : int(keep[-1]) + 1].reset_index(drop=True)
+            metadata["row_coverage_plan"]["applied"] = True
+            metadata["row_coverage_plan"]["strategy"] = "trim_dense_window"
+    elif coverage_strategy in {"manual_range", "range"}:
+        start = 0 if row_range_start is None else max(0, int(row_range_start))
+        end = len(prepared) - 1 if row_range_end is None else min(len(prepared) - 1, int(row_range_end))
+        if end < start:
+            raise ValueError(
+                f"Invalid row range [{start}, {end}] after bounds check; end must be >= start."
+            )
+        prepared = prepared.iloc[start : end + 1].reset_index(drop=True)
+        metadata["row_coverage_plan"]["applied"] = True
+        metadata["row_coverage_plan"]["strategy"] = "manual_range"
+        metadata["row_coverage_plan"]["row_range_start"] = start
+        metadata["row_coverage_plan"]["row_range_end"] = end
+    metadata["row_coverage_plan"]["rows_after"] = int(len(prepared))
+
+    if len(prepared) == 0:
+        raise ValueError(
+            "Preprocessing removed all rows. Relax filtering/range settings and retry."
+        )
+    metadata["final_rows"] = int(len(prepared))
+    return prepared, metadata
+
+
+def _planner_generate_strategy_candidates(
+    *,
+    user_plan: dict[str, Any],
+    max_candidates: int,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    base = dict(user_plan)
+    candidates.append({"candidate_id": "user_plan", "plan": base, "source": "user"})
+
+    # Controlled alternatives for critic scoring.
+    variants = [
+        {
+            "candidate_id": "fill_median_trim",
+            "plan": {
+                **base,
+                "missing_data_strategy": "fill_median",
+                "row_coverage_strategy": "trim_dense_window",
+                "sparse_row_min_fraction": max(0.7, float(base.get("sparse_row_min_fraction", 0.8))),
+            },
+            "source": "planner",
+        },
+        {
+            "candidate_id": "drop_rows_drop_sparse",
+            "plan": {
+                **base,
+                "missing_data_strategy": "drop_rows",
+                "row_coverage_strategy": "drop_sparse_rows",
+                "sparse_row_min_fraction": max(0.75, float(base.get("sparse_row_min_fraction", 0.8))),
+            },
+            "source": "planner",
+        },
+        {
+            "candidate_id": "fill_constant_keep",
+            "plan": {
+                **base,
+                "missing_data_strategy": "fill_constant",
+                "fill_constant_value": 0.0 if base.get("fill_constant_value") is None else base.get("fill_constant_value"),
+                "row_coverage_strategy": "keep",
+            },
+            "source": "planner",
+        },
+        {
+            "candidate_id": "keep_keep",
+            "plan": {
+                **base,
+                "missing_data_strategy": "keep",
+                "row_coverage_strategy": "keep",
+            },
+            "source": "planner",
+        },
+    ]
+    for item in variants:
+        if len(candidates) >= max_candidates:
+            break
+        if not any(c["candidate_id"] == item["candidate_id"] for c in candidates):
+            candidates.append(item)
+    return candidates[:max_candidates]
+
+
+def _planner_evaluate_candidates(
+    *,
+    frame: pd.DataFrame,
+    candidate_plans: list[dict[str, Any]],
+    timestamp_column: str | None,
+    target_signals: list[str] | None,
+    predictor_signals_by_target: dict[str, list[str]] | None,
+    max_lag: int,
+) -> list[dict[str, Any]]:
+    trace: list[dict[str, Any]] = []
+    for candidate in candidate_plans:
+        candidate_id = str(candidate.get("candidate_id", "candidate"))
+        plan = dict(candidate.get("plan", {}))
+        try:
+            prepared, prep_meta = _apply_preprocessing_plan(
+                frame=frame,
+                max_samples=plan.get("max_samples"),
+                sample_selection=str(plan.get("sample_selection", "uniform")),
+                missing_data_strategy=str(plan.get("missing_data_strategy", "keep")),
+                fill_constant_value=plan.get("fill_constant_value"),
+                row_coverage_strategy=str(plan.get("row_coverage_strategy", "keep")),
+                sparse_row_min_fraction=float(plan.get("sparse_row_min_fraction", 0.8)),
+                row_range_start=plan.get("row_range_start"),
+                row_range_end=plan.get("row_range_end"),
+            )
+            quality = run_quality_checks(prepared, timestamp_column=timestamp_column)
+            quick_targets = target_signals if target_signals else _top_numeric_targets(prepared, limit=3)
+            quick_corr = run_correlation_analysis(
+                frame=prepared,
+                target_signals=quick_targets,
+                predictor_signals_by_target=predictor_signals_by_target,
+                timestamp_column=timestamp_column,
+                max_lag=max_lag,
+                include_feature_engineering=False,
+                top_k_predictors=3,
+                confidence_top_k=0,
+                bootstrap_rounds=0,
+                stability_windows=3,
+            )
+            top_strength = _avg_top_strength(quick_corr.to_dict())
+            warning_penalty = min(0.2, 0.03 * len(quality.warnings))
+            rows_ratio = min(1.0, len(prepared) / max(len(frame), 1))
+            score = float(
+                max(
+                    0.0,
+                    min(
+                        1.0,
+                        0.55 * top_strength + 0.35 * quality.completeness_score + 0.10 * rows_ratio - warning_penalty,
+                    ),
+                )
+            )
+            trace.append(
+                {
+                    "candidate_id": candidate_id,
+                    "score": score,
+                    "rows": int(len(prepared)),
+                    "completeness": float(quality.completeness_score),
+                    "top_strength": float(top_strength),
+                    "warnings": list(quality.warnings),
+                    "plan": plan,
+                    "preprocessing": prep_meta,
+                    "error": "",
+                }
+            )
+        except Exception as exc:
+            trace.append(
+                {
+                    "candidate_id": candidate_id,
+                    "score": 0.0,
+                    "rows": 0,
+                    "completeness": 0.0,
+                    "top_strength": 0.0,
+                    "warnings": [],
+                    "plan": plan,
+                    "preprocessing": {},
+                    "error": str(exc),
+                }
+            )
+    return trace
+
+
+def _critic_choose_strategy(trace: list[dict[str, Any]]) -> dict[str, Any]:
+    if not trace:
+        return {"selected_candidate_id": "user_plan", "rationale": "no_candidates"}
+    ranked = sorted(trace, key=lambda item: float(item.get("score", 0.0)), reverse=True)
+    best = ranked[0]
+    second = ranked[1] if len(ranked) > 1 else None
+    margin = (
+        float(best.get("score", 0.0)) - float(second.get("score", 0.0))
+        if second is not None
+        else float(best.get("score", 0.0))
+    )
+    rationale = (
+        f"highest composite score={float(best.get('score', 0.0)):.3f} "
+        f"(margin={margin:.3f}, rows={best.get('rows')}, "
+        f"completeness={float(best.get('completeness', 0.0)):.3f}, "
+        f"top_strength={float(best.get('top_strength', 0.0)):.3f})"
+    )
+    return {
+        "selected_candidate_id": best.get("candidate_id", "user_plan"),
+        "rationale": rationale,
+        "margin": margin,
+    }
+
+
+def _candidate_plan_by_id(
+    candidates: list[dict[str, Any]],
+    candidate_id: Any,
+) -> dict[str, Any] | None:
+    key = str(candidate_id) if candidate_id is not None else ""
+    for item in candidates:
+        if str(item.get("candidate_id")) == key:
+            return dict(item.get("plan", {}))
+    return None
+
+
+def _avg_top_strength(correlations: dict[str, Any]) -> float:
+    targets = list(correlations.get("target_analyses", []))
+    if not targets:
+        return 0.0
+    vals: list[float] = []
+    for target in targets:
+        rows = list(target.get("predictor_results", []))
+        if not rows:
+            continue
+        vals.append(float(rows[0].get("best_abs_score", 0.0)))
+    if not vals:
+        return 0.0
+    return float(np.mean(vals))
+
+
+def _top_numeric_targets(frame: pd.DataFrame, *, limit: int) -> list[str]:
+    cols = _detect_numeric_signal_columns(frame)
+    return cols[:limit]
+
+
+def _dataset_slug_from_path(path: str) -> str:
+    stem = Path(path).stem.strip().lower()
+    safe = "".join(ch if ch.isalnum() else "_" for ch in stem)
+    safe = "_".join(token for token in safe.split("_") if token)
+    return safe or "dataset"

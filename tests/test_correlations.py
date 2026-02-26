@@ -24,6 +24,11 @@ def test_run_correlation_analysis_identifies_top_predictor() -> None:
     analysis = bundle.target_analyses[0]
     assert analysis.top_predictors
     assert analysis.top_predictors[0] == "x1"
+    top = analysis.predictor_results[0]
+    assert top.pearson_ci_low <= top.pearson <= top.pearson_ci_high
+    assert 0.0 <= top.pearson_pvalue <= 1.0
+    assert top.confounder_signal != ""
+    assert np.isfinite(top.partial_pearson) or np.isnan(top.partial_pearson)
 
     candidates = build_candidate_signals_from_correlations(bundle)
     assert candidates

@@ -177,6 +177,32 @@ def build_parser() -> argparse.ArgumentParser:
     run_agent1.add_argument("--max-lag", type=int, default=8)
     run_agent1.add_argument("--no-feature-engineering", action="store_true")
     run_agent1.add_argument("--feature-gain-threshold", type=float, default=0.05)
+    run_agent1.add_argument("--confidence-top-k", type=int, default=10)
+    run_agent1.add_argument("--bootstrap-rounds", type=int, default=40)
+    run_agent1.add_argument("--stability-windows", type=int, default=4)
+    run_agent1.add_argument("--max-samples", type=int, default=None)
+    run_agent1.add_argument(
+        "--sample-selection",
+        choices=["uniform", "head", "tail"],
+        default="uniform",
+    )
+    run_agent1.add_argument(
+        "--missing-data-strategy",
+        choices=["keep", "drop_rows", "fill_median", "fill_constant"],
+        default="keep",
+    )
+    run_agent1.add_argument("--fill-constant-value", type=float, default=None)
+    run_agent1.add_argument(
+        "--row-coverage-strategy",
+        choices=["keep", "drop_sparse_rows", "trim_dense_window", "manual_range"],
+        default="keep",
+    )
+    run_agent1.add_argument("--sparse-row-min-fraction", type=float, default=0.8)
+    run_agent1.add_argument("--row-range-start", type=int, default=None)
+    run_agent1.add_argument("--row-range-end", type=int, default=None)
+    run_agent1.add_argument("--no-strategy-search", action="store_true")
+    run_agent1.add_argument("--strategy-search-candidates", type=int, default=4)
+    run_agent1.add_argument("--no-save-artifacts", action="store_true")
     run_agent1.add_argument("--run-id", default=None)
     run_agent1.add_argument("--no-save-report", action="store_true")
 
@@ -206,12 +232,21 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             parser.error(str(exc))
             return 2
-        result = run_local_agent_once(
-            agent=args.agent,
-            user_message=args.message,
-            context=context,
-            config_path=args.config,
-        )
+        try:
+            result = _invoke_agent_once_with_recovery(
+                agent=args.agent,
+                user_message=args.message,
+                context=context,
+                config_path=args.config,
+            )
+        except Exception as exc:
+            message = _runtime_error_fallback_message(
+                agent=args.agent,
+                user_message=args.message,
+                error=exc,
+            )
+            print(json.dumps({"status": "error", "message": message}, indent=2))
+            return 1
         print(json.dumps(result, indent=2))
         return 0
 
@@ -264,6 +299,20 @@ def main(argv: list[str] | None = None) -> int:
             "max_lag": int(args.max_lag),
             "include_feature_engineering": not args.no_feature_engineering,
             "feature_gain_threshold": float(args.feature_gain_threshold),
+            "confidence_top_k": int(args.confidence_top_k),
+            "bootstrap_rounds": int(args.bootstrap_rounds),
+            "stability_windows": int(args.stability_windows),
+            "max_samples": args.max_samples,
+            "sample_selection": args.sample_selection,
+            "missing_data_strategy": args.missing_data_strategy,
+            "fill_constant_value": args.fill_constant_value,
+            "row_coverage_strategy": args.row_coverage_strategy,
+            "sparse_row_min_fraction": float(args.sparse_row_min_fraction),
+            "row_range_start": args.row_range_start,
+            "row_range_end": args.row_range_end,
+            "enable_strategy_search": not args.no_strategy_search,
+            "strategy_search_candidates": int(args.strategy_search_candidates),
+            "save_artifacts": not args.no_save_artifacts,
             "save_report": not args.no_save_report,
         }
         if args.sheet_name:
@@ -386,25 +435,6 @@ def _run_agent_session(
             print("Session state reset.")
             continue
 
-        if agent == "analyst" and _is_simple_greeting(user_message):
-            response = (
-                "Hi. I can chat and help with analysis. "
-                "To start dataset analysis, paste a .csv/.xlsx path. "
-                "You can also ask what checks I run before correlation."
-            )
-            print(f"agent> {response}")
-            session_messages.append({"role": "user", "content": user_message})
-            session_messages.append({"role": "assistant", "content": response})
-            session_messages = session_messages[-20:]
-            session_context["last_event"] = _compact_event_for_context(
-                {"status": "respond", "message": response, "error": ""}
-            )
-            turns += 1
-            if max_turns > 0 and turns >= max_turns:
-                print(f"Reached max turns ({max_turns}). Session ended.")
-                return 0
-            continue
-
         if agent == "analyst":
             autopilot = _run_analyst_autopilot_turn(
                 user_message=user_message,
@@ -426,14 +456,29 @@ def _run_agent_session(
         turn_context = dict(session_context)
         turn_context["session_messages"] = list(session_messages)
         try:
-            result = run_local_agent_once(
+            result = _invoke_agent_once_with_recovery(
                 agent=agent,
                 user_message=user_message,
                 context=turn_context,
                 config_path=config_path,
             )
         except Exception as exc:
-            print(f"agent> Runtime error: {exc}")
+            response = _runtime_error_fallback_message(
+                agent=agent,
+                user_message=user_message,
+                error=exc,
+            )
+            print(f"agent> {response}")
+            session_messages.append({"role": "user", "content": user_message})
+            session_messages.append({"role": "assistant", "content": response})
+            session_messages = session_messages[-20:]
+            session_context["last_event"] = _compact_event_for_context(
+                {"status": "respond", "message": response, "error": "runtime_error"}
+            )
+            turns += 1
+            if max_turns > 0 and turns >= max_turns:
+                print(f"Reached max turns ({max_turns}). Session ended.")
+                return 0
             continue
 
         event = result.get("event", {})
@@ -549,7 +594,24 @@ def _run_analyst_autopilot_turn(*, user_message: str, registry: Any) -> dict[str
     analysis_args: dict[str, Any] = {
         "data_path": data_path,
         "save_report": True,
+        "save_artifacts": True,
+        "enable_strategy_search": True,
+        "strategy_search_candidates": 4,
+        "include_feature_engineering": True,
+        "top_k_predictors": 10,
+        "feature_scan_predictors": 10,
+        "max_feature_opportunities": 20,
+        "confidence_top_k": 10,
+        "bootstrap_rounds": 40,
+        "stability_windows": 4,
     }
+    row_count = int(preflight.get("row_count") or 0)
+    sample_plan = _prompt_sample_budget(row_count=row_count)
+    analysis_args.update(sample_plan)
+
+    data_issue_plan = _prompt_data_issue_handling(preflight=preflight)
+    analysis_args.update(data_issue_plan)
+
     numeric_signals = [str(item) for item in (preflight.get("numeric_signal_columns") or [])]
     if len(numeric_signals) > 40:
         print(
@@ -568,14 +630,28 @@ def _run_analyst_autopilot_turn(*, user_message: str, registry: Any) -> dict[str
         if selected_targets is not None:
             analysis_args["target_signals"] = selected_targets
             print(f"agent> Using focused targets: {selected_targets}")
-            analysis_args["include_feature_engineering"] = False
-            analysis_args["max_lag"] = 2
             print(
-                "agent> Quick mode enabled for high-dimensional data "
-                "(feature engineering off, max_lag=2)."
+                "agent> Focused target mode enabled with full analysis "
+                "(multi-technique correlations + feature engineering)."
             )
         else:
             print("agent> Running full all-signal analysis as requested.")
+
+    timestamp_hint = str(preflight.get("timestamp_column_hint") or "").strip()
+    estimated_sample_period = _safe_float_or_none(preflight.get("estimated_sample_period_seconds"))
+    if timestamp_hint:
+        lag_plan = _prompt_lag_preferences(
+            timestamp_column_hint=timestamp_hint,
+            estimated_sample_period_seconds=estimated_sample_period,
+        )
+        analysis_args["timestamp_column"] = timestamp_hint
+        analysis_args["max_lag"] = int(lag_plan["max_lag"])
+        print(
+            "agent> Lag plan: "
+            f"enabled={lag_plan['enabled']}, "
+            f"dimension={lag_plan['dimension']}, "
+            f"max_lag_samples={lag_plan['max_lag']}."
+        )
 
     if selected_sheet:
         analysis_args["sheet_name"] = str(selected_sheet)
@@ -884,6 +960,316 @@ def _parse_target_selection_with_unknowns(
     return deduped, unknown
 
 
+def _prompt_lag_preferences(
+    *,
+    timestamp_column_hint: str,
+    estimated_sample_period_seconds: float | None,
+) -> dict[str, Any]:
+    print(f"agent> Detected timestamp column hint: `{timestamp_column_hint}`.")
+    while True:
+        print("agent> Do you expect time-based lag effects? [Y/n]")
+        answer = input("you> ").strip().lower()
+        if answer in {"", "y", "yes"}:
+            break
+        if answer in {"n", "no"}:
+            return {"enabled": False, "dimension": "none", "max_lag": 0}
+        if _looks_like_small_talk(answer):
+            print(
+                "agent> I can chat, and we are deciding lag analysis scope now. "
+                "Reply Y/Enter to investigate lags, or N to skip lag search."
+            )
+            continue
+        print("agent> Please answer Y/Enter or N.")
+
+    while True:
+        print("agent> Lag dimension? Enter `samples` or `seconds` [samples].")
+        dimension = input("you> ").strip().lower()
+        if dimension in {"", "samples", "sample"}:
+            max_lag_samples = _prompt_positive_int(
+                prompt=(
+                    "agent> Enter maximum lag in samples (positive integer). "
+                    "Press Enter for default 8."
+                ),
+                default_value=8,
+            )
+            return {"enabled": True, "dimension": "samples", "max_lag": max_lag_samples}
+        if dimension in {"seconds", "second", "sec", "s"}:
+            lag_seconds = _prompt_positive_float(
+                prompt=(
+                    "agent> Enter maximum lag window in seconds (positive number, for example 2.5)."
+                ),
+                default_value=None,
+            )
+            default_period = estimated_sample_period_seconds
+            if default_period is not None:
+                period_prompt = (
+                    "agent> Enter sample period in seconds. "
+                    f"Press Enter to use estimated {default_period:.6f}s."
+                )
+            else:
+                period_prompt = (
+                    "agent> Enter sample period in seconds "
+                    "(required to convert seconds to lag samples)."
+                )
+            sample_period = _prompt_positive_float(
+                prompt=period_prompt,
+                default_value=default_period,
+            )
+            max_lag_samples = max(1, int(round(lag_seconds / sample_period)))
+            return {"enabled": True, "dimension": "seconds", "max_lag": max_lag_samples}
+        if _looks_like_small_talk(dimension):
+            print(
+                "agent> We need a lag dimension choice to continue. "
+                "Use `samples` or `seconds`."
+            )
+            continue
+        print("agent> Invalid lag dimension. Use `samples` or `seconds`.")
+
+
+def _prompt_sample_budget(*, row_count: int) -> dict[str, Any]:
+    if row_count <= 0:
+        return {"max_samples": None, "sample_selection": "uniform"}
+    if row_count < 500:
+        return {"max_samples": None, "sample_selection": "uniform"}
+    print(f"agent> Dataset contains {row_count} rows.")
+    while True:
+        print("agent> Analyze all rows? [Y/n]")
+        answer = input("you> ").strip().lower()
+        if answer in {"", "y", "yes"}:
+            return {"max_samples": None, "sample_selection": "uniform"}
+        if answer in {"n", "no"}:
+            break
+        if _looks_like_small_talk(answer):
+            print(
+                "agent> We are choosing analysis sample count. "
+                "Reply Y/Enter for all rows, or N to set a subset."
+            )
+            continue
+        print("agent> Please answer Y/Enter or N.")
+
+    count = _prompt_positive_int(
+        prompt=(
+            "agent> Enter number of rows to analyze "
+            f"(1..{row_count})."
+        ),
+        default_value=min(row_count, 2000),
+    )
+    count = max(1, min(count, row_count))
+    while True:
+        print("agent> Sampling mode? Enter `uniform`, `head`, or `tail` [uniform].")
+        mode = input("you> ").strip().lower()
+        if mode in {"", "uniform"}:
+            return {"max_samples": count, "sample_selection": "uniform"}
+        if mode in {"head", "tail"}:
+            return {"max_samples": count, "sample_selection": mode}
+        if _looks_like_small_talk(mode):
+            print("agent> Sampling mode controls subset selection order. Use uniform/head/tail.")
+            continue
+        print("agent> Invalid mode. Use uniform, head, or tail.")
+
+
+def _prompt_data_issue_handling(*, preflight: dict[str, Any]) -> dict[str, Any]:
+    plan: dict[str, Any] = {
+        "missing_data_strategy": "keep",
+        "fill_constant_value": None,
+        "row_coverage_strategy": "keep",
+        "sparse_row_min_fraction": 0.8,
+        "row_range_start": None,
+        "row_range_end": None,
+    }
+    missing_fraction = _safe_float_or_none(preflight.get("missing_overall_fraction")) or 0.0
+    missing_cols_count = int(preflight.get("columns_with_missing_count") or 0)
+    missing_cols = [str(item) for item in (preflight.get("columns_with_missing") or [])]
+    if missing_fraction > 0.0:
+        preview = ", ".join(missing_cols[:8]) if missing_cols else "n/a"
+        print(
+            "agent> Missing-data detected: "
+            f"overall_fraction={missing_fraction:.3f}, "
+            f"columns_with_missing={missing_cols_count} "
+            f"(examples: {preview})."
+        )
+        print(
+            "agent> Choose missing-data handling: "
+            "`keep`, `drop_rows`, `fill_median`, `fill_constant` [keep]."
+        )
+        while True:
+            answer = input("you> ").strip().lower()
+            if answer in {"", "keep"}:
+                break
+            if answer in {"drop_rows", "fill_median", "fill_constant"}:
+                plan["missing_data_strategy"] = answer
+                if answer == "fill_constant":
+                    value = _prompt_numeric_value(
+                        prompt=(
+                            "agent> Enter fill constant (numeric). "
+                            "Use negative values if needed."
+                        ),
+                        default_value=0.0,
+                    )
+                    plan["fill_constant_value"] = float(value)
+                break
+            if _looks_like_small_talk(answer):
+                print(
+                    "agent> This choice controls NaN handling before correlation. "
+                    "Use keep/drop_rows/fill_median/fill_constant."
+                )
+                continue
+            print("agent> Invalid choice. Use keep, drop_rows, fill_median, or fill_constant.")
+
+    mismatch = bool(preflight.get("potential_length_mismatch"))
+    if mismatch:
+        row_min = _safe_float_or_none(preflight.get("row_non_null_fraction_min")) or 0.0
+        row_med = _safe_float_or_none(preflight.get("row_non_null_fraction_median")) or 0.0
+        row_max = _safe_float_or_none(preflight.get("row_non_null_fraction_max")) or 0.0
+        print(
+            "agent> Uneven row coverage detected (possible different signal lengths): "
+            f"min/median/max non-null fraction = {row_min:.3f}/{row_med:.3f}/{row_max:.3f}."
+        )
+        print(
+            "agent> Choose row-coverage handling: "
+            "`keep`, `drop_sparse_rows`, `trim_dense_window`, `manual_range` [keep]."
+        )
+        while True:
+            answer = input("you> ").strip().lower()
+            if answer in {"", "keep"}:
+                break
+            if answer in {"drop_sparse_rows", "trim_dense_window"}:
+                plan["row_coverage_strategy"] = answer
+                threshold = _prompt_fraction(
+                    prompt=(
+                        "agent> Enter non-null fraction threshold between 0 and 1 "
+                        "(default 0.8)."
+                    ),
+                    default_value=0.8,
+                )
+                plan["sparse_row_min_fraction"] = threshold
+                break
+            if answer == "manual_range":
+                plan["row_coverage_strategy"] = "manual_range"
+                start, end = _prompt_manual_row_range()
+                plan["row_range_start"] = start
+                plan["row_range_end"] = end
+                break
+            if _looks_like_small_talk(answer):
+                print(
+                    "agent> This choice controls how to align uneven row coverage. "
+                    "Use keep/drop_sparse_rows/trim_dense_window/manual_range."
+                )
+                continue
+            print(
+                "agent> Invalid choice. Use keep, drop_sparse_rows, "
+                "trim_dense_window, or manual_range."
+            )
+    return plan
+
+
+def _prompt_positive_int(*, prompt: str, default_value: int | None) -> int:
+    while True:
+        print(prompt)
+        raw = input("you> ").strip()
+        if not raw and default_value is not None:
+            return int(default_value)
+        try:
+            value = int(raw)
+        except ValueError:
+            if _looks_like_small_talk(raw):
+                print("agent> Please provide a positive integer value.")
+            else:
+                print("agent> Invalid number. Please provide a positive integer.")
+            continue
+        if value > 0:
+            return value
+        print("agent> Value must be > 0.")
+
+
+def _prompt_positive_float(*, prompt: str, default_value: float | None) -> float:
+    while True:
+        print(prompt)
+        raw = input("you> ").strip()
+        if not raw and default_value is not None:
+            return float(default_value)
+        try:
+            value = float(raw)
+        except ValueError:
+            if _looks_like_small_talk(raw):
+                print("agent> Please provide a positive numeric value.")
+            else:
+                print("agent> Invalid number. Please provide a positive numeric value.")
+            continue
+        if value > 0.0:
+            return value
+        print("agent> Value must be > 0.")
+
+
+def _prompt_fraction(*, prompt: str, default_value: float) -> float:
+    while True:
+        print(prompt)
+        raw = input("you> ").strip()
+        if not raw:
+            return float(default_value)
+        try:
+            value = float(raw)
+        except ValueError:
+            if _looks_like_small_talk(raw):
+                print("agent> Please provide a number between 0 and 1.")
+            else:
+                print("agent> Invalid value. Please provide a number between 0 and 1.")
+            continue
+        if 0.0 < value <= 1.0:
+            return value
+        print("agent> Threshold must be in (0, 1].")
+
+
+def _prompt_numeric_value(*, prompt: str, default_value: float) -> float:
+    while True:
+        print(prompt)
+        raw = input("you> ").strip()
+        if not raw:
+            return float(default_value)
+        try:
+            return float(raw)
+        except ValueError:
+            if _looks_like_small_talk(raw):
+                print("agent> Please provide a numeric value.")
+            else:
+                print("agent> Invalid value. Please provide a numeric value.")
+
+
+def _prompt_manual_row_range() -> tuple[int, int]:
+    while True:
+        print("agent> Enter manual row range as `start,end` (0-based, inclusive).")
+        raw = input("you> ").strip()
+        parsed = _parse_row_range(raw)
+        if parsed is not None:
+            return parsed
+        if _looks_like_small_talk(raw):
+            print("agent> Use numeric row range like `100,2500`.")
+            continue
+        print("agent> Invalid range. Use `start,end` with end >= start.")
+
+
+def _parse_row_range(raw: str) -> tuple[int, int] | None:
+    text = raw.strip()
+    match = re.match(r"^\s*(\d+)\s*,\s*(\d+)\s*$", text)
+    if not match:
+        return None
+    start = int(match.group(1))
+    end = int(match.group(2))
+    if end < start:
+        return None
+    return start, end
+
+
+def _safe_float_or_none(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
+
+
 def _print_signal_names(signals: list[str], *, query: str) -> None:
     q = query.strip().lower()
     if q:
@@ -923,12 +1309,8 @@ def _rewrite_unhelpful_response(*, agent: str, user_message: str, response: str)
         "too many invalid actions",
     )
     if any(marker in lowered for marker in fallback_markers):
-        if _is_simple_greeting(user_message):
-            return (
-                "Hi. I can chat and help with analysis. "
-                "To start dataset analysis, paste a .csv/.xlsx path. "
-                "You can also ask what steps I run before modeling."
-            )
+        if _is_casual_chat_message(user_message):
+            return _casual_chat_response(user_message)
         if _extract_first_data_path(user_message) is None:
             return (
                 "I can help with that. For data analysis, paste a .csv/.xlsx path. "
@@ -941,6 +1323,112 @@ def _rewrite_unhelpful_response(*, agent: str, user_message: str, response: str)
 def _is_simple_greeting(text: str) -> bool:
     normalized = text.strip().lower()
     return normalized in {"hi", "hello", "hey", "yo", "good morning", "good evening"}
+
+
+def _is_casual_chat_message(text: str) -> bool:
+    normalized = text.strip().lower()
+    if not normalized:
+        return False
+    if _is_simple_greeting(normalized):
+        return True
+    phrases = {
+        "how are you",
+        "who are you",
+        "what can you do",
+        "what?",
+        "thanks",
+        "thank you",
+    }
+    return any(phrase in normalized for phrase in phrases)
+
+
+def _casual_chat_response(user_message: str) -> str:
+    normalized = user_message.strip().lower()
+    if "how are you" in normalized:
+        return (
+            "I am ready to help. I can chat and run analysis locally. "
+            "Paste a .csv/.xlsx path when you want to start."
+        )
+    if "who are you" in normalized or "what can you do" in normalized:
+        return (
+            "I am your local Corr2Surrogate analyst. I can ingest CSV/XLSX, validate headers/sheets, "
+            "run quality checks, stationarity checks, correlation analysis, and generate reports."
+        )
+    return (
+        "Hi. I can chat and help with analysis. "
+        "To start dataset analysis, paste a .csv/.xlsx path. "
+        "You can also ask what checks I run before correlation."
+    )
+
+
+def _runtime_error_fallback_message(*, agent: str, user_message: str, error: Exception) -> str:
+    if _is_provider_connection_error(error):
+        if agent == "analyst":
+            return (
+                "Local LLM runtime is not reachable at the configured endpoint. "
+                "Start it with `corr2surrogate setup-local-llm` (or launch your local provider), "
+                "then retry. I can still run deterministic ingestion/analysis if you paste a "
+                ".csv/.xlsx path."
+            )
+        return (
+            "Local LLM runtime is not reachable at the configured endpoint. "
+            "Start it with `corr2surrogate setup-local-llm` (or launch your local provider) and retry."
+        )
+    return f"Runtime error: {error}"
+
+
+def _invoke_agent_once_with_recovery(
+    *,
+    agent: str,
+    user_message: str,
+    context: dict[str, Any],
+    config_path: str | None,
+) -> dict[str, Any]:
+    try:
+        return run_local_agent_once(
+            agent=agent,
+            user_message=user_message,
+            context=context,
+            config_path=config_path,
+        )
+    except Exception as exc:
+        if not _is_provider_connection_error(exc):
+            raise
+        # Best effort: start/check local runtime, then retry exactly once.
+        try:
+            setup_local_llm(
+                config_path=config_path,
+                provider=None,
+                profile_name=None,
+                model=None,
+                endpoint=None,
+                install_provider=False,
+                start_runtime=True,
+                pull_model=False,
+                download_model=False,
+                llama_model_path=None,
+                llama_model_url=None,
+                timeout_seconds=30,
+            )
+        except Exception:
+            pass
+        return run_local_agent_once(
+            agent=agent,
+            user_message=user_message,
+            context=context,
+            config_path=config_path,
+        )
+
+
+def _is_provider_connection_error(error: Exception) -> bool:
+    lowered = str(error).lower()
+    markers = (
+        "provider connection error",
+        "connection refused",
+        "winerror 10061",
+        "failed to establish a new connection",
+    )
+    return any(marker in lowered for marker in markers)
 
 
 def _looks_like_small_talk(text: str) -> bool:

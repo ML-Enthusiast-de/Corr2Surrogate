@@ -149,15 +149,42 @@ corr2surrogate run-agent-session --agent analyst
 Behavior:
 - Agent detects the file path and runs deterministic ingestion + Agent 1 analysis.
 - If sheet/header is ambiguous, Agent asks in CLI and continues after your input.
+- In sheet/header/target prompts, casual chat still works and the agent steers you back to the pending decision.
+- For large datasets, Agent asks if you want full data or a sample subset (uniform/head/tail + row count).
+- If NaN or uneven row coverage is detected, Agent asks how to proceed (`keep`, `drop_rows`, `fill_median`, `fill_constant`, `drop_sparse_rows`, `trim_dense_window`, `manual_range`).
 - For wide datasets, Agent asks for target focus; type `list` (or `list <filter>`) to show signal names.
+- For time-like datasets, Agent asks whether lag analysis is expected and lets you choose lag dimension (`samples` or `seconds`) and search window.
 - Report is saved in dataset-related folder:
   - `reports/<dataset_slug>/agent1_<timestamp>.md`
   - example: `reports/rde_v19_1_143_kopie/agent1_20260225_120501.md`
+- Report content includes per-target top 10 predictors with correlation type/strength (pearson, spearman, kendall, distance, lagged) plus top feature-engineering opportunities.
+- Agent 1 now also includes:
+  - confidence + stability layer for top predictors (bootstrap CI, approximate p-value, window stability),
+  - confounder-aware stats (partial correlation + conditional MI for top predictors),
+  - planner/critic preprocessing strategy search (candidate plans scored before final run),
+  - sensor diagnostics and trust scoring (saturation/quantization/drift/dropout/stuck),
+  - experiment trajectory recommendations for targeted new data collection,
+  - run lineage (`.lineage.json`) for reproducibility,
+  - artifact export folder with CSV/JSON (and optional plot when `matplotlib` is available).
 
 Run deterministic Agent 1 analysis directly:
 ```bash
 corr2surrogate run-agent1-analysis --data-path data/private/run1.csv --timestamp-column time
 ```
+Useful flags for advanced analysis:
+```bash
+corr2surrogate run-agent1-analysis \
+  --data-path data/private/run1.csv \
+  --timestamp-column time \
+  --confidence-top-k 10 \
+  --bootstrap-rounds 40 \
+  --stability-windows 4 \
+  --strategy-search-candidates 4
+```
+Outputs are saved under `reports/<dataset_slug>/`:
+- markdown report: `agent1_<timestamp>.md`
+- run lineage: `agent1_<timestamp>.lineage.json`
+- artifacts folder: `agent1_<timestamp>_artifacts/`
 
 ## Troubleshooting (Windows)
 If PowerShell says `corr2surrogate` is not recognized:
@@ -176,6 +203,11 @@ If execution policy blocks activation, run without activation:
 ```powershell
 .\.venv\Scripts\corr2surrogate.exe run-agent-session --agent analyst
 ```
+If local chat turns fail due provider endpoint not reachable, start/check local runtime:
+```powershell
+corr2surrogate setup-local-llm
+```
+Session mode also performs a best-effort local-runtime recovery and retries once before returning an error.
 
 Run leak scan before commit/push:
 ```bash

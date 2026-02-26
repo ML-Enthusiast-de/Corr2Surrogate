@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from itertools import combinations
+import math
 from typing import Any
 
 import numpy as np
@@ -27,6 +28,16 @@ class PairCorrelationResult:
     lagged_pearson: float
     best_method: str
     best_abs_score: float
+    pearson_ci_low: float = float("nan")
+    pearson_ci_high: float = float("nan")
+    pearson_pvalue: float = float("nan")
+    spearman_ci_low: float = float("nan")
+    spearman_ci_high: float = float("nan")
+    spearman_pvalue: float = float("nan")
+    stability_score: float = float("nan")
+    confounder_signal: str = ""
+    partial_pearson: float = float("nan")
+    conditional_mi: float = float("nan")
 
 
 @dataclass(frozen=True)
@@ -86,7 +97,13 @@ def run_correlation_analysis(
     min_samples: int = 8,
     include_feature_engineering: bool = True,
     feature_gain_threshold: float = 0.05,
-    top_k_predictors: int = 5,
+    top_k_predictors: int = 10,
+    feature_scan_predictors: int = 10,
+    feature_pair_predictors: int = 5,
+    max_feature_opportunities: int = 20,
+    confidence_top_k: int = 10,
+    bootstrap_rounds: int = 40,
+    stability_windows: int = 4,
 ) -> CorrelationAnalysisBundle:
     """Run multi-technique correlation analysis for each target."""
     ts_col = _resolve_timestamp_column(frame, explicit=timestamp_column)
@@ -116,6 +133,17 @@ def run_correlation_analysis(
                 pair_results.append(pair)
 
         pair_results.sort(key=lambda item: item.best_abs_score, reverse=True)
+        if pair_results and confidence_top_k > 0:
+            pair_results = _augment_top_pairs_with_confidence_and_confounding(
+                frame=frame,
+                target=target,
+                pair_results=pair_results,
+                top_k=min(confidence_top_k, len(pair_results)),
+                bootstrap_rounds=bootstrap_rounds,
+                stability_windows=stability_windows,
+                data_mode=data_mode,
+                min_samples=min_samples,
+            )
         top_predictors = [item.predictor_signal for item in pair_results[:top_k_predictors]]
         opportunities: list[FeatureEngineeringOpportunity] = []
         if include_feature_engineering:
@@ -126,6 +154,9 @@ def run_correlation_analysis(
                 data_mode=data_mode,
                 gain_threshold=feature_gain_threshold,
                 max_lag=max_lag,
+                max_opportunities=max_feature_opportunities,
+                max_predictors_to_scan=feature_scan_predictors,
+                max_pair_predictors=feature_pair_predictors,
             )
         analyses.append(
             TargetCorrelationAnalysis(
@@ -186,7 +217,9 @@ def discover_feature_engineering_opportunities(
     data_mode: str,
     gain_threshold: float = 0.05,
     max_lag: int = 8,
-    max_opportunities: int = 12,
+    max_opportunities: int = 20,
+    max_predictors_to_scan: int = 10,
+    max_pair_predictors: int = 5,
 ) -> list[FeatureEngineeringOpportunity]:
     """Discover transformations with stronger target association than raw signal."""
     opportunities: list[FeatureEngineeringOpportunity] = []
@@ -194,7 +227,7 @@ def discover_feature_engineering_opportunities(
         return opportunities
 
     target_series = pd.to_numeric(frame[target_signal], errors="coerce")
-    top_predictors = predictor_results[:5]
+    top_predictors = predictor_results[: max(1, max_predictors_to_scan)]
 
     for item in top_predictors:
         predictor = item.predictor_signal
@@ -218,7 +251,9 @@ def discover_feature_engineering_opportunities(
                 )
 
     if len(top_predictors) >= 2:
-        pair_cols = [item.predictor_signal for item in top_predictors[:3]]
+        pair_cols = [
+            item.predictor_signal for item in top_predictors[: max(2, max_pair_predictors)]
+        ]
         for a, b in combinations(pair_cols, 2):
             sa = pd.to_numeric(frame[a], errors="coerce")
             sb = pd.to_numeric(frame[b], errors="coerce")
@@ -427,6 +462,197 @@ def _safe_corr(a: pd.Series, b: pd.Series, *, method: str) -> float:
 
     value = x.corr(y, method=method)
     return float(value) if value is not None else float("nan")
+
+
+def _augment_top_pairs_with_confidence_and_confounding(
+    *,
+    frame: pd.DataFrame,
+    target: str,
+    pair_results: list[PairCorrelationResult],
+    top_k: int,
+    bootstrap_rounds: int,
+    stability_windows: int,
+    data_mode: str,
+    min_samples: int,
+) -> list[PairCorrelationResult]:
+    if top_k <= 0:
+        return pair_results
+    updated = list(pair_results)
+    top_predictors = [item.predictor_signal for item in pair_results[:top_k]]
+    if not top_predictors:
+        return updated
+    confounder_by_predictor: dict[str, str] = {}
+    fallback = top_predictors[0]
+    for predictor in top_predictors:
+        alternatives = [name for name in top_predictors if name != predictor]
+        confounder_by_predictor[predictor] = alternatives[0] if alternatives else fallback
+
+    for idx in range(top_k):
+        base = updated[idx]
+        x = pd.to_numeric(frame[target], errors="coerce")
+        y = pd.to_numeric(frame[base.predictor_signal], errors="coerce")
+        aligned_xy = pd.concat([x, y], axis=1).dropna()
+        if len(aligned_xy) < min_samples:
+            continue
+        x_arr = aligned_xy.iloc[:, 0].to_numpy(dtype=float)
+        y_arr = aligned_xy.iloc[:, 1].to_numpy(dtype=float)
+
+        pearson_ci_low, pearson_ci_high, pearson_pvalue = _bootstrap_ci_and_pvalue(
+            x_arr, y_arr, method="pearson", rounds=bootstrap_rounds
+        )
+        spearman_ci_low, spearman_ci_high, spearman_pvalue = _bootstrap_ci_and_pvalue(
+            x_arr, y_arr, method="spearman", rounds=bootstrap_rounds
+        )
+        stability_score = _window_stability_score(
+            x_arr, y_arr, windows=stability_windows, data_mode=data_mode
+        )
+
+        confounder = confounder_by_predictor.get(base.predictor_signal, "")
+        partial_pearson = float("nan")
+        conditional_mi = float("nan")
+        if confounder and confounder in frame.columns and confounder != base.predictor_signal:
+            z = pd.to_numeric(frame[confounder], errors="coerce")
+            aligned_xyz = pd.concat([x, y, z], axis=1).dropna()
+            if len(aligned_xyz) >= min_samples:
+                xv = aligned_xyz.iloc[:, 0].to_numpy(dtype=float)
+                yv = aligned_xyz.iloc[:, 1].to_numpy(dtype=float)
+                zv = aligned_xyz.iloc[:, 2].to_numpy(dtype=float)
+                partial_pearson = _partial_correlation(xv, yv, zv)
+                conditional_mi = _conditional_mi_gaussian(xv, yv, zv)
+
+        updated[idx] = PairCorrelationResult(
+            target_signal=base.target_signal,
+            predictor_signal=base.predictor_signal,
+            sample_count=base.sample_count,
+            pearson=base.pearson,
+            spearman=base.spearman,
+            kendall=base.kendall,
+            distance_corr=base.distance_corr,
+            best_lag=base.best_lag,
+            lagged_pearson=base.lagged_pearson,
+            best_method=base.best_method,
+            best_abs_score=base.best_abs_score,
+            pearson_ci_low=pearson_ci_low,
+            pearson_ci_high=pearson_ci_high,
+            pearson_pvalue=pearson_pvalue,
+            spearman_ci_low=spearman_ci_low,
+            spearman_ci_high=spearman_ci_high,
+            spearman_pvalue=spearman_pvalue,
+            stability_score=stability_score,
+            confounder_signal=confounder,
+            partial_pearson=partial_pearson,
+            conditional_mi=conditional_mi,
+        )
+    return updated
+
+
+def _bootstrap_ci_and_pvalue(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    method: str,
+    rounds: int,
+) -> tuple[float, float, float]:
+    if len(x) < 4 or len(y) < 4:
+        return float("nan"), float("nan"), float("nan")
+    observed = _corr_array(x, y, method=method)
+    if not math.isfinite(observed):
+        return float("nan"), float("nan"), float("nan")
+
+    if rounds <= 0:
+        pvalue = _approx_corr_pvalue(observed, n=len(x))
+        return float("nan"), float("nan"), pvalue
+
+    rng = np.random.default_rng(42)
+    vals: list[float] = []
+    n = len(x)
+    for _ in range(rounds):
+        indices = rng.integers(0, n, size=n)
+        val = _corr_array(x[indices], y[indices], method=method)
+        if math.isfinite(val):
+            vals.append(float(val))
+    if len(vals) < 5:
+        return float("nan"), float("nan"), _approx_corr_pvalue(observed, n=len(x))
+
+    low = float(np.quantile(vals, 0.025))
+    high = float(np.quantile(vals, 0.975))
+    return low, high, _approx_corr_pvalue(observed, n=len(x))
+
+
+def _corr_array(x: np.ndarray, y: np.ndarray, *, method: str) -> float:
+    xs = pd.Series(x)
+    ys = pd.Series(y)
+    return _safe_corr(xs, ys, method=method)
+
+
+def _approx_corr_pvalue(rho: float, *, n: int) -> float:
+    if n < 4 or not math.isfinite(rho):
+        return float("nan")
+    clipped = max(min(rho, 0.999999), -0.999999)
+    z = abs(np.arctanh(clipped)) * math.sqrt(max(n - 3, 1))
+    p = 2.0 * (1.0 - _normal_cdf(z))
+    return float(max(0.0, min(1.0, p)))
+
+
+def _normal_cdf(z: float) -> float:
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def _window_stability_score(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    windows: int,
+    data_mode: str,
+) -> float:
+    n = len(x)
+    if n < 20 or windows < 2:
+        return float("nan")
+    order_x = x
+    order_y = y
+    if data_mode != "time_series":
+        rng = np.random.default_rng(7)
+        idx = rng.permutation(n)
+        order_x = x[idx]
+        order_y = y[idx]
+    splits = np.array_split(np.arange(n), windows)
+    vals: list[float] = []
+    for split in splits:
+        if len(split) < 4:
+            continue
+        corr = _corr_array(order_x[split], order_y[split], method="pearson")
+        if math.isfinite(corr):
+            vals.append(abs(corr))
+    if len(vals) < 2:
+        return float("nan")
+    mean = float(np.mean(vals))
+    std = float(np.std(vals))
+    if mean <= 1e-8:
+        return 0.0
+    score = 1.0 - min(1.0, std / mean)
+    return float(max(0.0, min(1.0, score)))
+
+
+def _partial_correlation(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> float:
+    if len(x) < 4:
+        return float("nan")
+    zc = z - np.mean(z)
+    denom = float(np.dot(zc, zc))
+    if denom <= 1e-12:
+        return _pearson_numeric(x, y)
+    bx = float(np.dot(x - np.mean(x), zc) / denom)
+    by = float(np.dot(y - np.mean(y), zc) / denom)
+    rx = x - (np.mean(x) + bx * zc)
+    ry = y - (np.mean(y) + by * zc)
+    return _pearson_numeric(rx, ry)
+
+
+def _conditional_mi_gaussian(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> float:
+    rho = _partial_correlation(x, y, z)
+    if not math.isfinite(rho):
+        return float("nan")
+    clipped = max(min(abs(rho), 0.999999), 0.0)
+    return float(max(0.0, -0.5 * math.log(max(1e-12, 1.0 - clipped * clipped))))
 
 
 def _pearson_numeric(x: np.ndarray, y: np.ndarray) -> float:

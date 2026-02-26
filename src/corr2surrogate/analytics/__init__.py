@@ -10,6 +10,16 @@ from .correlations import (
     run_correlation_analysis,
 )
 from .quality_checks import QualityCheckResult, run_quality_checks
+from .sensor_diagnostics import (
+    SensorDiagnostic,
+    SensorDiagnosticsSummary,
+    run_sensor_diagnostics,
+)
+from .experiment_design import (
+    ExperimentRecommendation,
+    recommend_data_trajectories,
+    recommendations_to_dict,
+)
 from .ranking import (
     CandidateSignal,
     ForcedModelingDirective,
@@ -17,7 +27,11 @@ from .ranking import (
     build_forced_directive,
     rank_surrogate_candidates,
 )
-from .reporting import build_agent1_report_payload, save_agent1_markdown_report
+from .reporting import (
+    build_agent1_report_payload,
+    save_agent1_artifacts,
+    save_agent1_markdown_report,
+)
 from .stationarity import StationaritySignalResult, StationaritySummary, assess_stationarity
 
 __all__ = [
@@ -27,6 +41,9 @@ __all__ = [
     "ForcedModelingDirective",
     "PairCorrelationResult",
     "QualityCheckResult",
+    "SensorDiagnostic",
+    "SensorDiagnosticsSummary",
+    "ExperimentRecommendation",
     "RankedSignal",
     "StationaritySignalResult",
     "StationaritySummary",
@@ -39,5 +56,9 @@ __all__ = [
     "rank_surrogate_candidates",
     "run_correlation_analysis",
     "run_quality_checks",
+    "run_sensor_diagnostics",
+    "recommend_data_trajectories",
+    "recommendations_to_dict",
+    "save_agent1_artifacts",
     "save_agent1_markdown_report",
 ]

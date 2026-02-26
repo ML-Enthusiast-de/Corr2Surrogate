@@ -585,17 +585,163 @@ def test_cli_run_agent_session_rewrites_greeting_tool_error_fallback(monkeypatch
     assert "Hi. I can chat and help with analysis." in output
 
 
-def test_cli_run_agent_session_fast_greeting_bypasses_llm(monkeypatch, capsys) -> None:
+def test_cli_run_agent_session_greeting_uses_llm(monkeypatch, capsys) -> None:
     inputs = iter(["hello", "/exit"])
+    calls = []
     monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
-    monkeypatch.setattr(
-        "corr2surrogate.ui.cli.run_local_agent_once",
-        lambda **_: (_ for _ in ()).throw(AssertionError("LLM should not be called for greeting")),
-    )
+
+    def fake_run_local_agent_once(*, agent, user_message, context, config_path):
+        calls.append((agent, user_message))
+        return {"event": {"message": "LLM says hello"}}
+
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", fake_run_local_agent_once)
     exit_code = main(["run-agent-session", "--agent", "analyst"])
     assert exit_code == 0
+    assert calls and calls[0][1] == "hello"
     output = capsys.readouterr().out
-    assert "Hi. I can chat and help with analysis." in output
+    assert "LLM says hello" in output
+
+
+def test_cli_run_agent_session_how_are_you_uses_llm(monkeypatch, capsys) -> None:
+    inputs = iter(["how are you", "/exit"])
+    calls = []
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+
+    def fake_run_local_agent_once(*, agent, user_message, context, config_path):
+        calls.append((agent, user_message))
+        return {"event": {"message": "LLM says I am fine."}}
+
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", fake_run_local_agent_once)
+    exit_code = main(["run-agent-session", "--agent", "analyst"])
+    assert exit_code == 0
+    assert calls and calls[0][1] == "how are you"
+    output = capsys.readouterr().out
+    assert "LLM says I am fine." in output
+
+
+def test_cli_run_agent_session_provider_connection_error_is_friendly(monkeypatch, capsys) -> None:
+    inputs = iter(["what happened", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+
+    calls = {"count": 0}
+
+    def _raise_provider_error(**_kwargs):
+        calls["count"] += 1
+        raise RuntimeError(
+            "Provider connection error at http://127.0.0.1:8000/v1/chat/completions: "
+            "<urlopen error [WinError 10061] connection refused>"
+        )
+
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _raise_provider_error)
+    monkeypatch.setattr("corr2surrogate.ui.cli.setup_local_llm", lambda **_: {"ready": False})
+    exit_code = main(["run-agent-session", "--agent", "analyst"])
+    assert exit_code == 0
+    assert calls["count"] == 2
+    output = capsys.readouterr().out
+    assert "Local LLM runtime is not reachable" in output
+    assert "setup-local-llm" in output
+    assert "WinError 10061" not in output
+
+
+def test_cli_run_agent_session_analyst_lag_prompt_sets_max_lag(monkeypatch, tmp_path: Path) -> None:
+    data_path = tmp_path / "lag_flow.xlsx"
+    data_path.write_text("placeholder", encoding="utf-8")
+    inputs = iter([f"Analyze {data_path}", "y", "samples", "12", "/exit"])
+    registry = _SessionRegistry(
+        scripted_outputs={
+            "prepare_ingestion_step": [
+                {
+                    "status": "ok",
+                    "message": "Ingestion ready.",
+                    "options": [],
+                    "selected_sheet": "S1",
+                    "available_sheets": ["S1"],
+                    "row_count": 100,
+                    "column_count": 10,
+                    "signal_columns": ["recorder_time", "sig_a", "sig_b"],
+                    "numeric_signal_columns": ["sig_a", "sig_b"],
+                    "timestamp_column_hint": "recorder_time",
+                    "estimated_sample_period_seconds": 0.2,
+                    "header_row": 0,
+                    "data_start_row": 1,
+                    "header_confidence": 0.95,
+                    "needs_user_confirmation": False,
+                }
+            ],
+            "run_agent1_analysis": [
+                {
+                    "status": "ok",
+                    "data_mode": "time_series",
+                    "target_count": 2,
+                    "candidate_count": 1,
+                    "report_path": "reports/lag_flow/agent1_20260226_120000.md",
+                }
+            ],
+        }
+    )
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    exit_code = main(["run-agent-session", "--agent", "analyst"])
+    assert exit_code == 0
+    assert registry.calls[1][0] == "run_agent1_analysis"
+    assert registry.calls[1][1]["timestamp_column"] == "recorder_time"
+    assert registry.calls[1][1]["max_lag"] == 12
+
+
+def test_cli_run_agent_session_analyst_prompts_missing_and_length_handling(
+    monkeypatch, tmp_path: Path
+) -> None:
+    data_path = tmp_path / "nan_len_flow.xlsx"
+    data_path.write_text("placeholder", encoding="utf-8")
+    inputs = iter([f"Analyze {data_path}", "fill_median", "trim_dense_window", "0.85", "/exit"])
+    registry = _SessionRegistry(
+        scripted_outputs={
+            "prepare_ingestion_step": [
+                {
+                    "status": "ok",
+                    "message": "Ingestion ready.",
+                    "options": [],
+                    "selected_sheet": "S1",
+                    "available_sheets": ["S1"],
+                    "row_count": 120,
+                    "column_count": 8,
+                    "signal_columns": ["a", "b", "c"],
+                    "numeric_signal_columns": ["a", "b", "c"],
+                    "missing_overall_fraction": 0.21,
+                    "columns_with_missing_count": 3,
+                    "columns_with_missing": ["a", "b", "c"],
+                    "row_non_null_fraction_min": 0.45,
+                    "row_non_null_fraction_median": 0.88,
+                    "row_non_null_fraction_max": 1.0,
+                    "potential_length_mismatch": True,
+                    "header_row": 0,
+                    "data_start_row": 1,
+                    "header_confidence": 0.95,
+                    "needs_user_confirmation": False,
+                }
+            ],
+            "run_agent1_analysis": [
+                {
+                    "status": "ok",
+                    "data_mode": "steady_state",
+                    "target_count": 2,
+                    "candidate_count": 1,
+                    "report_path": "reports/nan_len_flow/agent1_20260226_120000.md",
+                }
+            ],
+        }
+    )
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    exit_code = main(["run-agent-session", "--agent", "analyst"])
+    assert exit_code == 0
+    assert registry.calls[1][0] == "run_agent1_analysis"
+    args = registry.calls[1][1]
+    assert args["missing_data_strategy"] == "fill_median"
+    assert args["row_coverage_strategy"] == "trim_dense_window"
+    assert float(args["sparse_row_min_fraction"]) == 0.85
 
 
 def test_cli_run_agent_session_prints_welcome_message(monkeypatch, capsys) -> None:
