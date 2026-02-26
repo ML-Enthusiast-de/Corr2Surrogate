@@ -174,6 +174,19 @@ def build_parser() -> argparse.ArgumentParser:
         default="[]",
         help="JSON array of forced requests: [{target_signal,predictor_signals,user_reason}]",
     )
+    run_agent1.add_argument(
+        "--user-hypotheses-json",
+        default="[]",
+        help="JSON array of correlation hypotheses: [{target_signal,predictor_signals,user_reason}]",
+    )
+    run_agent1.add_argument(
+        "--feature-hypotheses-json",
+        default="[]",
+        help=(
+            "JSON array of feature hypotheses: "
+            "[{target_signal?,base_signal,transformation,user_reason}]"
+        ),
+    )
     run_agent1.add_argument("--max-lag", type=int, default=8)
     run_agent1.add_argument("--no-feature-engineering", action="store_true")
     run_agent1.add_argument("--feature-gain-threshold", type=float, default=0.05)
@@ -288,6 +301,12 @@ def main(argv: list[str] | None = None) -> int:
             forced_requests = _parse_json_array(
                 args.forced_requests_json, arg_name="--forced-requests-json"
             )
+            user_hypotheses = _parse_json_array(
+                args.user_hypotheses_json, arg_name="--user-hypotheses-json"
+            )
+            feature_hypotheses = _parse_json_array(
+                args.feature_hypotheses_json, arg_name="--feature-hypotheses-json"
+            )
         except ValueError as exc:
             parser.error(str(exc))
             return 2
@@ -296,6 +315,8 @@ def main(argv: list[str] | None = None) -> int:
             "data_path": args.data_path,
             "predictor_signals_by_target": predictor_map,
             "forced_requests": forced_requests,
+            "user_hypotheses": user_hypotheses,
+            "feature_hypotheses": feature_hypotheses,
             "max_lag": int(args.max_lag),
             "include_feature_engineering": not args.no_feature_engineering,
             "feature_gain_threshold": float(args.feature_gain_threshold),
@@ -380,11 +401,27 @@ def _run_agent_session(
 
     print(f"agent> Welcome to Corr2Surrogate ({agent} session).")
     if agent == "analyst":
+        default_dataset_path = _resolve_default_public_dataset_path()
         print("agent> I can chat, inspect CSV/XLSX data, run Agent 1 analysis, and save reports.")
         print(
             "agent> Useful commands: /help, /context, /reset, /exit. "
             "At target selection use: list, list <filter>, all, or comma-separated names."
         )
+        print(
+            "agent> Hypothesis syntax: "
+            "`hypothesis corr target:pred1,pred2; target2:pred3` and "
+            "`hypothesis feature target:signal->rate_change; signal2->square`."
+        )
+        if default_dataset_path is not None:
+            print(
+                "agent> Dataset choice: paste a CSV/XLSX path or type `default` "
+                f"to run the built-in test dataset: `{default_dataset_path}`."
+            )
+        else:
+            print(
+                "agent> Dataset choice: paste a CSV/XLSX path. "
+                "(`default` is unavailable because no public test dataset was found.)"
+            )
     else:
         print("agent> I can chat and run local modeler workflows through tool calls.")
         print("agent> Useful commands: /help, /context, /reset, /exit.")
@@ -413,6 +450,7 @@ def _run_agent_session(
             return 0
         if command == "/help":
             if agent == "analyst":
+                default_dataset_path = _resolve_default_public_dataset_path()
                 print(
                     "agent> Commands: /help, /context, /reset, /exit. "
                     "For data analysis paste a .csv/.xlsx path."
@@ -421,6 +459,15 @@ def _run_agent_session(
                     "agent> During target selection: type list, list <filter>, "
                     "all, numeric index, or comma-separated signal names."
                 )
+                print(
+                    "agent> You can also add hypotheses: "
+                    "`hypothesis corr target:pred1,pred2` or "
+                    "`hypothesis feature target:signal->rate_change`."
+                )
+                if default_dataset_path is not None:
+                    print(
+                        "agent> Type `default` to analyze the built-in public test dataset."
+                    )
             else:
                 print("agent> Commands: /help, /context, /reset, /exit")
             continue
@@ -443,6 +490,8 @@ def _run_agent_session(
             if autopilot is not None:
                 response = autopilot["response"]
                 summary_event = autopilot["event"]
+                if summary_event.get("error"):
+                    print(f"agent> {response}")
                 session_messages.append({"role": "user", "content": user_message})
                 session_messages.append({"role": "assistant", "content": response})
                 session_messages = session_messages[-20:]
@@ -504,7 +553,24 @@ def _run_agent_session(
 
 
 def _run_analyst_autopilot_turn(*, user_message: str, registry: Any) -> dict[str, Any] | None:
-    detected = _extract_first_data_path(user_message)
+    detected: Path | None = None
+    if user_message.strip().lower() == "default":
+        detected = _resolve_default_public_dataset_path()
+        if detected is None:
+            response = (
+                "Default dataset is not available. "
+                "Please paste a CSV/XLSX path from your machine."
+            )
+            return {
+                "response": response,
+                "event": {
+                    "status": "respond",
+                    "message": response,
+                    "error": "default_dataset_missing",
+                },
+            }
+    else:
+        detected = _extract_first_data_path(user_message)
     if detected is None:
         return None
 
@@ -605,6 +671,10 @@ def _run_analyst_autopilot_turn(*, user_message: str, registry: Any) -> dict[str
         "bootstrap_rounds": 40,
         "stability_windows": 4,
     }
+    hypothesis_state: dict[str, list[dict[str, Any]]] = {
+        "user_hypotheses": [],
+        "feature_hypotheses": [],
+    }
     row_count = int(preflight.get("row_count") or 0)
     sample_plan = _prompt_sample_budget(row_count=row_count)
     analysis_args.update(sample_plan)
@@ -621,11 +691,13 @@ def _run_analyst_autopilot_turn(*, user_message: str, registry: Any) -> dict[str
         print(
             "agent> Enter comma-separated target signals to focus, "
             "'all' for full run, 'list' to show signal names, "
+            "or `hypothesis ...` to add correlation/feature hypotheses; "
             "or press Enter to use a quick default subset."
         )
         selected_targets = _prompt_target_selection(
             available_signals=numeric_signals,
             default_count=5,
+            hypothesis_state=hypothesis_state,
         )
         if selected_targets is not None:
             analysis_args["target_signals"] = selected_targets
@@ -636,6 +708,27 @@ def _run_analyst_autopilot_turn(*, user_message: str, registry: Any) -> dict[str
             )
         else:
             print("agent> Running full all-signal analysis as requested.")
+
+    inline_hypotheses = _parse_inline_hypothesis_command(
+        user_message=user_message,
+        available_signals=numeric_signals,
+    )
+    if inline_hypotheses["user_hypotheses"] or inline_hypotheses["feature_hypotheses"]:
+        _merge_hypothesis_state(hypothesis_state, inline_hypotheses)
+        print(
+            "agent> Parsed inline hypotheses from your request: "
+            f"correlation={len(inline_hypotheses['user_hypotheses'])}, "
+            f"feature={len(inline_hypotheses['feature_hypotheses'])}."
+        )
+
+    if hypothesis_state["user_hypotheses"] or hypothesis_state["feature_hypotheses"]:
+        analysis_args["user_hypotheses"] = hypothesis_state["user_hypotheses"]
+        analysis_args["feature_hypotheses"] = hypothesis_state["feature_hypotheses"]
+        print(
+            "agent> User hypotheses will be investigated additionally: "
+            f"correlation={len(hypothesis_state['user_hypotheses'])}, "
+            f"feature={len(hypothesis_state['feature_hypotheses'])}."
+        )
 
     timestamp_hint = str(preflight.get("timestamp_column_hint") or "").strip()
     estimated_sample_period = _safe_float_or_none(preflight.get("estimated_sample_period_seconds"))
@@ -834,6 +927,23 @@ def _extract_first_data_path(user_message: str) -> Path | None:
     return None
 
 
+def _resolve_default_public_dataset_path() -> Path | None:
+    candidates: list[Path] = []
+    candidates.append(Path("data/public/public_testbench_dataset_20k_minmax.csv"))
+    candidates.append(Path("data/public/public_testbench_dataset_20k_minmax.xlsx"))
+    repo_root_guess = Path(__file__).resolve().parents[3]
+    candidates.append(
+        repo_root_guess / "data" / "public" / "public_testbench_dataset_20k_minmax.csv"
+    )
+    candidates.append(
+        repo_root_guess / "data" / "public" / "public_testbench_dataset_20k_minmax.xlsx"
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
 def _compact_event_for_context(event: dict[str, Any]) -> dict[str, Any]:
     compact = {
         "status": event.get("status"),
@@ -882,18 +992,46 @@ def _prompt_target_selection(
     *,
     available_signals: list[str],
     default_count: int,
+    hypothesis_state: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[str] | None:
     while True:
         answer = input("you> ").strip()
         lowered = answer.lower()
         if lowered == "all":
             return None
+        if lowered.startswith("hypothesis"):
+            parsed = _parse_inline_hypothesis_command(
+                user_message=answer,
+                available_signals=available_signals,
+            )
+            if parsed["user_hypotheses"] or parsed["feature_hypotheses"]:
+                if hypothesis_state is not None:
+                    _merge_hypothesis_state(hypothesis_state, parsed)
+                print(
+                    "agent> Hypotheses noted. "
+                    f"correlation={len(parsed['user_hypotheses'])}, "
+                    f"feature={len(parsed['feature_hypotheses'])}. "
+                    "Now continue with target selection."
+                )
+                print(
+                    "agent> Enter comma-separated target signals, "
+                    "'all' for full run, `hypothesis ...` to add more, "
+                    "or press Enter for quick default subset."
+                )
+                continue
+            print(
+                "agent> Hypothesis format not recognized. "
+                "Use: `hypothesis corr target:pred1,pred2; target2:pred3` or "
+                "`hypothesis feature target:signal->rate_change; signal2->square`."
+            )
+            continue
         if lowered.startswith("list"):
             query = answer[4:].strip()
             _print_signal_names(available_signals, query=query)
             print(
                 "agent> Enter comma-separated target signals, "
-                "'all' for full run, or press Enter for quick default subset."
+                "'all' for full run, `hypothesis ...` to add hypotheses, "
+                "or press Enter for quick default subset."
             )
             continue
         selected, unknown = _parse_target_selection_with_unknowns(
@@ -906,6 +1044,7 @@ def _prompt_target_selection(
                 print(
                     "agent> I am good and ready to continue. "
                     "We are currently selecting target signals. "
+                    "If useful, add hypotheses via `hypothesis ...`. "
                     "Type 'list' to show names, 'all' for full run, "
                     "or press Enter for a quick subset."
                 )
@@ -958,6 +1097,203 @@ def _parse_target_selection_with_unknowns(
             seen.add(name)
 
     return deduped, unknown
+
+
+def _parse_inline_hypothesis_command(
+    *,
+    user_message: str,
+    available_signals: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    parsed: dict[str, list[dict[str, Any]]] = {
+        "user_hypotheses": [],
+        "feature_hypotheses": [],
+    }
+    text = user_message.strip()
+    lowered = text.lower()
+    if "hypothesis" not in lowered:
+        return parsed
+
+    payload = text
+    if lowered.startswith("hypothesis"):
+        payload = text[len("hypothesis") :].strip()
+    if not payload:
+        return parsed
+
+    segments = [part.strip() for part in payload.split(";") if part.strip()]
+    for segment in segments:
+        seg_lower = segment.lower()
+        if seg_lower.startswith("corr"):
+            seg_body = segment[4:].strip()
+            corr = _parse_correlation_hypothesis_segment(
+                segment=seg_body,
+                available_signals=available_signals,
+            )
+            if corr:
+                parsed["user_hypotheses"].append(corr)
+            continue
+        if seg_lower.startswith("feature"):
+            seg_body = segment[7:].strip()
+            features = _parse_feature_hypothesis_segment(
+                segment=seg_body,
+                available_signals=available_signals,
+            )
+            parsed["feature_hypotheses"].extend(features)
+            continue
+        corr = _parse_correlation_hypothesis_segment(
+            segment=segment,
+            available_signals=available_signals,
+        )
+        if corr:
+            parsed["user_hypotheses"].append(corr)
+            continue
+        features = _parse_feature_hypothesis_segment(
+            segment=segment,
+            available_signals=available_signals,
+        )
+        parsed["feature_hypotheses"].extend(features)
+    return parsed
+
+
+def _parse_correlation_hypothesis_segment(
+    *,
+    segment: str,
+    available_signals: list[str],
+) -> dict[str, Any] | None:
+    if ":" not in segment:
+        return None
+    left, right = segment.split(":", 1)
+    target = _resolve_signal_name(left.strip(), available_signals)
+    if target is None:
+        return None
+    raw_predictors = [item.strip() for item in re.split(r"[,\|]", right) if item.strip()]
+    predictors: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_predictors:
+        resolved = _resolve_signal_name(raw, available_signals)
+        if resolved is None or resolved == target or resolved in seen:
+            continue
+        predictors.append(resolved)
+        seen.add(resolved)
+    if not predictors:
+        return None
+    return {
+        "target_signal": target,
+        "predictor_signals": predictors,
+        "user_reason": "user hypothesis",
+    }
+
+
+def _parse_feature_hypothesis_segment(
+    *,
+    segment: str,
+    available_signals: list[str],
+) -> list[dict[str, Any]]:
+    if "->" not in segment:
+        return []
+    target_signal = ""
+    payload = segment.strip()
+    if ":" in payload and payload.index(":") < payload.index("->"):
+        left, right = payload.split(":", 1)
+        resolved_target = _resolve_signal_name(left.strip(), available_signals)
+        if resolved_target is None:
+            return []
+        target_signal = resolved_target
+        payload = right.strip()
+    if "->" not in payload:
+        return []
+    base_raw, transform_raw = payload.split("->", 1)
+    base_signal = _resolve_signal_name(base_raw.strip(), available_signals)
+    if base_signal is None:
+        return []
+    transforms = [
+        token.strip().lower()
+        for token in re.split(r"[,\|]", transform_raw)
+        if token.strip()
+    ]
+    allowed = {
+        "rate_change",
+        "delta",
+        "pct_change",
+        "signed_log",
+        "square",
+        "sqrt_abs",
+        "inverse",
+        "lag1",
+        "lag2",
+        "lag3",
+    }
+    rows: list[dict[str, Any]] = []
+    for transformation in transforms:
+        if transformation not in allowed:
+            continue
+        rows.append(
+            {
+                "target_signal": target_signal,
+                "base_signal": base_signal,
+                "transformation": transformation,
+                "user_reason": "user hypothesis",
+            }
+        )
+    return rows
+
+
+def _resolve_signal_name(raw: str, available_signals: list[str]) -> str | None:
+    token = raw.strip()
+    if not token:
+        return None
+    if token.isdigit():
+        idx = int(token)
+        if 1 <= idx <= len(available_signals):
+            return available_signals[idx - 1]
+    lookup = {name.lower(): name for name in available_signals}
+    exact = lookup.get(token.lower())
+    if exact:
+        return exact
+    fuzzy = [name for name in available_signals if token.lower() in name.lower()]
+    if len(fuzzy) == 1:
+        return fuzzy[0]
+    return None
+
+
+def _merge_hypothesis_state(
+    state: dict[str, list[dict[str, Any]]],
+    update: dict[str, list[dict[str, Any]]],
+) -> None:
+    corr_seen = {
+        (
+            str(item.get("target_signal", "")),
+            tuple(str(v) for v in item.get("predictor_signals", [])),
+        )
+        for item in state.get("user_hypotheses", [])
+    }
+    for item in update.get("user_hypotheses", []):
+        key = (
+            str(item.get("target_signal", "")),
+            tuple(str(v) for v in item.get("predictor_signals", [])),
+        )
+        if key in corr_seen:
+            continue
+        state.setdefault("user_hypotheses", []).append(item)
+        corr_seen.add(key)
+
+    feat_seen = {
+        (
+            str(item.get("target_signal", "")),
+            str(item.get("base_signal", "")),
+            str(item.get("transformation", "")),
+        )
+        for item in state.get("feature_hypotheses", [])
+    }
+    for item in update.get("feature_hypotheses", []):
+        key = (
+            str(item.get("target_signal", "")),
+            str(item.get("base_signal", "")),
+            str(item.get("transformation", "")),
+        )
+        if key in feat_seen:
+            continue
+        state.setdefault("feature_hypotheses", []).append(item)
+        feat_seen.add(key)
 
 
 def _prompt_lag_preferences(

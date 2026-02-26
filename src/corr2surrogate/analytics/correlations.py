@@ -38,6 +38,8 @@ class PairCorrelationResult:
     confounder_signal: str = ""
     partial_pearson: float = float("nan")
     conditional_mi: float = float("nan")
+    is_user_hypothesis: bool = False
+    hypothesis_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,8 @@ class FeatureEngineeringOpportunity:
     score_abs: float
     gain_over_raw: float
     notes: str
+    is_user_hypothesis: bool = False
+    hypothesis_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,8 @@ class TargetCorrelationAnalysis:
     predictor_results: list[PairCorrelationResult]
     top_predictors: list[str]
     feature_opportunities: list[FeatureEngineeringOpportunity]
+    hypothesis_pair_checks: list[PairCorrelationResult]
+    hypothesis_feature_checks: list[FeatureEngineeringOpportunity]
 
 
 @dataclass(frozen=True)
@@ -81,6 +87,10 @@ class CorrelationAnalysisBundle:
                     "predictor_results": [asdict(p) for p in item.predictor_results],
                     "top_predictors": item.top_predictors,
                     "feature_opportunities": [asdict(op) for op in item.feature_opportunities],
+                    "hypothesis_pair_checks": [asdict(p) for p in item.hypothesis_pair_checks],
+                    "hypothesis_feature_checks": [
+                        asdict(op) for op in item.hypothesis_feature_checks
+                    ],
                 }
                 for item in self.target_analyses
             ],
@@ -104,20 +114,40 @@ def run_correlation_analysis(
     confidence_top_k: int = 10,
     bootstrap_rounds: int = 40,
     stability_windows: int = 4,
+    correlation_hypotheses: list[dict[str, Any]] | None = None,
+    feature_hypotheses: list[dict[str, Any]] | None = None,
 ) -> CorrelationAnalysisBundle:
     """Run multi-technique correlation analysis for each target."""
     ts_col = _resolve_timestamp_column(frame, explicit=timestamp_column)
     data_mode = _infer_data_mode(frame, timestamp_column=ts_col)
     numeric = _numeric_signal_columns(frame, exclude={ts_col} if ts_col else set())
+    pair_hypothesis_map = _normalize_correlation_hypotheses(
+        hypotheses=correlation_hypotheses,
+        numeric_columns=numeric,
+    )
+    normalized_feature_hypotheses = _normalize_feature_hypotheses(
+        hypotheses=feature_hypotheses,
+        numeric_columns=numeric,
+    )
 
     targets = _resolve_targets(numeric_columns=numeric, target_signals=target_signals)
+    hypothesis_targets = [name for name in pair_hypothesis_map.keys() if name]
+    if targets:
+        targets = _merge_unique(targets, [name for name in hypothesis_targets if name in numeric])
+    else:
+        targets = [name for name in hypothesis_targets if name in numeric]
     analyses: list[TargetCorrelationAnalysis] = []
 
     for target in targets:
+        target_pair_hypotheses = pair_hypothesis_map.get(target, {})
         predictors = _resolve_predictors(
             numeric_columns=numeric,
             target=target,
             predictor_signals_by_target=predictor_signals_by_target,
+        )
+        predictors = _merge_unique(
+            predictors,
+            [name for name in target_pair_hypotheses.keys() if name != target],
         )
         pair_results: list[PairCorrelationResult] = []
         for predictor in predictors:
@@ -128,6 +158,8 @@ def run_correlation_analysis(
                 data_mode=data_mode,
                 max_lag=max_lag,
                 min_samples=min_samples,
+                is_user_hypothesis=(predictor in target_pair_hypotheses),
+                hypothesis_note=target_pair_hypotheses.get(predictor, ""),
             )
             if pair is not None:
                 pair_results.append(pair)
@@ -146,6 +178,7 @@ def run_correlation_analysis(
             )
         top_predictors = [item.predictor_signal for item in pair_results[:top_k_predictors]]
         opportunities: list[FeatureEngineeringOpportunity] = []
+        timestamp_series = frame[ts_col] if ts_col and ts_col in frame.columns else None
         if include_feature_engineering:
             opportunities = discover_feature_engineering_opportunities(
                 frame=frame,
@@ -157,13 +190,35 @@ def run_correlation_analysis(
                 max_opportunities=max_feature_opportunities,
                 max_predictors_to_scan=feature_scan_predictors,
                 max_pair_predictors=feature_pair_predictors,
+                timestamp_series=timestamp_series,
             )
+        target_feature_hypotheses = _feature_hypotheses_for_target(
+            hypotheses=normalized_feature_hypotheses,
+            target=target,
+        )
+        hypothesis_feature_checks = _evaluate_hypothesized_features(
+            frame=frame,
+            target_signal=target,
+            hypotheses=target_feature_hypotheses,
+            data_mode=data_mode,
+            max_lag=max_lag,
+            timestamp_series=timestamp_series,
+        )
+        if hypothesis_feature_checks:
+            opportunities = _merge_feature_opportunities(
+                base=opportunities,
+                extra=hypothesis_feature_checks,
+                max_opportunities=max_feature_opportunities,
+            )
+        hypothesis_pair_checks = [item for item in pair_results if item.is_user_hypothesis]
         analyses.append(
             TargetCorrelationAnalysis(
                 target_signal=target,
                 predictor_results=pair_results,
                 top_predictors=top_predictors,
                 feature_opportunities=opportunities,
+                hypothesis_pair_checks=hypothesis_pair_checks,
+                hypothesis_feature_checks=hypothesis_feature_checks,
             )
         )
 
@@ -220,6 +275,7 @@ def discover_feature_engineering_opportunities(
     max_opportunities: int = 20,
     max_predictors_to_scan: int = 10,
     max_pair_predictors: int = 5,
+    timestamp_series: pd.Series | None = None,
 ) -> list[FeatureEngineeringOpportunity]:
     """Discover transformations with stronger target association than raw signal."""
     opportunities: list[FeatureEngineeringOpportunity] = []
@@ -233,7 +289,12 @@ def discover_feature_engineering_opportunities(
         predictor = item.predictor_signal
         raw = pd.to_numeric(frame[predictor], errors="coerce")
         base = abs(_safe_corr(target_series, raw, method="pearson"))
-        transforms = _univariate_transforms(raw, data_mode=data_mode, max_lag=max_lag)
+        transforms = _univariate_transforms(
+            raw,
+            data_mode=data_mode,
+            max_lag=max_lag,
+            timestamp_series=timestamp_series,
+        )
         for name, transformed in transforms:
             score = abs(_safe_corr(target_series, transformed, method="pearson"))
             gain = score - base
@@ -247,6 +308,8 @@ def discover_feature_engineering_opportunities(
                         score_abs=float(score),
                         gain_over_raw=float(gain),
                         notes=f"Improves abs Pearson from {base:.3f} to {score:.3f}.",
+                        is_user_hypothesis=False,
+                        hypothesis_note="",
                     )
                 )
 
@@ -276,6 +339,8 @@ def discover_feature_engineering_opportunities(
                         score_abs=float(product_score),
                         gain_over_raw=float(product_score - base),
                         notes="Pair interaction improves target association.",
+                        is_user_hypothesis=False,
+                        hypothesis_note="",
                     )
                 )
 
@@ -290,6 +355,8 @@ def discover_feature_engineering_opportunities(
                         score_abs=float(ratio_score),
                         gain_over_raw=float(ratio_score - base),
                         notes="Ratio feature improves target association.",
+                        is_user_hypothesis=False,
+                        hypothesis_note="",
                     )
                 )
 
@@ -305,6 +372,8 @@ def _pairwise_result(
     data_mode: str,
     max_lag: int,
     min_samples: int,
+    is_user_hypothesis: bool = False,
+    hypothesis_note: str = "",
 ) -> PairCorrelationResult | None:
     target_series = pd.to_numeric(frame[target], errors="coerce")
     predictor_series = pd.to_numeric(frame[predictor], errors="coerce")
@@ -349,6 +418,8 @@ def _pairwise_result(
         lagged_pearson=float(lagged),
         best_method=best_method,
         best_abs_score=float(best_score),
+        is_user_hypothesis=is_user_hypothesis,
+        hypothesis_note=hypothesis_note,
     )
 
 
@@ -415,19 +486,221 @@ def _univariate_transforms(
     *,
     data_mode: str,
     max_lag: int,
+    timestamp_series: pd.Series | None = None,
 ) -> list[tuple[str, pd.Series]]:
     eps = 1e-9
+    rate_change = _rate_change_transform(series=series, timestamp_series=timestamp_series)
     transforms: list[tuple[str, pd.Series]] = [
         ("signed_log", np.sign(series) * np.log1p(np.abs(series))),
         ("square", np.square(series)),
         ("sqrt_abs", np.sqrt(np.abs(series))),
         ("inverse", 1.0 / (series + eps)),
+        ("pct_change", series.pct_change()),
     ]
     if data_mode == "time_series":
         transforms.append(("delta", series.diff()))
+        transforms.append(("rate_change", rate_change))
         for lag in range(1, min(max_lag, 3) + 1):
             transforms.append((f"lag{lag}", series.shift(lag)))
+    else:
+        transforms.append(("rate_change", series.diff()))
     return transforms
+
+
+def _rate_change_transform(
+    *,
+    series: pd.Series,
+    timestamp_series: pd.Series | None,
+) -> pd.Series:
+    if timestamp_series is None:
+        return series.diff()
+    parsed_time = pd.to_datetime(timestamp_series, errors="coerce")
+    if float(parsed_time.notna().mean()) >= 0.8:
+        dt = parsed_time.diff().dt.total_seconds()
+    else:
+        dt = pd.to_numeric(timestamp_series, errors="coerce").diff()
+    dt = dt.replace(0, np.nan)
+    return series.diff() / dt
+
+
+def _normalize_correlation_hypotheses(
+    *,
+    hypotheses: list[dict[str, Any]] | None,
+    numeric_columns: list[str],
+) -> dict[str, dict[str, str]]:
+    valid = set(numeric_columns)
+    out: dict[str, dict[str, str]] = {}
+    for item in hypotheses or []:
+        if not isinstance(item, dict):
+            continue
+        target = str(item.get("target_signal", "")).strip()
+        if target not in valid:
+            continue
+        raw_predictors = item.get("predictor_signals")
+        if not isinstance(raw_predictors, list):
+            single = item.get("predictor_signal")
+            raw_predictors = [single] if isinstance(single, str) else []
+        predictors = []
+        for raw in raw_predictors:
+            name = str(raw).strip()
+            if name and name in valid and name != target:
+                predictors.append(name)
+        if not predictors:
+            continue
+        note = str(item.get("user_reason", item.get("reason", "user hypothesis"))).strip()
+        target_map = out.setdefault(target, {})
+        for predictor in predictors:
+            target_map[predictor] = note or "user hypothesis"
+    return out
+
+
+def _normalize_feature_hypotheses(
+    *,
+    hypotheses: list[dict[str, Any]] | None,
+    numeric_columns: list[str],
+) -> list[dict[str, str]]:
+    valid = set(numeric_columns)
+    normalized: list[dict[str, str]] = []
+    for item in hypotheses or []:
+        if not isinstance(item, dict):
+            continue
+        base_signal = str(item.get("base_signal", "")).strip()
+        if base_signal not in valid:
+            continue
+        transformation = str(item.get("transformation", "")).strip().lower()
+        if not transformation:
+            continue
+        target_signal_raw = str(item.get("target_signal", "")).strip()
+        target_signal = target_signal_raw if target_signal_raw in valid else ""
+        reason = str(item.get("user_reason", item.get("reason", "user hypothesis"))).strip()
+        normalized.append(
+            {
+                "target_signal": target_signal,
+                "base_signal": base_signal,
+                "transformation": transformation,
+                "user_reason": reason or "user hypothesis",
+            }
+        )
+    return normalized
+
+
+def _feature_hypotheses_for_target(
+    *,
+    hypotheses: list[dict[str, str]],
+    target: str,
+) -> list[dict[str, str]]:
+    return [
+        item
+        for item in hypotheses
+        if not item.get("target_signal") or item.get("target_signal") == target
+    ]
+
+
+def _evaluate_hypothesized_features(
+    *,
+    frame: pd.DataFrame,
+    target_signal: str,
+    hypotheses: list[dict[str, str]],
+    data_mode: str,
+    max_lag: int,
+    timestamp_series: pd.Series | None,
+) -> list[FeatureEngineeringOpportunity]:
+    if not hypotheses:
+        return []
+    target_series = pd.to_numeric(frame[target_signal], errors="coerce")
+    checks: list[FeatureEngineeringOpportunity] = []
+    seen: set[tuple[str, str]] = set()
+    for hypothesis in hypotheses:
+        base_signal = hypothesis.get("base_signal", "")
+        transform_name = hypothesis.get("transformation", "")
+        if not base_signal or not transform_name:
+            continue
+        key = (base_signal, transform_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        raw = pd.to_numeric(frame[base_signal], errors="coerce")
+        transforms = dict(
+            _univariate_transforms(
+                raw,
+                data_mode=data_mode,
+                max_lag=max_lag,
+                timestamp_series=timestamp_series,
+            )
+        )
+        transformed = transforms.get(transform_name)
+        base_score = abs(_safe_corr(target_series, raw, method="pearson"))
+        if transformed is None:
+            checks.append(
+                FeatureEngineeringOpportunity(
+                    target_signal=target_signal,
+                    base_signal=base_signal,
+                    transformation=transform_name,
+                    expression=f"{transform_name}({base_signal})",
+                    score_abs=float("nan"),
+                    gain_over_raw=float("nan"),
+                    notes="Hypothesis transform name not supported in current feature library.",
+                    is_user_hypothesis=True,
+                    hypothesis_note=hypothesis.get("user_reason", "user hypothesis"),
+                )
+            )
+            continue
+        score = abs(_safe_corr(target_series, transformed, method="pearson"))
+        gain = score - base_score if np.isfinite(score) and np.isfinite(base_score) else float("nan")
+        checks.append(
+            FeatureEngineeringOpportunity(
+                target_signal=target_signal,
+                base_signal=base_signal,
+                transformation=transform_name,
+                expression=f"{transform_name}({base_signal})",
+                score_abs=float(score),
+                gain_over_raw=float(gain),
+                notes=(
+                    f"Hypothesis check for {transform_name} on {base_signal}: "
+                    f"base={base_score:.3f}, transformed={score:.3f}."
+                    if np.isfinite(base_score) and np.isfinite(score)
+                    else "Hypothesis check executed but score is not finite."
+                ),
+                is_user_hypothesis=True,
+                hypothesis_note=hypothesis.get("user_reason", "user hypothesis"),
+            )
+        )
+    checks.sort(
+        key=lambda item: item.gain_over_raw if np.isfinite(item.gain_over_raw) else -1e9,
+        reverse=True,
+    )
+    return checks
+
+
+def _merge_feature_opportunities(
+    *,
+    base: list[FeatureEngineeringOpportunity],
+    extra: list[FeatureEngineeringOpportunity],
+    max_opportunities: int,
+) -> list[FeatureEngineeringOpportunity]:
+    merged = list(base)
+    index = {(item.base_signal, item.transformation) for item in merged}
+    for item in extra:
+        key = (item.base_signal, item.transformation)
+        if key in index:
+            continue
+        merged.append(item)
+        index.add(key)
+    merged.sort(
+        key=lambda item: item.gain_over_raw if np.isfinite(item.gain_over_raw) else -1e9,
+        reverse=True,
+    )
+    return merged[:max_opportunities]
+
+
+def _merge_unique(primary: list[str], secondary: list[str]) -> list[str]:
+    seen = set(primary)
+    out = list(primary)
+    for item in secondary:
+        if item not in seen:
+            out.append(item)
+            seen.add(item)
+    return out
 
 
 def _safe_corr(a: pd.Series, b: pd.Series, *, method: str) -> float:
@@ -542,6 +815,8 @@ def _augment_top_pairs_with_confidence_and_confounding(
             confounder_signal=confounder,
             partial_pearson=partial_pearson,
             conditional_mi=conditional_mi,
+            is_user_hypothesis=base.is_user_hypothesis,
+            hypothesis_note=base.hypothesis_note,
         )
     return updated
 

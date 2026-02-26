@@ -31,6 +31,7 @@ def build_agent1_report_payload(
     critic_decision: dict[str, Any] | None = None,
     lineage_path: str | None = None,
     artifact_paths: dict[str, Any] | None = None,
+    user_hypotheses: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build structured and markdown report payload for Agent 1 output."""
     timestamp = datetime.now(timezone.utc).isoformat()
@@ -52,6 +53,7 @@ def build_agent1_report_payload(
         "critic_decision": critic_decision or {},
         "lineage_path": lineage_path,
         "artifact_paths": artifact_paths or {},
+        "user_hypotheses": user_hypotheses or {},
     }
     markdown = _build_markdown(structured)
     return {
@@ -98,6 +100,8 @@ def save_agent1_artifacts(
 
     top_predictors_rows: list[dict[str, Any]] = []
     feature_rows: list[dict[str, Any]] = []
+    hypothesis_pair_rows: list[dict[str, Any]] = []
+    hypothesis_feature_rows: list[dict[str, Any]] = []
     for target in structured.get("correlations", {}).get("target_analyses", []):
         target_signal = str(target.get("target_signal", "unknown"))
         for rank, row in enumerate(list(target.get("predictor_results", []))[:10], start=1):
@@ -110,6 +114,18 @@ def save_agent1_artifacts(
             merged["target_signal"] = target_signal
             merged["rank"] = rank
             feature_rows.append(merged)
+        for rank, row in enumerate(list(target.get("hypothesis_pair_checks", []))[:10], start=1):
+            merged = dict(row)
+            merged["target_signal"] = target_signal
+            merged["rank"] = rank
+            hypothesis_pair_rows.append(merged)
+        for rank, row in enumerate(
+            list(target.get("hypothesis_feature_checks", []))[:10], start=1
+        ):
+            merged = dict(row)
+            merged["target_signal"] = target_signal
+            merged["rank"] = rank
+            hypothesis_feature_rows.append(merged)
 
     csv_paths: dict[str, str] = {}
     csv_paths["top_predictors"] = _write_rows_csv(
@@ -125,6 +141,14 @@ def save_agent1_artifacts(
     csv_paths["sensor_diagnostics"] = _write_rows_csv(
         artifact_dir / "sensor_diagnostics.csv",
         list((structured.get("sensor_diagnostics") or {}).get("diagnostics", [])),
+    )
+    csv_paths["hypothesis_pair_checks"] = _write_rows_csv(
+        artifact_dir / "hypothesis_pair_checks.csv",
+        hypothesis_pair_rows,
+    )
+    csv_paths["hypothesis_feature_checks"] = _write_rows_csv(
+        artifact_dir / "hypothesis_feature_checks.csv",
+        hypothesis_feature_rows,
     )
     csv_paths["planner_trace"] = _write_rows_csv(
         artifact_dir / "planner_trace.csv",
@@ -179,6 +203,7 @@ def _build_markdown(structured: dict[str, Any]) -> str:
     critic = structured.get("critic_decision") or {}
     lineage_path = structured.get("lineage_path")
     artifact_paths = structured.get("artifact_paths") or {}
+    user_hypotheses = structured.get("user_hypotheses") or {}
 
     lines: list[str] = [
         "# Agent 1 Analysis Report",
@@ -191,6 +216,8 @@ def _build_markdown(structured: dict[str, Any]) -> str:
         "## Preprocessing Decisions",
     ]
     lines.extend(_render_preprocessing_section(preprocessing))
+    lines.extend(["", "## User Hypotheses"])
+    lines.extend(_render_user_hypotheses_section(user_hypotheses))
     lines.extend(
         [
             "",
@@ -258,7 +285,7 @@ def _build_markdown(structured: dict[str, Any]) -> str:
                 )
                 lines.append(
                     "| "
-                    f"`predictor_correlation` | `{target_signal}` | "
+                    f"`{_row_category(row_dict)}` | `{target_signal}` | "
                     f"{idx} | `{row_dict.get('predictor_signal', 'n/a')}` | "
                     f"{_correlation_kind_label(row_dict)} | "
                     f"{_strength_label(best_abs)} | "
@@ -297,7 +324,7 @@ def _build_markdown(structured: dict[str, Any]) -> str:
                 op_dict = dict(op)
                 lines.append(
                     "| "
-                    f"`feature_engineering` | `{target_signal}` | "
+                    f"`{_feature_category(op_dict)}` | `{target_signal}` | "
                     f"{idx} | `{op_dict.get('expression', 'n/a')}` | "
                     f"`{op_dict.get('base_signal', 'n/a')}` | "
                     f"{_fmt(_safe_float(op_dict.get('score_abs')))} | "
@@ -307,6 +334,33 @@ def _build_markdown(structured: dict[str, Any]) -> str:
         else:
             lines.append("- No feature-engineering opportunity exceeded the gain threshold.")
         lines.append("")
+        hypothesis_pairs = list(target.get("hypothesis_pair_checks", []))
+        hypothesis_features = list(target.get("hypothesis_feature_checks", []))
+        if hypothesis_pairs or hypothesis_features:
+            lines.append("#### User Hypothesis Checks")
+            if hypothesis_pairs:
+                lines.append("- Pair hypotheses:")
+                for row in hypothesis_pairs[:10]:
+                    row_dict = dict(row)
+                    lines.append(
+                        "  - "
+                        f"target=`{target_signal}` predictor=`{row_dict.get('predictor_signal', 'n/a')}` "
+                        f"best_method=`{row_dict.get('best_method', 'n/a')}` "
+                        f"best_abs={_fmt(_safe_float(row_dict.get('best_abs_score')))} "
+                        f"note={row_dict.get('hypothesis_note', '')}"
+                    )
+            if hypothesis_features:
+                lines.append("- Feature hypotheses:")
+                for row in hypothesis_features[:10]:
+                    row_dict = dict(row)
+                    lines.append(
+                        "  - "
+                        f"target=`{target_signal}` expr=`{row_dict.get('expression', 'n/a')}` "
+                        f"abs_score={_fmt(_safe_float(row_dict.get('score_abs')))} "
+                        f"gain={_fmt(_safe_float(row_dict.get('gain_over_raw')))} "
+                        f"note={row_dict.get('hypothesis_note', '')}"
+                    )
+            lines.append("")
     lines.extend(["", "## Sensor Diagnostics"])
     lines.extend(_render_sensor_diagnostics(sensor_diagnostics))
     lines.extend(["", "## Experiment Recommendations"])
@@ -388,6 +442,34 @@ def _render_agentic_section(
             f"`{critic.get('selected_candidate_id', 'n/a')}` "
             f"because: {critic.get('rationale', 'n/a')}"
         )
+    return lines
+
+
+def _render_user_hypotheses_section(payload: dict[str, Any]) -> list[str]:
+    pair_items = list(payload.get("correlation_hypotheses", []))
+    feature_items = list(payload.get("feature_hypotheses", []))
+    if not pair_items and not feature_items:
+        return ["- None provided by user."]
+    lines: list[str] = []
+    if pair_items:
+        lines.append(f"- Correlation hypotheses: {len(pair_items)}")
+        for item in pair_items[:10]:
+            target = item.get("target_signal", "")
+            predictors = item.get("predictor_signals", [])
+            reason = item.get("user_reason", "")
+            lines.append(
+                f"  - `{target}` <- {predictors} ({reason})"
+            )
+    if feature_items:
+        lines.append(f"- Feature hypotheses: {len(feature_items)}")
+        for item in feature_items[:10]:
+            target = item.get("target_signal", "") or "*"
+            base_signal = item.get("base_signal", "")
+            transformation = item.get("transformation", "")
+            reason = item.get("user_reason", "")
+            lines.append(
+                f"  - target=`{target}` expression=`{transformation}({base_signal})` ({reason})"
+            )
     return lines
 
 
@@ -513,6 +595,18 @@ def _correlation_kind_label(row: dict[str, Any]) -> str:
         return method_family
     direction = "positive" if method_value >= 0 else "negative"
     return f"{direction} {method_family}"
+
+
+def _row_category(row: dict[str, Any]) -> str:
+    if bool(row.get("is_user_hypothesis")):
+        return "hypothesis_pair"
+    return "predictor_correlation"
+
+
+def _feature_category(row: dict[str, Any]) -> str:
+    if bool(row.get("is_user_hypothesis")):
+        return "hypothesis_feature"
+    return "feature_engineering"
 
 
 def _write_rows_csv(path: Path, rows: list[dict[str, Any]]) -> str:

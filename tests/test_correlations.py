@@ -51,3 +51,33 @@ def test_feature_engineering_opportunity_detects_square_relation() -> None:
     )
     opportunities = bundle.target_analyses[0].feature_opportunities
     assert any(item.transformation == "square" for item in opportunities)
+
+
+def test_feature_hypothesis_rate_change_is_investigated() -> None:
+    rng = np.random.default_rng(12)
+    n = 220
+    time = np.arange(n, dtype=float)
+    increments = rng.normal(0.05, 0.02, n)
+    x = np.cumsum(increments)
+    y = np.concatenate([[0.0], np.diff(x)]) + rng.normal(0.0, 0.002, n)
+    frame = pd.DataFrame({"time": time, "x": x, "y": y})
+
+    bundle = run_correlation_analysis(
+        frame,
+        target_signals=["y"],
+        predictor_signals_by_target={"y": ["x"]},
+        timestamp_column="time",
+        include_feature_engineering=True,
+        feature_gain_threshold=0.0,
+        feature_hypotheses=[
+            {
+                "target_signal": "y",
+                "base_signal": "x",
+                "transformation": "rate_change",
+                "user_reason": "dynamic hypothesis",
+            }
+        ],
+    )
+    analysis = bundle.target_analyses[0]
+    assert any(item.transformation == "rate_change" for item in analysis.feature_opportunities)
+    assert analysis.hypothesis_feature_checks

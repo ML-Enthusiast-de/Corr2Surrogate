@@ -513,6 +513,63 @@ def test_cli_run_agent_session_analyst_target_prompt_accepts_list_command(
     assert registry.calls[1][1]["target_signals"] == ["sig_20"]
 
 
+def test_cli_run_agent_session_analyst_target_prompt_accepts_hypothesis_command(
+    monkeypatch, tmp_path: Path
+) -> None:
+    data_path = tmp_path / "wide_hypothesis.xlsx"
+    data_path.write_text("placeholder", encoding="utf-8")
+    numeric_signals = [f"sig_{idx}" for idx in range(1, 46)]
+    inputs = iter(
+        [
+            f"Analyze {data_path}",
+            "hypothesis corr sig_20:sig_3,sig_4; feature sig_3->rate_change",
+            "sig_20",
+            "/exit",
+        ]
+    )
+    registry = _SessionRegistry(
+        scripted_outputs={
+            "prepare_ingestion_step": [
+                {
+                    "status": "ok",
+                    "message": "Ingestion ready.",
+                    "options": [],
+                    "selected_sheet": "S1",
+                    "available_sheets": ["S1"],
+                    "row_count": 100,
+                    "column_count": 60,
+                    "signal_columns": numeric_signals,
+                    "numeric_signal_columns": numeric_signals,
+                    "header_row": 0,
+                    "data_start_row": 1,
+                    "header_confidence": 0.95,
+                    "needs_user_confirmation": False,
+                }
+            ],
+            "run_agent1_analysis": [
+                {
+                    "status": "ok",
+                    "data_mode": "steady_state",
+                    "target_count": 1,
+                    "candidate_count": 1,
+                    "report_path": "reports/wide_hypothesis/agent1_20260225_120000.md",
+                }
+            ],
+        }
+    )
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+
+    exit_code = main(["run-agent-session", "--agent", "analyst"])
+    assert exit_code == 0
+    args = registry.calls[1][1]
+    assert args["target_signals"] == ["sig_20"]
+    assert args["user_hypotheses"]
+    assert args["feature_hypotheses"]
+    assert args["feature_hypotheses"][0]["transformation"] == "rate_change"
+
+
 def test_cli_run_agent_session_analyst_target_prompt_handles_small_talk(
     monkeypatch, capsys, tmp_path: Path
 ) -> None:
@@ -744,6 +801,72 @@ def test_cli_run_agent_session_analyst_prompts_missing_and_length_handling(
     assert float(args["sparse_row_min_fraction"]) == 0.85
 
 
+def test_cli_run_agent_session_analyst_default_dataset_runs_autopilot(
+    monkeypatch, tmp_path: Path
+) -> None:
+    default_path = tmp_path / "public_testbench_dataset_20k_minmax.csv"
+    default_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+    inputs = iter(["default", "/exit"])
+    registry = _SessionRegistry(
+        scripted_outputs={
+            "prepare_ingestion_step": [
+                {
+                    "status": "ok",
+                    "message": "Ingestion ready.",
+                    "options": [],
+                    "selected_sheet": None,
+                    "available_sheets": [],
+                    "row_count": 2,
+                    "column_count": 2,
+                    "signal_columns": ["a", "b"],
+                    "numeric_signal_columns": ["a", "b"],
+                    "header_row": 0,
+                    "data_start_row": 1,
+                    "header_confidence": 0.95,
+                    "needs_user_confirmation": False,
+                }
+            ],
+            "run_agent1_analysis": [
+                {
+                    "status": "ok",
+                    "data_mode": "steady_state",
+                    "target_count": 2,
+                    "candidate_count": 1,
+                    "report_path": "reports/public_testbench_dataset_20k_minmax/agent1_20260226_120000.md",
+                }
+            ],
+        }
+    )
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr(
+        "corr2surrogate.ui.cli._resolve_default_public_dataset_path",
+        lambda: default_path,
+    )
+    exit_code = main(["run-agent-session", "--agent", "analyst"])
+    assert exit_code == 0
+    assert registry.calls[0][0] == "prepare_ingestion_step"
+    assert registry.calls[0][1]["path"] == str(default_path.resolve())
+    assert registry.calls[1][0] == "run_agent1_analysis"
+    assert registry.calls[1][1]["data_path"] == str(default_path.resolve())
+
+
+def test_cli_run_agent_session_analyst_default_dataset_missing_is_reported(
+    monkeypatch, capsys
+) -> None:
+    inputs = iter(["default", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr(
+        "corr2surrogate.ui.cli._resolve_default_public_dataset_path",
+        lambda: None,
+    )
+    exit_code = main(["run-agent-session", "--agent", "analyst"])
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Default dataset is not available" in output
+
+
 def test_cli_run_agent_session_prints_welcome_message(monkeypatch, capsys) -> None:
     inputs = iter(["/exit"])
     monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
@@ -752,6 +875,7 @@ def test_cli_run_agent_session_prints_welcome_message(monkeypatch, capsys) -> No
     output = capsys.readouterr().out
     assert "Welcome to Corr2Surrogate" in output
     assert "Useful commands" in output
+    assert "Dataset choice" in output
 
 
 def test_cli_run_agent_session_prints_header_preview_on_confirmation(

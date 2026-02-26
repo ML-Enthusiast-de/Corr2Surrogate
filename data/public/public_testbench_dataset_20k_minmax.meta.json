@@ -1,0 +1,9 @@
+{
+  "rows": 7860,
+  "columns": 147,
+  "header_scheme": "letters",
+  "normalization": "min_max_per_column",
+  "row_limit": 20000,
+  "source_details": "omitted_for_privacy",
+  "private_source_tracked_in_git": false
+}

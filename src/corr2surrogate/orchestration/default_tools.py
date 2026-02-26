@@ -87,6 +87,8 @@ def build_default_registry() -> ToolRegistry:
                     "type": "object",
                     "additionalProperties": True,
                 },
+                "user_hypotheses": {"type": "array"},
+                "feature_hypotheses": {"type": "array"},
                 "forced_requests": {"type": "array"},
                 "physically_available_signals": {
                     "type": "array",
@@ -368,6 +370,8 @@ def _tool_run_agent1_analysis(
     timestamp_column: str | None = None,
     target_signals: list[str] | None = None,
     predictor_signals_by_target: dict[str, list[str]] | None = None,
+    user_hypotheses: list[dict[str, Any]] | None = None,
+    feature_hypotheses: list[dict[str, Any]] | None = None,
     forced_requests: list[dict[str, Any]] | None = None,
     physically_available_signals: list[str] | None = None,
     non_virtualizable_signals: list[str] | None = None,
@@ -414,6 +418,13 @@ def _tool_run_agent1_analysis(
     }
     planner_trace: list[dict[str, Any]] = []
     critic_decision: dict[str, Any] = {}
+    normalized_user_hypotheses = _normalize_user_hypotheses(user_hypotheses)
+    normalized_feature_hypotheses = _normalize_feature_hypotheses(feature_hypotheses)
+    resolved_targets, resolved_predictor_map = _merge_hypotheses_into_analysis_scope(
+        target_signals=target_signals,
+        predictor_signals_by_target=predictor_signals_by_target,
+        user_hypotheses=normalized_user_hypotheses,
+    )
 
     if enable_strategy_search:
         candidate_plans = _planner_generate_strategy_candidates(
@@ -424,8 +435,8 @@ def _tool_run_agent1_analysis(
             frame=source_frame,
             candidate_plans=candidate_plans,
             timestamp_column=timestamp_column,
-            target_signals=target_signals,
-            predictor_signals_by_target=predictor_signals_by_target,
+            target_signals=resolved_targets,
+            predictor_signals_by_target=resolved_predictor_map,
             max_lag=max_lag,
         )
         chosen = _critic_choose_strategy(planner_trace)
@@ -452,8 +463,8 @@ def _tool_run_agent1_analysis(
     diagnostics = run_sensor_diagnostics(frame, timestamp_column=timestamp_column)
     correlations = run_correlation_analysis(
         frame=frame,
-        target_signals=target_signals,
-        predictor_signals_by_target=predictor_signals_by_target,
+        target_signals=resolved_targets,
+        predictor_signals_by_target=resolved_predictor_map,
         timestamp_column=timestamp_column,
         max_lag=max_lag,
         include_feature_engineering=include_feature_engineering,
@@ -464,6 +475,8 @@ def _tool_run_agent1_analysis(
         confidence_top_k=confidence_top_k,
         bootstrap_rounds=bootstrap_rounds,
         stability_windows=stability_windows,
+        correlation_hypotheses=normalized_user_hypotheses,
+        feature_hypotheses=normalized_feature_hypotheses,
     )
     stationarity_columns = [item.target_signal for item in correlations.target_analyses]
     stationarity = assess_stationarity(frame, signal_columns=stationarity_columns)
@@ -490,8 +503,10 @@ def _tool_run_agent1_analysis(
         data_path=data_path,
         analysis_config={
             "timestamp_column": timestamp_column,
-            "target_signals": target_signals,
-            "predictor_signals_by_target": predictor_signals_by_target,
+            "target_signals": resolved_targets,
+            "predictor_signals_by_target": resolved_predictor_map,
+            "user_hypotheses": normalized_user_hypotheses,
+            "feature_hypotheses": normalized_feature_hypotheses,
             "max_lag": max_lag,
             "include_feature_engineering": include_feature_engineering,
             "feature_gain_threshold": feature_gain_threshold,
@@ -522,6 +537,10 @@ def _tool_run_agent1_analysis(
         planner_trace=planner_trace,
         critic_decision=critic_decision,
         lineage_path=lineage_path,
+        user_hypotheses={
+            "correlation_hypotheses": normalized_user_hypotheses,
+            "feature_hypotheses": normalized_feature_hypotheses,
+        },
     )
 
     artifact_paths: dict[str, Any] | None = None
@@ -546,6 +565,10 @@ def _tool_run_agent1_analysis(
         critic_decision=critic_decision,
         lineage_path=lineage_path,
         artifact_paths=artifact_paths or {},
+        user_hypotheses={
+            "correlation_hypotheses": normalized_user_hypotheses,
+            "feature_hypotheses": normalized_feature_hypotheses,
+        },
     )
     report_path: str | None = None
     if save_report:
@@ -563,6 +586,8 @@ def _tool_run_agent1_analysis(
         "candidate_count": len(candidates),
         "ranking": [asdict(item) for item in ranking],
         "forced_requests": [asdict(item) for item in forced_directives],
+        "user_hypotheses": normalized_user_hypotheses,
+        "feature_hypotheses": normalized_feature_hypotheses,
         "quality": quality.to_dict(),
         "stationarity": stationarity.to_dict(),
         "correlations": correlations.to_dict(),
@@ -776,6 +801,95 @@ def _normalize_forced_requests(
             )
         )
     return directives
+
+
+def _normalize_user_hypotheses(
+    hypotheses: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in hypotheses or []:
+        if not isinstance(item, dict):
+            continue
+        target = str(item.get("target_signal", "")).strip()
+        raw_predictors = item.get("predictor_signals")
+        if not isinstance(raw_predictors, list):
+            single = item.get("predictor_signal")
+            raw_predictors = [single] if isinstance(single, str) else []
+        predictors = [str(value).strip() for value in raw_predictors if str(value).strip()]
+        if not target or not predictors:
+            continue
+        normalized.append(
+            {
+                "target_signal": target,
+                "predictor_signals": predictors,
+                "user_reason": str(
+                    item.get("user_reason", item.get("reason", "user hypothesis"))
+                ),
+            }
+        )
+    return normalized
+
+
+def _normalize_feature_hypotheses(
+    hypotheses: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in hypotheses or []:
+        if not isinstance(item, dict):
+            continue
+        base_signal = str(item.get("base_signal", "")).strip()
+        transformation = str(item.get("transformation", "")).strip().lower()
+        if not base_signal or not transformation:
+            continue
+        target_signal = str(item.get("target_signal", "")).strip()
+        normalized.append(
+            {
+                "target_signal": target_signal,
+                "base_signal": base_signal,
+                "transformation": transformation,
+                "user_reason": str(
+                    item.get("user_reason", item.get("reason", "user hypothesis"))
+                ),
+            }
+        )
+    return normalized
+
+
+def _merge_hypotheses_into_analysis_scope(
+    *,
+    target_signals: list[str] | None,
+    predictor_signals_by_target: dict[str, list[str]] | None,
+    user_hypotheses: list[dict[str, Any]],
+) -> tuple[list[str] | None, dict[str, list[str]] | None]:
+    resolved_targets = list(target_signals) if isinstance(target_signals, list) else None
+    resolved_predictor_map: dict[str, list[str]] | None = None
+    if isinstance(predictor_signals_by_target, dict):
+        resolved_predictor_map = {
+            str(key): [str(item) for item in value]
+            for key, value in predictor_signals_by_target.items()
+            if isinstance(value, list)
+        }
+
+    for item in user_hypotheses:
+        target = str(item.get("target_signal", "")).strip()
+        predictors = [
+            str(value).strip() for value in item.get("predictor_signals", []) if str(value).strip()
+        ]
+        if not target or not predictors:
+            continue
+        if resolved_targets is not None and target not in resolved_targets:
+            resolved_targets.append(target)
+        if resolved_predictor_map is None:
+            resolved_predictor_map = {}
+        current = list(resolved_predictor_map.get(target, []))
+        seen = set(current)
+        for predictor in predictors:
+            if predictor not in seen and predictor != target:
+                current.append(predictor)
+                seen.add(predictor)
+        resolved_predictor_map[target] = current
+
+    return resolved_targets, resolved_predictor_map
 
 
 def _detect_numeric_signal_columns(frame: Any) -> list[str]:

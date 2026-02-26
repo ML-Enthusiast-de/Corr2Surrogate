@@ -38,6 +38,21 @@ def test_run_agent1_analysis_tool_end_to_end(monkeypatch, tmp_path: Path) -> Non
                     "user_reason": "lab requirement",
                 }
             ],
+            "user_hypotheses": [
+                {
+                    "target_signal": "target",
+                    "predictor_signals": ["sensor_a"],
+                    "user_reason": "expected strong coupling",
+                }
+            ],
+            "feature_hypotheses": [
+                {
+                    "target_signal": "target",
+                    "base_signal": "sensor_a",
+                    "transformation": "rate_change",
+                    "user_reason": "dynamic bench behavior",
+                }
+            ],
             "save_report": True,
             "run_id": "agent1_test_run",
         },
@@ -48,6 +63,8 @@ def test_run_agent1_analysis_tool_end_to_end(monkeypatch, tmp_path: Path) -> Non
     assert payload["target_count"] == 1
     assert payload["ranking"]
     assert payload["forced_requests"]
+    assert payload["user_hypotheses"]
+    assert payload["feature_hypotheses"]
     assert payload["report_path"] is not None
     assert payload["lineage_path"]
     assert payload["artifact_paths"]["artifact_dir"]
@@ -57,12 +74,14 @@ def test_run_agent1_analysis_tool_end_to_end(monkeypatch, tmp_path: Path) -> Non
     assert report_path.name == "agent1_test_run.md"
     markdown = payload["report_markdown"]
     assert "Preprocessing Decisions" in markdown
+    assert "User Hypotheses" in markdown
     assert "Agentic Planning" in markdown
     assert "Sensor Diagnostics" in markdown
     assert "Experiment Recommendations" in markdown
     assert "Correlation Details (Top 10 Predictors per Target)" in markdown
     assert "| Category | Target | Rank | Predictor | Correlation Type | Strength |" in markdown
     assert "Feature Engineering Opportunities (Top 10)" in markdown
+    assert "User Hypothesis Checks" in markdown
 
 
 def test_run_agent1_analysis_tool_handles_nan_and_row_coverage_strategy(

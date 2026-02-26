@@ -133,6 +133,10 @@ Run interactive multi-turn session:
 ```bash
 corr2surrogate run-agent-session --agent analyst
 ```
+At startup, analyst session now asks for dataset choice:
+- paste a new `.csv` / `.xlsx` path, or
+- type `default` to use `data/public/public_testbench_dataset_20k_minmax.csv` (if present).
+
 Session commands:
 - `/help`
 - `/context`
@@ -153,11 +157,15 @@ Behavior:
 - For large datasets, Agent asks if you want full data or a sample subset (uniform/head/tail + row count).
 - If NaN or uneven row coverage is detected, Agent asks how to proceed (`keep`, `drop_rows`, `fill_median`, `fill_constant`, `drop_sparse_rows`, `trim_dense_window`, `manual_range`).
 - For wide datasets, Agent asks for target focus; type `list` (or `list <filter>`) to show signal names.
+- At target selection, you can add user hypotheses inline:
+  - correlation: `hypothesis corr target:pred1,pred2; target2:pred3`
+  - feature engineering: `hypothesis feature target:signal->rate_change; signal2->square`
 - For time-like datasets, Agent asks whether lag analysis is expected and lets you choose lag dimension (`samples` or `seconds`) and search window.
 - Report is saved in dataset-related folder:
   - `reports/<dataset_slug>/agent1_<timestamp>.md`
   - example: `reports/rde_v19_1_143_kopie/agent1_20260225_120501.md`
 - Report content includes per-target top 10 predictors with correlation type/strength (pearson, spearman, kendall, distance, lagged) plus top feature-engineering opportunities.
+- User hypotheses are investigated additionally and reported explicitly (including requested `rate_change` feature checks).
 - Agent 1 now also includes:
   - confidence + stability layer for top predictors (bootstrap CI, approximate p-value, window stability),
   - confounder-aware stats (partial correlation + conditional MI for top predictors),
@@ -180,6 +188,13 @@ corr2surrogate run-agent1-analysis \
   --bootstrap-rounds 40 \
   --stability-windows 4 \
   --strategy-search-candidates 4
+```
+Optional hypothesis JSON args:
+```bash
+corr2surrogate run-agent1-analysis \
+  --data-path data/private/run1.csv \
+  --user-hypotheses-json '[{"target_signal":"y","predictor_signals":["x1","x2"],"user_reason":"lab hypothesis"}]' \
+  --feature-hypotheses-json '[{"target_signal":"y","base_signal":"x1","transformation":"rate_change","user_reason":"dynamics expected"}]'
 ```
 Outputs are saved under `reports/<dataset_slug>/`:
 - markdown report: `agent1_<timestamp>.md`
