@@ -75,10 +75,20 @@ def run_quality_checks(
     warnings: list[str] = []
 
     if ts_col is not None:
-        parsed = pd.to_datetime(frame[ts_col], errors="coerce")
-        invalid_ts = int(parsed.isna().sum())
-        duplicate_ts = int(parsed.duplicated().sum())
-        monotonic_ts = bool(parsed.dropna().is_monotonic_increasing)
+        ts_series = frame[ts_col]
+        numeric_ts = pd.to_numeric(ts_series, errors="coerce")
+        numeric_ratio = float(numeric_ts.notna().mean()) if len(ts_series) > 0 else 0.0
+        if numeric_ratio >= 0.95:
+            valid_ts = numeric_ts.dropna()
+            invalid_ts = int(numeric_ts.isna().sum())
+            duplicate_ts = int(valid_ts.duplicated().sum())
+            monotonic_ts = bool(valid_ts.is_monotonic_increasing)
+        else:
+            parsed_ts = pd.to_datetime(ts_series, errors="coerce")
+            valid_ts = parsed_ts.dropna()
+            invalid_ts = int(parsed_ts.isna().sum())
+            duplicate_ts = int(valid_ts.duplicated().sum())
+            monotonic_ts = bool(valid_ts.is_monotonic_increasing)
         if invalid_ts > 0:
             warnings.append(
                 f"Timestamp column '{ts_col}' has {invalid_ts} invalid timestamps."

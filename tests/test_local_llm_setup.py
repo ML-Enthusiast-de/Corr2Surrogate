@@ -82,3 +82,36 @@ def test_setup_local_llm_ollama_missing_binary(monkeypatch) -> None:
     result = setup_local_llm(provider="ollama", install_provider=False)
     assert result["ready"] is False
     assert any("not found" in item.lower() for item in result["errors"])
+
+
+def test_setup_local_llm_openai_provider_requires_key(monkeypatch) -> None:
+    config = {
+        "privacy": {"api_calls_allowed": True, "telemetry_allowed": False},
+        "runtime": {
+            "provider": "openai",
+            "require_local_models": False,
+            "block_remote_endpoints": False,
+            "offline_mode": False,
+            "remote_default_model": "gpt-4.1-mini",
+            "endpoints": {
+                "openai": "https://api.openai.com/v1/chat/completions",
+            },
+            "profiles": {
+                "small_cpu": {
+                    "model": "c2s-4b",
+                    "cpu_only": True,
+                    "n_gpu_layers": 0,
+                    "max_context": 2048,
+                },
+            },
+            "default_profile": "small_cpu",
+            "fallback_order": ["small_cpu"],
+        },
+    }
+    monkeypatch.setattr("corr2surrogate.orchestration.local_llm_setup.load_config", lambda _: config)
+    monkeypatch.delenv("C2S_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    result = setup_local_llm(provider="openai")
+    assert result["ready"] is False
+    assert any("Missing API key" in item for item in result["errors"])

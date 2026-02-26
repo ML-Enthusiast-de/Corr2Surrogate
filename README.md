@@ -107,8 +107,13 @@ These modules are OS-agnostic and avoid machine-specific paths. Runtime behavior
 - `C2S_PROVIDER`
 - `C2S_PROFILE`
 - `C2S_OFFLINE_MODE`
+- `C2S_REQUIRE_LOCAL_MODELS`
+- `C2S_BLOCK_REMOTE_ENDPOINTS`
+- `C2S_API_CALLS_ALLOWED`
 - `C2S_MODEL`
 - `C2S_ENDPOINT`
+- `C2S_API_KEY`
+- `C2S_REMOTE_DEFAULT_MODEL`
 
 ## CLI
 Set up local LLM runtime (recommended before first agent run):
@@ -116,7 +121,7 @@ Set up local LLM runtime (recommended before first agent run):
 # Use configured provider/profile from config
 corr2surrogate setup-local-llm
 
-# Lightweight CPU path (llama.cpp + small GGUF)
+# CPU local path (llama.cpp + Qwen 4B Q4_K_M GGUF)
 corr2surrogate setup-local-llm --provider llama_cpp --install-provider
 ```
 
@@ -124,15 +129,33 @@ Run one local agent turn:
 ```bash
 # Optional provider/model overrides (PowerShell)
 $env:C2S_PROVIDER="llama_cpp"
-$env:C2S_MODEL="c2s-local"
+$env:C2S_MODEL="c2s-4b"
 
 corr2surrogate run-agent-once --agent analyst --message "Load data/private/run1.csv and tell me next step"
 ```
 
-Run interactive multi-turn session:
-```bash
-corr2surrogate run-agent-session --agent analyst
+Optional remote API mode (explicit opt-in):
+```powershell
+$env:C2S_PROVIDER="openai"
+$env:C2S_REQUIRE_LOCAL_MODELS="false"
+$env:C2S_BLOCK_REMOTE_ENDPOINTS="false"
+$env:C2S_API_CALLS_ALLOWED="true"
+$env:C2S_OFFLINE_MODE="false"
+$env:C2S_API_KEY="<your_api_key>"
+$env:C2S_MODEL="gpt-4.1-mini"
+# optional custom endpoint:
+# $env:C2S_ENDPOINT="https://api.openai.com/v1/chat/completions"
 ```
+You can validate this mode with:
+```bash
+corr2surrogate setup-local-llm --provider openai
+```
+
+Run interactive multi-turn session:
+```powershell
+& .\.venv\Scripts\corr2surrogate.exe run-agent-session --agent analyst
+```
+If you prefer short commands, activate `.venv` first and then use `corr2surrogate ...`.
 At startup, analyst session now asks for dataset choice:
 - paste a new `.csv` / `.xlsx` path, or
 - type `default` to use `data/public/public_testbench_dataset_20k_minmax.csv` (if present).
@@ -145,10 +168,14 @@ Session commands:
 
 Run Analyst on XLSX (PowerShell):
 ```powershell
-.\.venv\Scripts\Activate.ps1
-corr2surrogate run-agent-session --agent analyst
+& .\.venv\Scripts\corr2surrogate.exe run-agent-session --agent analyst
 # then paste:
 # C:\path\to\Corr2Surrogate\data\private\your_data.xlsx
+```
+Activation-based alternative:
+```powershell
+.\.venv\Scripts\Activate.ps1
+corr2surrogate run-agent-session --agent analyst
 ```
 Behavior:
 - Agent detects the file path and runs deterministic ingestion + Agent 1 analysis.
@@ -210,11 +237,16 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
 ```
-3. Run CLI:
+3. Run CLI (works even when you stay in `base`/`ml`):
 ```powershell
+.\.venv\Scripts\corr2surrogate.exe --help
+```
+If you prefer activating first:
+```powershell
+.\.venv\Scripts\Activate.ps1
 corr2surrogate --help
 ```
-If execution policy blocks activation, run without activation:
+If execution policy blocks activation, use direct executable calls:
 ```powershell
 .\.venv\Scripts\corr2surrogate.exe run-agent-session --agent analyst
 ```

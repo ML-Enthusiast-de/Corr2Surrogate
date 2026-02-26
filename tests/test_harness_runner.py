@@ -124,3 +124,61 @@ def test_run_local_agent_once_handles_max_turns_without_crash(
 def test_extract_data_path_hints() -> None:
     hints = _extract_data_path_hints("Analyze data/private/run1.csv and data/private/run2.xlsx")
     assert hints == ["data/private/run1.csv", "data/private/run2.xlsx"]
+
+
+def test_run_local_agent_once_supports_openai_opt_in(monkeypatch, tmp_path: Path) -> None:
+    config = tmp_path / "config_openai.yaml"
+    config.write_text(
+        "\n".join(
+            [
+                "privacy:",
+                "  local_only: false",
+                "  api_calls_allowed: true",
+                "  telemetry_allowed: false",
+                "runtime:",
+                "  provider: openai",
+                "  require_local_models: false",
+                "  block_remote_endpoints: false",
+                "  offline_mode: false",
+                "  remote_default_model: gpt-4.1-mini",
+                "  temperature: 0.0",
+                "  timeout_seconds: 10",
+                "  endpoints:",
+                "    openai: https://api.openai.com/v1/chat/completions",
+                "  profiles:",
+                "    small_cpu:",
+                "      model: c2s-4b",
+                "      cpu_only: true",
+                "      n_gpu_layers: 0",
+                "      max_context: 4096",
+                "  default_profile: small_cpu",
+                "  fallback_order:",
+                "    - small_cpu",
+                "prompts:",
+                "  analyst_system_path: ''",
+                "  modeler_system_path: ''",
+                "  extra_instructions: ''",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_call(self, *, history, context):
+        return {"action": "respond", "message": "api-ok"}
+
+    monkeypatch.setattr(
+        "corr2surrogate.orchestration.local_provider.LocalLLMResponder.__call__",
+        fake_call,
+    )
+    monkeypatch.setenv("C2S_API_KEY", "dummy-key")
+
+    result = run_local_agent_once(
+        agent="analyst",
+        user_message="hello",
+        context={"x": 1},
+        config_path=str(config),
+    )
+    assert result["event"]["status"] == "respond"
+    assert result["event"]["message"] == "api-ok"
+    assert result["runtime"]["provider"] == "openai"
+    assert result["runtime"]["model"] == "gpt-4.1-mini"

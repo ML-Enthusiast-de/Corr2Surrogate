@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import warnings
 
 from corr2surrogate.analytics.correlations import (
     build_candidate_signals_from_correlations,
@@ -81,3 +82,30 @@ def test_feature_hypothesis_rate_change_is_investigated() -> None:
     analysis = bundle.target_analyses[0]
     assert any(item.transformation == "rate_change" for item in analysis.feature_opportunities)
     assert analysis.hypothesis_feature_checks
+
+
+def test_run_correlation_analysis_filters_non_finite_values_without_runtime_warning() -> None:
+    n = 120
+    time = np.arange(n, dtype=float)
+    x = np.linspace(0.0, 5.0, n)
+    y = 2.0 * x + 0.1
+    frame = pd.DataFrame({"time": time, "x": x, "y": y})
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        bundle = run_correlation_analysis(
+            frame,
+            target_signals=["y"],
+            predictor_signals_by_target={"y": ["x"]},
+            timestamp_column="time",
+            include_feature_engineering=True,
+            feature_gain_threshold=0.0,
+        )
+
+    runtime_warnings = [
+        str(item.message).lower()
+        for item in caught
+        if issubclass(item.category, RuntimeWarning)
+    ]
+    assert not any("invalid value encountered" in msg for msg in runtime_warnings)
+    assert bundle.target_analyses

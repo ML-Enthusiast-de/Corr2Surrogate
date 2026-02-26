@@ -15,14 +15,19 @@ from urllib.request import Request, urlopen
 
 from corr2surrogate.core.config import load_config
 
-from .runtime_policy import LOCAL_PROVIDERS, apply_environment_overrides, load_runtime_policy
-
-DEFAULT_LLAMA_MODEL_PATH = Path("models/qwen2.5-0.5b-instruct-q4_k_m.gguf")
-DEFAULT_LLAMA_MODEL_URL = (
-    "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/"
-    "qwen2.5-0.5b-instruct-q4_k_m.gguf?download=true"
+from .runtime_policy import (
+    LOCAL_PROVIDERS,
+    REMOTE_API_PROVIDERS,
+    apply_environment_overrides,
+    load_runtime_policy,
 )
-DEFAULT_LLAMA_ALIAS = "c2s-local"
+
+DEFAULT_LLAMA_MODEL_PATH = Path("models/Qwen_Qwen3-4B-Q4_K_M.gguf")
+DEFAULT_LLAMA_MODEL_URL = (
+    "https://huggingface.co/bartowski/Qwen_Qwen3-4B-GGUF/resolve/main/"
+    "Qwen_Qwen3-4B-Q4_K_M.gguf?download=true"
+)
+DEFAULT_LLAMA_ALIAS = "c2s-4b"
 
 
 def setup_local_llm(
@@ -40,14 +45,15 @@ def setup_local_llm(
     llama_model_url: str | None = None,
     timeout_seconds: int = 120,
 ) -> dict[str, Any]:
-    """Set up the configured local LLM runtime and return a machine-readable report."""
+    """Set up configured local/remote LLM runtime and return a machine-readable report."""
     config = load_config(config_path)
     policy = apply_environment_overrides(load_runtime_policy(config))
 
     target_provider = (provider or policy.provider).strip().lower()
-    if target_provider not in LOCAL_PROVIDERS:
+    if target_provider not in LOCAL_PROVIDERS and target_provider not in REMOTE_API_PROVIDERS:
         raise ValueError(
-            f"Unsupported provider '{target_provider}'. Use one of {sorted(LOCAL_PROVIDERS)}."
+            "Unsupported provider "
+            f"'{target_provider}'. Use one of {sorted(LOCAL_PROVIDERS | REMOTE_API_PROVIDERS)}."
         )
     policy = replace(policy, provider=target_provider)
 
@@ -59,6 +65,13 @@ def setup_local_llm(
         endpoint=resolved_endpoint,
     )
     resolved_model = model or str(options.get("model", ""))
+
+    if target_provider in REMOTE_API_PROVIDERS:
+        return _setup_remote_api(
+            provider=target_provider,
+            model=resolved_model,
+            endpoint=resolved_endpoint,
+        )
 
     if target_provider == "ollama":
         return _setup_ollama(
@@ -82,6 +95,52 @@ def setup_local_llm(
         max_context=int(options.get("max_context", 4096)),
         timeout_seconds=timeout_seconds,
     )
+
+
+def _setup_remote_api(
+    *,
+    provider: str,
+    model: str,
+    endpoint: str,
+) -> dict[str, Any]:
+    api_key = os.getenv("C2S_API_KEY", "").strip()
+    if not api_key and provider == "openai":
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    report: dict[str, Any] = {
+        "provider": provider,
+        "endpoint": endpoint,
+        "model": model,
+        "ready": False,
+        "steps": [],
+        "warnings": [],
+        "errors": [],
+    }
+    if provider == "openai" and not api_key:
+        report["errors"].append(
+            "Missing API key. Set C2S_API_KEY (or OPENAI_API_KEY) to enable OpenAI calls."
+        )
+        report["suggested_env"] = {
+            "C2S_PROVIDER": "openai",
+            "C2S_MODEL": model,
+            "C2S_ENDPOINT": endpoint,
+            "C2S_API_KEY": "<set-your-key>",
+        }
+        return report
+
+    if provider == "openai_compatible" and not api_key:
+        report["warnings"].append(
+            "No C2S_API_KEY provided. This is allowed for some endpoints, but many require bearer auth."
+        )
+
+    report["ready"] = True
+    report["suggested_env"] = {
+        "C2S_PROVIDER": provider,
+        "C2S_MODEL": model,
+        "C2S_ENDPOINT": endpoint,
+    }
+    if api_key:
+        report["suggested_env"]["C2S_API_KEY"] = "<already-set>"
+    return report
 
 
 def _setup_ollama(
@@ -310,6 +369,15 @@ def _resolve_endpoint(provider: str, runtime_cfg: dict[str, Any]) -> str:
                 "http://127.0.0.1:8000/v1/chat/completions",
             )
         )
+    if provider_key == "openai":
+        return str(endpoints.get("openai", "https://api.openai.com/v1/chat/completions"))
+    if provider_key == "openai_compatible":
+        return str(
+            endpoints.get(
+                "openai_compatible",
+                "https://api.openai.com/v1/chat/completions",
+            )
+        )
     raise ValueError(f"Unsupported provider '{provider}'.")
 
 
@@ -500,4 +568,3 @@ def _tail(text: str | None, *, max_lines: int = 8) -> str:
         return ""
     lines = text.splitlines()
     return "\n".join(lines[-max_lines:])
-

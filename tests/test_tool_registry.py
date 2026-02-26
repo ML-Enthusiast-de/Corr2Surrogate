@@ -72,3 +72,51 @@ def test_tool_registry_respects_confirm_risk_level() -> None:
     )
     result = registry.execute("needs_confirm", {})
     assert result.status == "needs_confirmation"
+
+
+def test_tool_registry_allows_optional_null_field_values() -> None:
+    registry = ToolRegistry()
+
+    def echo(value: int, optional_value: int | None = None) -> dict[str, int | None]:
+        return {"value": value, "optional_value": optional_value}
+
+    registry.register_function(
+        name="echo",
+        description="Echo values.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "value": {"type": "integer"},
+                "optional_value": {"type": "integer"},
+            },
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+        handler=echo,
+    )
+    registry.validate_arguments("echo", {"value": 1, "optional_value": None})
+
+
+def test_tool_registry_rejects_required_null_field_values() -> None:
+    registry = ToolRegistry()
+
+    def echo(value: int) -> int:
+        return value
+
+    registry.register_function(
+        name="echo_required",
+        description="Echo required value.",
+        input_schema={
+            "type": "object",
+            "properties": {"value": {"type": "integer"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+        handler=echo,
+    )
+
+    try:
+        registry.validate_arguments("echo_required", {"value": None})
+    except ToolValidationError:
+        return
+    raise AssertionError("Expected ToolValidationError for required null value.")

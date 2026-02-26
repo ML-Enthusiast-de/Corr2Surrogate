@@ -131,6 +131,7 @@ def _validate_object(payload: Any, *, schema: dict[str, Any], path: str) -> None
 
     properties = schema.get("properties", {})
     required = schema.get("required", [])
+    required_set = set(required)
     additional_properties = schema.get("additionalProperties", True)
 
     for key in required:
@@ -150,6 +151,10 @@ def _validate_object(payload: Any, *, schema: dict[str, Any], path: str) -> None
             if additional_properties:
                 continue
             raise ToolValidationError(f"{key_path}: field is not defined in schema.")
+        if value is None:
+            if key in required_set:
+                raise ToolValidationError(f"{key_path}: required field cannot be null.")
+            continue
         _validate_value(value=value, schema=key_schema, path=key_path)
 
 

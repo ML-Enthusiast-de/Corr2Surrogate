@@ -55,6 +55,7 @@ def run_local_agent_once(
             provider=options["provider"],
             model=options["model"],
             endpoint=endpoint,
+            auth_token=_resolve_api_key(options["provider"]),
             temperature=float(runtime_cfg.get("temperature", 0.0)),
             max_context=int(options["max_context"]),
             timeout_seconds=int(runtime_cfg.get("timeout_seconds", 120)),
@@ -125,7 +126,32 @@ def _resolve_endpoint(provider: str, runtime_cfg: dict[str, Any]) -> str:
                 "http://127.0.0.1:8000/v1/chat/completions",
             )
         )
+    if provider_key in {"openai"}:
+        return str(
+            endpoints.get(
+                "openai",
+                "https://api.openai.com/v1/chat/completions",
+            )
+        )
+    if provider_key in {"openai_compatible"}:
+        return str(
+            endpoints.get(
+                "openai_compatible",
+                "https://api.openai.com/v1/chat/completions",
+            )
+        )
     raise ValueError(f"Unsupported provider '{provider}'.")
+
+
+def _resolve_api_key(provider: str) -> str | None:
+    key = os.getenv("C2S_API_KEY", "").strip()
+    if key:
+        return key
+    provider_key = provider.lower()
+    if provider_key == "openai":
+        alt = os.getenv("OPENAI_API_KEY", "").strip()
+        return alt or None
+    return None
 
 
 def _event_to_dict(event: AgentTurnEvent) -> dict[str, Any]:

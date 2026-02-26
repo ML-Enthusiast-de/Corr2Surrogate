@@ -116,3 +116,57 @@ def test_runtime_policy_applies_model_override_from_env() -> None:
     overridden = apply_environment_overrides(policy, env={"C2S_MODEL": "local-override"})
     options = overridden.runtime_options(profile_name="small_cpu")
     assert options["model"] == "local-override"
+
+
+def test_runtime_policy_allows_remote_provider_when_opted_in() -> None:
+    config = {
+        "privacy": {"api_calls_allowed": True, "telemetry_allowed": False},
+        "runtime": {
+            "provider": "openai",
+            "require_local_models": False,
+            "block_remote_endpoints": False,
+            "offline_mode": False,
+            "remote_default_model": "gpt-4.1-mini",
+            "profiles": {
+                "small_cpu": {
+                    "model": "c2s-4b",
+                    "cpu_only": True,
+                    "n_gpu_layers": 0,
+                    "max_context": 4096,
+                },
+            },
+            "default_profile": "small_cpu",
+            "fallback_order": ["small_cpu"],
+        },
+    }
+    policy = load_runtime_policy(config)
+    options = policy.runtime_options(endpoint="https://api.openai.com/v1/chat/completions")
+    assert options["provider"] == "openai"
+    assert options["model"] == "gpt-4.1-mini"
+
+
+def test_runtime_policy_blocks_remote_provider_without_opt_in() -> None:
+    config = {
+        "privacy": {"api_calls_allowed": False, "telemetry_allowed": False},
+        "runtime": {
+            "provider": "openai",
+            "require_local_models": True,
+            "block_remote_endpoints": True,
+            "offline_mode": True,
+            "profiles": {
+                "small_cpu": {
+                    "model": "c2s-4b",
+                    "cpu_only": True,
+                    "n_gpu_layers": 0,
+                    "max_context": 4096,
+                },
+            },
+            "default_profile": "small_cpu",
+            "fallback_order": ["small_cpu"],
+        },
+    }
+    try:
+        load_runtime_policy(config)
+    except RuntimePolicyError:
+        return
+    raise AssertionError("Expected RuntimePolicyError when remote provider is used without opt-in.")

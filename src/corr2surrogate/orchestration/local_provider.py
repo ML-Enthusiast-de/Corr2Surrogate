@@ -22,6 +22,7 @@ class LocalResponderConfig:
     provider: str
     model: str
     endpoint: str
+    auth_token: str | None = None
     temperature: float = 0.0
     max_context: int = 4096
     timeout_seconds: int = 120
@@ -59,6 +60,20 @@ class LocalLLMResponder:
             return _call_ollama(self.config, messages)
         if provider in {"llama.cpp", "llama_cpp"}:
             return _call_openai_compatible(self.config, messages)
+        if provider == "openai":
+            if not self.config.auth_token:
+                raise LocalProviderError(
+                    "Missing API key for OpenAI provider. Set C2S_API_KEY or OPENAI_API_KEY."
+                )
+            return _call_openai_compatible(
+                self.config, messages, require_auth=True
+            )
+        if provider == "openai_compatible":
+            return _call_openai_compatible(
+                self.config,
+                messages,
+                require_auth=bool(self.config.auth_token),
+            )
         raise LocalProviderError(f"Unsupported provider '{self.config.provider}'.")
 
 
@@ -69,14 +84,22 @@ def _build_messages(
     context: dict[str, Any],
     tool_catalog: list[dict[str, str]],
 ) -> list[dict[str, str]]:
+    chat_only = bool(context.get("chat_only"))
+    instruction = (
+        "Return exactly one JSON action. Do not include markdown. "
+        "Use action='tool_call' or action='respond'. "
+        "If calling run_agent1_analysis, always include required field data_path. "
+        "If context.path_hints exists, use the first entry as data_path."
+    )
+    if chat_only:
+        instruction = (
+            "Return exactly one JSON action. Do not include markdown. "
+            "Use action='respond' only. Do not call tools. "
+            "Answer conversationally and helpfully."
+        )
     history_payload = [_sanitize_for_prompt(event.to_dict()) for event in history[-8:]]
     user_prompt = {
-        "instruction": (
-            "Return exactly one JSON action. Do not include markdown. "
-            "Use action='tool_call' or action='respond'. "
-            "If calling run_agent1_analysis, always include required field data_path. "
-            "If context.path_hints exists, use the first entry as data_path."
-        ),
+        "instruction": instruction,
         "tool_catalog": tool_catalog,
         "context": _sanitize_for_prompt(context),
         "recent_history": history_payload,
@@ -107,7 +130,10 @@ def _call_ollama(
 
 
 def _call_openai_compatible(
-    config: LocalResponderConfig, messages: list[dict[str, str]]
+    config: LocalResponderConfig,
+    messages: list[dict[str, str]],
+    *,
+    require_auth: bool = False,
 ) -> dict[str, Any] | str:
     payload = {
         "model": config.model,
@@ -116,7 +142,15 @@ def _call_openai_compatible(
         "max_tokens": 700,
         "response_format": {"type": "json_object"},
     }
-    data = _http_post_json(config.endpoint, payload, timeout_seconds=config.timeout_seconds)
+    headers: dict[str, str] | None = None
+    if require_auth and config.auth_token:
+        headers = {"Authorization": f"Bearer {config.auth_token}"}
+    data = _http_post_json(
+        config.endpoint,
+        payload,
+        timeout_seconds=config.timeout_seconds,
+        headers=headers,
+    )
     choices = data.get("choices") or []
     if not choices:
         raise LocalProviderError("OpenAI-compatible response has no choices.")
@@ -127,13 +161,20 @@ def _call_openai_compatible(
 
 
 def _http_post_json(
-    endpoint: str, payload: dict[str, Any], *, timeout_seconds: int
+    endpoint: str,
+    payload: dict[str, Any],
+    *,
+    timeout_seconds: int,
+    headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     body = json.dumps(payload).encode("utf-8")
+    request_headers = {"Content-Type": "application/json"}
+    if headers:
+        request_headers.update(headers)
     request = Request(
         endpoint,
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers=request_headers,
         method="POST",
     )
     try:

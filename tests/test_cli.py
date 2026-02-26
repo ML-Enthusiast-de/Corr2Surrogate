@@ -48,6 +48,10 @@ def test_cli_run_agent1_analysis_omits_none_fields(monkeypatch) -> None:
     assert "sheet_name" not in registry.last_args
     assert "timestamp_column" not in registry.last_args
     assert "target_signals" not in registry.last_args
+    assert "max_samples" not in registry.last_args
+    assert "fill_constant_value" not in registry.last_args
+    assert "row_range_start" not in registry.last_args
+    assert "row_range_end" not in registry.last_args
 
 
 def test_cli_setup_local_llm_invokes_setup(monkeypatch) -> None:
@@ -293,13 +297,18 @@ def test_cli_run_agent_session_analyst_autopilot_multi_sheet_handles_small_talk(
     )
     monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
     monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr(
+        "corr2surrogate.ui.cli.run_local_agent_once",
+        lambda **kwargs: {"event": {"message": "LLM detour reply (sheet)."}},
+    )
 
     exit_code = main(["run-agent-session", "--agent", "analyst"])
     assert exit_code == 0
     assert registry.calls[1][0] == "prepare_ingestion_step"
     assert registry.calls[1][1]["sheet_name"] == "S2"
     output = capsys.readouterr().out
-    assert "selecting an Excel sheet now" in output
+    assert "LLM detour reply (sheet)." in output
+    assert "To continue, please enter a sheet number/name" in output
 
 
 def test_cli_run_agent_session_analyst_autopilot_header_override(monkeypatch, tmp_path: Path) -> None:
@@ -401,6 +410,10 @@ def test_cli_run_agent_session_analyst_autopilot_header_confirmation_handles_sma
     )
     monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
     monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr(
+        "corr2surrogate.ui.cli.run_local_agent_once",
+        lambda **kwargs: {"event": {"message": "LLM detour reply (header confirm)."}},
+    )
 
     exit_code = main(["run-agent-session", "--agent", "analyst"])
     assert exit_code == 0
@@ -408,7 +421,8 @@ def test_cli_run_agent_session_analyst_autopilot_header_confirmation_handles_sma
     assert registry.calls[1][1]["header_row"] == 1
     assert registry.calls[1][1]["data_start_row"] == 2
     output = capsys.readouterr().out
-    assert "confirming inferred rows now" in output
+    assert "LLM detour reply (header confirm)." in output
+    assert "To continue, reply with Y/Enter to keep inferred rows" in output
 
 
 def test_cli_run_agent_session_analyst_autopilot_header_override_handles_small_talk(
@@ -456,6 +470,10 @@ def test_cli_run_agent_session_analyst_autopilot_header_override_handles_small_t
     )
     monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
     monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr(
+        "corr2surrogate.ui.cli.run_local_agent_once",
+        lambda **kwargs: {"event": {"message": "LLM detour reply (header override)."}},
+    )
 
     exit_code = main(["run-agent-session", "--agent", "analyst"])
     assert exit_code == 0
@@ -463,7 +481,8 @@ def test_cli_run_agent_session_analyst_autopilot_header_override_handles_small_t
     assert registry.calls[1][1]["header_row"] == 3
     assert registry.calls[1][1]["data_start_row"] == 4
     output = capsys.readouterr().out
-    assert "choosing explicit row numbers now" in output
+    assert "LLM detour reply (header override)." in output
+    assert "To continue, please enter 'header_row,data_start_row'" in output
 
 
 def test_cli_run_agent_session_analyst_target_prompt_accepts_list_command(
@@ -610,21 +629,30 @@ def test_cli_run_agent_session_analyst_target_prompt_handles_small_talk(
 
     monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
     monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr(
+        "corr2surrogate.ui.cli.run_local_agent_once",
+        lambda **kwargs: {"event": {"message": "LLM detour reply (target)."}},
+    )
     exit_code = main(["run-agent-session", "--agent", "analyst"])
     assert exit_code == 0
     assert registry.calls[1][0] == "run_agent1_analysis"
     assert registry.calls[1][1]["target_signals"] == ["sig_2"]
     output = capsys.readouterr().out
-    assert "I am good and ready to continue" in output
+    assert "LLM detour reply (target)." in output
+    assert "To continue, type 'list' to show names" in output
 
 
 def test_cli_run_agent_session_rewrites_greeting_tool_error_fallback(monkeypatch, capsys) -> None:
     inputs = iter(["hi", "/exit"])
+    calls = {"count": 0}
 
     def fake_input(_prompt):
         return next(inputs)
 
     def fake_run_local_agent_once(*, agent, user_message, context, config_path):
+        calls["count"] += 1
+        if context.get("chat_only"):
+            return {"event": {"message": "LLM detour hello"}}
         return {
             "event": {
                 "message": (
@@ -638,8 +666,39 @@ def test_cli_run_agent_session_rewrites_greeting_tool_error_fallback(monkeypatch
     monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", fake_run_local_agent_once)
     exit_code = main(["run-agent-session", "--agent", "analyst"])
     assert exit_code == 0
+    assert calls["count"] >= 2
     output = capsys.readouterr().out
-    assert "Hi. I can chat and help with analysis." in output
+    assert "LLM detour hello" in output
+
+
+def test_cli_run_agent_session_meaning_of_life_uses_llm_detour_on_fallback(
+    monkeypatch, capsys
+) -> None:
+    inputs = iter(["what is the meaning of life", "/exit"])
+    calls = {"chat_only": 0, "normal": 0}
+
+    def fake_run_local_agent_once(*, agent, user_message, context, config_path):
+        if context.get("chat_only"):
+            calls["chat_only"] += 1
+            return {"event": {"message": "Meaning is what you create through choices and responsibility."}}
+        calls["normal"] += 1
+        return {
+            "event": {
+                "message": (
+                    "I am stopping after repeated tool argument errors. "
+                    "Please provide a clearer request."
+                )
+            }
+        }
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", fake_run_local_agent_once)
+    exit_code = main(["run-agent-session", "--agent", "analyst"])
+    assert exit_code == 0
+    assert calls["normal"] == 1
+    assert calls["chat_only"] >= 1
+    output = capsys.readouterr().out
+    assert "Meaning is what you create through choices and responsibility." in output
 
 
 def test_cli_run_agent_session_greeting_uses_llm(monkeypatch, capsys) -> None:
@@ -698,6 +757,87 @@ def test_cli_run_agent_session_provider_connection_error_is_friendly(monkeypatch
     assert "Local LLM runtime is not reachable" in output
     assert "setup-local-llm" in output
     assert "WinError 10061" not in output
+
+
+def test_cli_run_agent_session_analyst_autopilot_handles_internal_error(monkeypatch, capsys) -> None:
+    inputs = iter(["hello", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: _SessionRegistry({}))
+    monkeypatch.setattr(
+        "corr2surrogate.ui.cli._run_analyst_autopilot_turn",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("boom with internal details")),
+    )
+    monkeypatch.setattr(
+        "corr2surrogate.ui.cli.run_local_agent_once",
+        lambda **_: (_ for _ in ()).throw(AssertionError("LLM path should not run for this test")),
+    )
+
+    exit_code = main(["run-agent-session", "--agent", "analyst"])
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "The session is still active" in output
+    assert "Traceback" not in output
+
+
+def test_cli_run_agent_session_analyst_autopilot_drops_none_optional_args(
+    monkeypatch, tmp_path: Path
+) -> None:
+    data_path = tmp_path / "autopilot_drop_none.csv"
+    data_path.write_text("placeholder", encoding="utf-8")
+    signals = ["time"] + [f"S{i}" for i in range(1, 72)]
+    inputs = iter([f"Analyze {data_path}", "y", "66", "n", "/exit"])
+    registry = _SessionRegistry(
+        scripted_outputs={
+            "prepare_ingestion_step": [
+                {
+                    "status": "ok",
+                    "message": "Ingestion ready.",
+                    "options": [],
+                    "selected_sheet": None,
+                    "available_sheets": [],
+                    "row_count": 7860,
+                    "column_count": 72,
+                    "signal_columns": signals,
+                    "numeric_signal_columns": signals,
+                    "timestamp_column_hint": "time",
+                    "estimated_sample_period_seconds": 0.1,
+                    "missing_overall_fraction": 0.0,
+                    "columns_with_missing_count": 0,
+                    "columns_with_missing": [],
+                    "row_non_null_fraction_min": 1.0,
+                    "row_non_null_fraction_median": 1.0,
+                    "row_non_null_fraction_max": 1.0,
+                    "potential_length_mismatch": False,
+                    "header_row": 0,
+                    "data_start_row": 1,
+                    "header_confidence": 1.0,
+                    "needs_user_confirmation": False,
+                }
+            ],
+            "run_agent1_analysis": [
+                {
+                    "status": "ok",
+                    "data_mode": "time_series",
+                    "target_count": 1,
+                    "candidate_count": 1,
+                    "report_path": "reports/autopilot_drop_none/agent1_20260226_120000.md",
+                }
+            ],
+        }
+    )
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    exit_code = main(["run-agent-session", "--agent", "analyst"])
+    assert exit_code == 0
+    assert registry.calls[1][0] == "run_agent1_analysis"
+    args = registry.calls[1][1]
+    assert args["timestamp_column"] == "time"
+    assert args["max_lag"] == 0
+    assert "max_samples" not in args
+    assert "fill_constant_value" not in args
+    assert "row_range_start" not in args
+    assert "row_range_end" not in args
 
 
 def test_cli_run_agent_session_analyst_lag_prompt_sets_max_lag(monkeypatch, tmp_path: Path) -> None:

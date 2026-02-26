@@ -9,6 +9,8 @@ from urllib.parse import urlparse
 
 
 LOCAL_PROVIDERS = {"ollama", "llama.cpp", "llama_cpp"}
+REMOTE_API_PROVIDERS = {"openai", "openai_compatible"}
+SUPPORTED_PROVIDERS = LOCAL_PROVIDERS | REMOTE_API_PROVIDERS
 
 
 class RuntimePolicyError(RuntimeError):
@@ -40,10 +42,15 @@ class RuntimePolicy:
     default_profile: str
     fallback_order: list[str] = field(default_factory=list)
     model_override: str | None = None
+    remote_default_model: str = "gpt-4.1-mini"
 
     def ensure_local_only(self, endpoint: str | None = None) -> None:
         """Validate runtime settings against local-only policy."""
         provider = self.provider.lower()
+        if provider not in SUPPORTED_PROVIDERS:
+            raise RuntimePolicyError(
+                f"Unsupported provider '{self.provider}'. Supported: {sorted(SUPPORTED_PROVIDERS)}."
+            )
         if self.require_local_models and provider not in LOCAL_PROVIDERS:
             raise RuntimePolicyError(
                 f"Provider '{self.provider}' is not local-only. Use one of {sorted(LOCAL_PROVIDERS)}."
@@ -91,7 +98,10 @@ class RuntimePolicy:
             profile = self.select_profile(prefer_cpu=prefer_cpu)
         return {
             "provider": self.provider,
-            "model": self.model_override or profile.model,
+            "model": (
+                self.model_override
+                or (self.remote_default_model if self.provider.lower() in REMOTE_API_PROVIDERS else profile.model)
+            ),
             "cpu_only": profile.cpu_only,
             "n_gpu_layers": profile.n_gpu_layers,
             "max_context": profile.max_context,
@@ -130,6 +140,7 @@ def load_runtime_policy(config: dict[str, Any]) -> RuntimePolicy:
         default_profile=default_profile,
         fallback_order=fallback_order,
         model_override=None,
+        remote_default_model=str(runtime_cfg.get("remote_default_model", "gpt-4.1-mini")),
     )
     _validate_policy(policy)
     return policy
@@ -143,29 +154,60 @@ def apply_environment_overrides(
     provider = values.get("C2S_PROVIDER", policy.provider)
     default_profile = values.get("C2S_PROFILE", policy.default_profile)
     offline_mode = values.get("C2S_OFFLINE_MODE")
+    require_local_models = values.get("C2S_REQUIRE_LOCAL_MODELS")
+    block_remote_endpoints = values.get("C2S_BLOCK_REMOTE_ENDPOINTS")
+    api_calls_allowed = values.get("C2S_API_CALLS_ALLOWED")
+    telemetry_allowed = values.get("C2S_TELEMETRY_ALLOWED")
     model_override = values.get("C2S_MODEL")
+    remote_default_model = values.get("C2S_REMOTE_DEFAULT_MODEL", policy.remote_default_model)
     resolved_offline = (
         policy.offline_mode
         if offline_mode is None
         else offline_mode.strip().lower() in {"1", "true", "yes", "on"}
     )
+    resolved_require_local_models = (
+        policy.require_local_models
+        if require_local_models is None
+        else require_local_models.strip().lower() in {"1", "true", "yes", "on"}
+    )
+    resolved_block_remote_endpoints = (
+        policy.block_remote_endpoints
+        if block_remote_endpoints is None
+        else block_remote_endpoints.strip().lower() in {"1", "true", "yes", "on"}
+    )
+    resolved_api_calls_allowed = (
+        policy.api_calls_allowed
+        if api_calls_allowed is None
+        else api_calls_allowed.strip().lower() in {"1", "true", "yes", "on"}
+    )
+    resolved_telemetry_allowed = (
+        policy.telemetry_allowed
+        if telemetry_allowed is None
+        else telemetry_allowed.strip().lower() in {"1", "true", "yes", "on"}
+    )
     updated = RuntimePolicy(
         provider=provider,
-        require_local_models=policy.require_local_models,
-        block_remote_endpoints=policy.block_remote_endpoints,
+        require_local_models=resolved_require_local_models,
+        block_remote_endpoints=resolved_block_remote_endpoints,
         offline_mode=resolved_offline,
-        api_calls_allowed=policy.api_calls_allowed,
-        telemetry_allowed=policy.telemetry_allowed,
+        api_calls_allowed=resolved_api_calls_allowed,
+        telemetry_allowed=resolved_telemetry_allowed,
         profiles=policy.profiles,
         default_profile=default_profile,
         fallback_order=policy.fallback_order,
         model_override=model_override or None,
+        remote_default_model=remote_default_model,
     )
     _validate_policy(updated)
     return updated
 
 
 def _validate_policy(policy: RuntimePolicy) -> None:
+    provider = policy.provider.lower()
+    if provider not in SUPPORTED_PROVIDERS:
+        raise RuntimePolicyError(
+            f"Provider '{policy.provider}' is not supported. Use one of {sorted(SUPPORTED_PROVIDERS)}."
+        )
     if not policy.profiles:
         raise RuntimePolicyError("At least one runtime profile is required.")
     if policy.default_profile not in policy.profiles:
@@ -177,7 +219,7 @@ def _validate_policy(policy: RuntimePolicy) -> None:
             raise RuntimePolicyError(
                 f"Fallback profile '{name}' not found in configured profiles."
             )
-    if policy.require_local_models and policy.provider.lower() not in LOCAL_PROVIDERS:
+    if policy.require_local_models and provider not in LOCAL_PROVIDERS:
         raise RuntimePolicyError(
             f"Provider '{policy.provider}' is not allowed for local-only execution."
         )

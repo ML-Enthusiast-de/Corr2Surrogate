@@ -455,8 +455,13 @@ def _best_lagged_pearson(
 
 
 def _distance_correlation(x: np.ndarray, y: np.ndarray) -> float:
-    x = np.asarray(x, dtype=float).reshape(-1, 1)
-    y = np.asarray(y, dtype=float).reshape(-1, 1)
+    x_arr = np.asarray(x, dtype=float).reshape(-1)
+    y_arr = np.asarray(y, dtype=float).reshape(-1)
+    finite_mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+    if int(np.sum(finite_mask)) < 3:
+        return float("nan")
+    x = x_arr[finite_mask].reshape(-1, 1)
+    y = y_arr[finite_mask].reshape(-1, 1)
     n = x.shape[0]
     if n < 3:
         return float("nan")
@@ -714,26 +719,33 @@ def _safe_corr(a: pd.Series, b: pd.Series, *, method: str) -> float:
         return float("nan")
     x = aligned_numeric.iloc[:, 0]
     y = aligned_numeric.iloc[:, 1]
+    x_arr = x.to_numpy(dtype=float)
+    y_arr = y.to_numpy(dtype=float)
+    finite_mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+    if int(np.sum(finite_mask)) < 3:
+        return float("nan")
+    x_arr = x_arr[finite_mask]
+    y_arr = y_arr[finite_mask]
 
     if method == "pearson":
-        return _pearson_numeric(x.to_numpy(dtype=float), y.to_numpy(dtype=float))
+        return _pearson_numeric(x_arr, y_arr)
     if method == "spearman":
-        xr = x.rank(method="average")
-        yr = y.rank(method="average")
+        xr = pd.Series(x_arr).rank(method="average")
+        yr = pd.Series(y_arr).rank(method="average")
         return _pearson_numeric(xr.to_numpy(dtype=float), yr.to_numpy(dtype=float))
     if method == "kendall":
         try:
             from scipy.stats import kendalltau  # type: ignore
 
-            value = kendalltau(x.to_numpy(dtype=float), y.to_numpy(dtype=float))[0]
+            value = kendalltau(x_arr, y_arr)[0]
             return float(value) if value is not None else float("nan")
         except Exception:
             # Fallback for local environments without scipy.
-            xr = x.rank(method="average")
-            yr = y.rank(method="average")
+            xr = pd.Series(x_arr).rank(method="average")
+            yr = pd.Series(y_arr).rank(method="average")
             return _pearson_numeric(xr.to_numpy(dtype=float), yr.to_numpy(dtype=float))
 
-    value = x.corr(y, method=method)
+    value = pd.Series(x_arr).corr(pd.Series(y_arr), method=method)
     return float(value) if value is not None else float("nan")
 
 
@@ -909,16 +921,23 @@ def _window_stability_score(
 
 
 def _partial_correlation(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> float:
-    if len(x) < 4:
+    x_arr = np.asarray(x, dtype=float).reshape(-1)
+    y_arr = np.asarray(y, dtype=float).reshape(-1)
+    z_arr = np.asarray(z, dtype=float).reshape(-1)
+    finite_mask = np.isfinite(x_arr) & np.isfinite(y_arr) & np.isfinite(z_arr)
+    if int(np.sum(finite_mask)) < 4:
         return float("nan")
-    zc = z - np.mean(z)
+    x_arr = x_arr[finite_mask]
+    y_arr = y_arr[finite_mask]
+    z_arr = z_arr[finite_mask]
+    zc = z_arr - np.mean(z_arr)
     denom = float(np.dot(zc, zc))
     if denom <= 1e-12:
-        return _pearson_numeric(x, y)
-    bx = float(np.dot(x - np.mean(x), zc) / denom)
-    by = float(np.dot(y - np.mean(y), zc) / denom)
-    rx = x - (np.mean(x) + bx * zc)
-    ry = y - (np.mean(y) + by * zc)
+        return _pearson_numeric(x_arr, y_arr)
+    bx = float(np.dot(x_arr - np.mean(x_arr), zc) / denom)
+    by = float(np.dot(y_arr - np.mean(y_arr), zc) / denom)
+    rx = x_arr - (np.mean(x_arr) + bx * zc)
+    ry = y_arr - (np.mean(y_arr) + by * zc)
     return _pearson_numeric(rx, ry)
 
 
@@ -931,13 +950,18 @@ def _conditional_mi_gaussian(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> flo
 
 
 def _pearson_numeric(x: np.ndarray, y: np.ndarray) -> float:
-    if len(x) < 3 or len(y) < 3:
+    x_arr = np.asarray(x, dtype=float).reshape(-1)
+    y_arr = np.asarray(y, dtype=float).reshape(-1)
+    finite_mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+    if int(np.sum(finite_mask)) < 3:
         return float("nan")
-    x_std = float(np.std(x))
-    y_std = float(np.std(y))
+    x_arr = x_arr[finite_mask]
+    y_arr = y_arr[finite_mask]
+    x_std = float(np.std(x_arr))
+    y_std = float(np.std(y_arr))
     if x_std <= 1e-12 or y_std <= 1e-12:
         return 0.0
-    corr = float(np.corrcoef(x, y)[0, 1])
+    corr = float(np.corrcoef(x_arr, y_arr)[0, 1])
     if not np.isfinite(corr):
         return float("nan")
     return corr

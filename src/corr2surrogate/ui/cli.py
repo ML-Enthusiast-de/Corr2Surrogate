@@ -7,7 +7,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from corr2surrogate.orchestration.default_tools import build_default_registry
 from corr2surrogate.orchestration.harness_runner import run_local_agent_once
@@ -83,7 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     setup_llm.add_argument(
         "--provider",
-        choices=["ollama", "llama_cpp", "llama.cpp"],
+        choices=["ollama", "llama_cpp", "llama.cpp", "openai", "openai_compatible"],
         default=None,
         help="Override provider. Defaults to configured runtime provider.",
     )
@@ -349,7 +349,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.run_id:
             tool_args["run_id"] = args.run_id
 
-        result = registry.execute("run_agent1_analysis", tool_args)
+        result = registry.execute("run_agent1_analysis", _drop_none_fields(tool_args))
         print(json.dumps(result.output, indent=2))
         return 0
 
@@ -385,6 +385,10 @@ def _parse_json_array(raw: str, *, arg_name: str) -> list[Any]:
     if not isinstance(parsed, list):
         raise ValueError(f"{arg_name} must decode to a JSON array.")
     return parsed
+
+
+def _drop_none_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in payload.items() if value is not None}
 
 
 def _run_agent_session(
@@ -483,10 +487,45 @@ def _run_agent_session(
             continue
 
         if agent == "analyst":
-            autopilot = _run_analyst_autopilot_turn(
-                user_message=user_message,
-                registry=registry,
-            )
+            def _chat_reply_only(detour_user_message: str) -> str:
+                return _llm_chat_detour(
+                    agent=agent,
+                    user_message=detour_user_message,
+                    session_context=session_context,
+                    session_messages=session_messages,
+                    config_path=config_path,
+                )
+
+            def _chat_detour_with_reprompt(detour_user_message: str, reminder: str) -> None:
+                reply = _chat_reply_only(detour_user_message)
+                if reply:
+                    print(f"agent> {reply}")
+                print(f"agent> {reminder}")
+
+            try:
+                autopilot = _run_analyst_autopilot_turn(
+                    user_message=user_message,
+                    registry=registry,
+                    chat_detour=_chat_detour_with_reprompt,
+                )
+            except Exception as exc:
+                response = _runtime_error_fallback_message(
+                    agent=agent,
+                    user_message=user_message,
+                    error=exc,
+                )
+                print(f"agent> {response}")
+                session_messages.append({"role": "user", "content": user_message})
+                session_messages.append({"role": "assistant", "content": response})
+                session_messages = session_messages[-20:]
+                session_context["last_event"] = _compact_event_for_context(
+                    {"status": "respond", "message": response, "error": "runtime_error"}
+                )
+                turns += 1
+                if max_turns > 0 and turns >= max_turns:
+                    print(f"Reached max turns ({max_turns}). Session ended.")
+                    return 0
+                continue
             if autopilot is not None:
                 response = autopilot["response"]
                 summary_event = autopilot["event"]
@@ -536,6 +575,11 @@ def _run_agent_session(
             agent=agent,
             user_message=user_message,
             response=response,
+            chat_detour=(
+                _chat_reply_only
+                if agent == "analyst"
+                else None
+            ),
         )
         print(f"agent> {response}")
         if show_json:
@@ -552,7 +596,12 @@ def _run_agent_session(
             return 0
 
 
-def _run_analyst_autopilot_turn(*, user_message: str, registry: Any) -> dict[str, Any] | None:
+def _run_analyst_autopilot_turn(
+    *,
+    user_message: str,
+    registry: Any,
+    chat_detour: Callable[[str, str], None] | None = None,
+) -> dict[str, Any] | None:
     detected: Path | None = None
     if user_message.strip().lower() == "default":
         detected = _resolve_default_public_dataset_path()
@@ -589,7 +638,7 @@ def _run_analyst_autopilot_turn(*, user_message: str, registry: Any) -> dict[str
 
     if preflight.get("status") == "needs_user_input":
         options = preflight.get("options") or preflight.get("available_sheets") or []
-        selected_sheet = _prompt_sheet_selection(options)
+        selected_sheet = _prompt_sheet_selection(options, chat_detour=chat_detour)
         if selected_sheet is None:
             response = "Sheet selection aborted. Please provide a valid sheet."
             return {
@@ -638,6 +687,7 @@ def _run_analyst_autopilot_turn(*, user_message: str, registry: Any) -> dict[str
         header_row, data_start_row = _prompt_header_confirmation(
             header_row=resolved_header_row,
             data_start_row=resolved_data_start,
+            chat_detour=chat_detour,
         )
 
         preflight_args["header_row"] = int(header_row)
@@ -676,10 +726,10 @@ def _run_analyst_autopilot_turn(*, user_message: str, registry: Any) -> dict[str
         "feature_hypotheses": [],
     }
     row_count = int(preflight.get("row_count") or 0)
-    sample_plan = _prompt_sample_budget(row_count=row_count)
+    sample_plan = _prompt_sample_budget(row_count=row_count, chat_detour=chat_detour)
     analysis_args.update(sample_plan)
 
-    data_issue_plan = _prompt_data_issue_handling(preflight=preflight)
+    data_issue_plan = _prompt_data_issue_handling(preflight=preflight, chat_detour=chat_detour)
     analysis_args.update(data_issue_plan)
 
     numeric_signals = [str(item) for item in (preflight.get("numeric_signal_columns") or [])]
@@ -698,6 +748,7 @@ def _run_analyst_autopilot_turn(*, user_message: str, registry: Any) -> dict[str
             available_signals=numeric_signals,
             default_count=5,
             hypothesis_state=hypothesis_state,
+            chat_detour=chat_detour,
         )
         if selected_targets is not None:
             analysis_args["target_signals"] = selected_targets
@@ -736,6 +787,7 @@ def _run_analyst_autopilot_turn(*, user_message: str, registry: Any) -> dict[str
         lag_plan = _prompt_lag_preferences(
             timestamp_column_hint=timestamp_hint,
             estimated_sample_period_seconds=estimated_sample_period,
+            chat_detour=chat_detour,
         )
         analysis_args["timestamp_column"] = timestamp_hint
         analysis_args["max_lag"] = int(lag_plan["max_lag"])
@@ -780,14 +832,18 @@ def _run_analyst_autopilot_turn(*, user_message: str, registry: Any) -> dict[str
 
 
 def _execute_registry_tool(registry: Any, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    result = registry.execute(tool_name, arguments)
+    result = registry.execute(tool_name, _drop_none_fields(arguments))
     output = result.output
     if not isinstance(output, dict):
         return {"status": "error", "message": f"Tool '{tool_name}' returned non-object output."}
     return output
 
 
-def _prompt_sheet_selection(options: list[str]) -> str | None:
+def _prompt_sheet_selection(
+    options: list[str],
+    *,
+    chat_detour: Callable[[str, str], None] | None = None,
+) -> str | None:
     if not options:
         return None
     _print_sheet_options(options)
@@ -801,11 +857,17 @@ def _prompt_sheet_selection(options: list[str]) -> str | None:
             _print_sheet_options(options)
             continue
         if _looks_like_small_talk(selection):
-            print(
-                "agent> I can chat, and we are selecting an Excel sheet now. "
-                "Please enter a sheet number/name, type 'list' to show sheets again, "
-                "or 'cancel' to abort."
-            )
+            if chat_detour is not None:
+                chat_detour(
+                    selection,
+                    "To continue, please enter a sheet number/name, type 'list', or 'cancel'.",
+                )
+            else:
+                print(
+                    "agent> I can chat, and we are selecting an Excel sheet now. "
+                    "Please enter a sheet number/name, type 'list' to show sheets again, "
+                    "or 'cancel' to abort."
+                )
             continue
         if selection.isdigit():
             index = int(selection)
@@ -826,7 +888,12 @@ def _print_sheet_options(options: list[str]) -> None:
         print(f"agent>   {idx}. {name}")
 
 
-def _prompt_header_confirmation(*, header_row: int, data_start_row: int) -> tuple[int, int]:
+def _prompt_header_confirmation(
+    *,
+    header_row: int,
+    data_start_row: int,
+    chat_detour: Callable[[str, str], None] | None = None,
+) -> tuple[int, int]:
     while True:
         print(
             "agent> Use inferred rows "
@@ -843,13 +910,20 @@ def _prompt_header_confirmation(*, header_row: int, data_start_row: int) -> tupl
             return _prompt_header_override(
                 default_header_row=header_row,
                 default_data_start_row=data_start_row,
+                chat_detour=chat_detour,
             )
         if _looks_like_small_talk(answer):
-            print(
-                "agent> I can chat, and we are confirming inferred rows now. "
-                "Reply with Y/Enter to keep inferred rows, N to change, "
-                "or 'h,d' (for example 2,3)."
-            )
+            if chat_detour is not None:
+                chat_detour(
+                    answer,
+                    "To continue, reply with Y/Enter to keep inferred rows, N to change, or 'h,d'.",
+                )
+            else:
+                print(
+                    "agent> I can chat, and we are confirming inferred rows now. "
+                    "Reply with Y/Enter to keep inferred rows, N to change, "
+                    "or 'h,d' (for example 2,3)."
+                )
             continue
         print(
             "agent> I did not parse that. Reply Y/Enter to keep inferred rows, "
@@ -861,6 +935,7 @@ def _prompt_header_override(
     *,
     default_header_row: int,
     default_data_start_row: int,
+    chat_detour: Callable[[str, str], None] | None = None,
 ) -> tuple[int, int]:
     while True:
         print("agent> Enter header_row,data_start_row (e.g. 2,3). Press Enter to keep inferred.")
@@ -872,11 +947,17 @@ def _prompt_header_override(
         if parsed_second is not None:
             return parsed_second
         if _looks_like_small_talk(second):
-            print(
-                "agent> I can chat, and we are choosing explicit row numbers now. "
-                "Please enter 'header_row,data_start_row' (for example 2,3), "
-                "or press Enter to keep inferred rows."
-            )
+            if chat_detour is not None:
+                chat_detour(
+                    second,
+                    "To continue, please enter 'header_row,data_start_row' or press Enter to keep inferred rows.",
+                )
+            else:
+                print(
+                    "agent> I can chat, and we are choosing explicit row numbers now. "
+                    "Please enter 'header_row,data_start_row' (for example 2,3), "
+                    "or press Enter to keep inferred rows."
+                )
             continue
         print(
             "agent> Invalid format. Use 'header_row,data_start_row' with "
@@ -993,6 +1074,7 @@ def _prompt_target_selection(
     available_signals: list[str],
     default_count: int,
     hypothesis_state: dict[str, list[dict[str, Any]]] | None = None,
+    chat_detour: Callable[[str, str], None] | None = None,
 ) -> list[str] | None:
     while True:
         answer = input("you> ").strip()
@@ -1041,13 +1123,19 @@ def _prompt_target_selection(
         )
         if unknown and not selected:
             if _looks_like_small_talk(answer):
-                print(
-                    "agent> I am good and ready to continue. "
-                    "We are currently selecting target signals. "
-                    "If useful, add hypotheses via `hypothesis ...`. "
-                    "Type 'list' to show names, 'all' for full run, "
-                    "or press Enter for a quick subset."
-                )
+                if chat_detour is not None:
+                    chat_detour(
+                        answer,
+                        "To continue, type 'list' to show names, 'all' for full run, or provide target signals.",
+                    )
+                else:
+                    print(
+                        "agent> I am good and ready to continue. "
+                        "We are currently selecting target signals. "
+                        "If useful, add hypotheses via `hypothesis ...`. "
+                        "Type 'list' to show names, 'all' for full run, "
+                        "or press Enter for a quick subset."
+                    )
                 continue
             print(
                 "agent> No matching signal names found. "
@@ -1300,6 +1388,7 @@ def _prompt_lag_preferences(
     *,
     timestamp_column_hint: str,
     estimated_sample_period_seconds: float | None,
+    chat_detour: Callable[[str, str], None] | None = None,
 ) -> dict[str, Any]:
     print(f"agent> Detected timestamp column hint: `{timestamp_column_hint}`.")
     while True:
@@ -1310,10 +1399,16 @@ def _prompt_lag_preferences(
         if answer in {"n", "no"}:
             return {"enabled": False, "dimension": "none", "max_lag": 0}
         if _looks_like_small_talk(answer):
-            print(
-                "agent> I can chat, and we are deciding lag analysis scope now. "
-                "Reply Y/Enter to investigate lags, or N to skip lag search."
-            )
+            if chat_detour is not None:
+                chat_detour(
+                    answer,
+                    "To continue, reply Y/Enter to investigate lags, or N to skip lag search.",
+                )
+            else:
+                print(
+                    "agent> I can chat, and we are deciding lag analysis scope now. "
+                    "Reply Y/Enter to investigate lags, or N to skip lag search."
+                )
             continue
         print("agent> Please answer Y/Enter or N.")
 
@@ -1327,6 +1422,7 @@ def _prompt_lag_preferences(
                     "Press Enter for default 8."
                 ),
                 default_value=8,
+                chat_detour=chat_detour,
             )
             return {"enabled": True, "dimension": "samples", "max_lag": max_lag_samples}
         if dimension in {"seconds", "second", "sec", "s"}:
@@ -1335,6 +1431,7 @@ def _prompt_lag_preferences(
                     "agent> Enter maximum lag window in seconds (positive number, for example 2.5)."
                 ),
                 default_value=None,
+                chat_detour=chat_detour,
             )
             default_period = estimated_sample_period_seconds
             if default_period is not None:
@@ -1350,19 +1447,30 @@ def _prompt_lag_preferences(
             sample_period = _prompt_positive_float(
                 prompt=period_prompt,
                 default_value=default_period,
+                chat_detour=chat_detour,
             )
             max_lag_samples = max(1, int(round(lag_seconds / sample_period)))
             return {"enabled": True, "dimension": "seconds", "max_lag": max_lag_samples}
         if _looks_like_small_talk(dimension):
-            print(
-                "agent> We need a lag dimension choice to continue. "
-                "Use `samples` or `seconds`."
-            )
+            if chat_detour is not None:
+                chat_detour(
+                    dimension,
+                    "To continue, choose lag dimension: `samples` or `seconds`.",
+                )
+            else:
+                print(
+                    "agent> We need a lag dimension choice to continue. "
+                    "Use `samples` or `seconds`."
+                )
             continue
         print("agent> Invalid lag dimension. Use `samples` or `seconds`.")
 
 
-def _prompt_sample_budget(*, row_count: int) -> dict[str, Any]:
+def _prompt_sample_budget(
+    *,
+    row_count: int,
+    chat_detour: Callable[[str, str], None] | None = None,
+) -> dict[str, Any]:
     if row_count <= 0:
         return {"max_samples": None, "sample_selection": "uniform"}
     if row_count < 500:
@@ -1376,10 +1484,16 @@ def _prompt_sample_budget(*, row_count: int) -> dict[str, Any]:
         if answer in {"n", "no"}:
             break
         if _looks_like_small_talk(answer):
-            print(
-                "agent> We are choosing analysis sample count. "
-                "Reply Y/Enter for all rows, or N to set a subset."
-            )
+            if chat_detour is not None:
+                chat_detour(
+                    answer,
+                    "To continue, reply Y/Enter for all rows, or N to set a subset.",
+                )
+            else:
+                print(
+                    "agent> We are choosing analysis sample count. "
+                    "Reply Y/Enter for all rows, or N to set a subset."
+                )
             continue
         print("agent> Please answer Y/Enter or N.")
 
@@ -1389,6 +1503,7 @@ def _prompt_sample_budget(*, row_count: int) -> dict[str, Any]:
             f"(1..{row_count})."
         ),
         default_value=min(row_count, 2000),
+        chat_detour=chat_detour,
     )
     count = max(1, min(count, row_count))
     while True:
@@ -1399,12 +1514,22 @@ def _prompt_sample_budget(*, row_count: int) -> dict[str, Any]:
         if mode in {"head", "tail"}:
             return {"max_samples": count, "sample_selection": mode}
         if _looks_like_small_talk(mode):
-            print("agent> Sampling mode controls subset selection order. Use uniform/head/tail.")
+            if chat_detour is not None:
+                chat_detour(
+                    mode,
+                    "To continue, choose sampling mode: uniform, head, or tail.",
+                )
+            else:
+                print("agent> Sampling mode controls subset selection order. Use uniform/head/tail.")
             continue
         print("agent> Invalid mode. Use uniform, head, or tail.")
 
 
-def _prompt_data_issue_handling(*, preflight: dict[str, Any]) -> dict[str, Any]:
+def _prompt_data_issue_handling(
+    *,
+    preflight: dict[str, Any],
+    chat_detour: Callable[[str, str], None] | None = None,
+) -> dict[str, Any]:
     plan: dict[str, Any] = {
         "missing_data_strategy": "keep",
         "fill_constant_value": None,
@@ -1441,14 +1566,21 @@ def _prompt_data_issue_handling(*, preflight: dict[str, Any]) -> dict[str, Any]:
                             "Use negative values if needed."
                         ),
                         default_value=0.0,
+                        chat_detour=chat_detour,
                     )
                     plan["fill_constant_value"] = float(value)
                 break
             if _looks_like_small_talk(answer):
-                print(
-                    "agent> This choice controls NaN handling before correlation. "
-                    "Use keep/drop_rows/fill_median/fill_constant."
-                )
+                if chat_detour is not None:
+                    chat_detour(
+                        answer,
+                        "To continue, choose missing-data handling: keep, drop_rows, fill_median, or fill_constant.",
+                    )
+                else:
+                    print(
+                        "agent> This choice controls NaN handling before correlation. "
+                        "Use keep/drop_rows/fill_median/fill_constant."
+                    )
                 continue
             print("agent> Invalid choice. Use keep, drop_rows, fill_median, or fill_constant.")
 
@@ -1477,20 +1609,27 @@ def _prompt_data_issue_handling(*, preflight: dict[str, Any]) -> dict[str, Any]:
                         "(default 0.8)."
                     ),
                     default_value=0.8,
+                    chat_detour=chat_detour,
                 )
                 plan["sparse_row_min_fraction"] = threshold
                 break
             if answer == "manual_range":
                 plan["row_coverage_strategy"] = "manual_range"
-                start, end = _prompt_manual_row_range()
+                start, end = _prompt_manual_row_range(chat_detour=chat_detour)
                 plan["row_range_start"] = start
                 plan["row_range_end"] = end
                 break
             if _looks_like_small_talk(answer):
-                print(
-                    "agent> This choice controls how to align uneven row coverage. "
-                    "Use keep/drop_sparse_rows/trim_dense_window/manual_range."
-                )
+                if chat_detour is not None:
+                    chat_detour(
+                        answer,
+                        "To continue, choose row-coverage handling: keep, drop_sparse_rows, trim_dense_window, or manual_range.",
+                    )
+                else:
+                    print(
+                        "agent> This choice controls how to align uneven row coverage. "
+                        "Use keep/drop_sparse_rows/trim_dense_window/manual_range."
+                    )
                 continue
             print(
                 "agent> Invalid choice. Use keep, drop_sparse_rows, "
@@ -1499,7 +1638,12 @@ def _prompt_data_issue_handling(*, preflight: dict[str, Any]) -> dict[str, Any]:
     return plan
 
 
-def _prompt_positive_int(*, prompt: str, default_value: int | None) -> int:
+def _prompt_positive_int(
+    *,
+    prompt: str,
+    default_value: int | None,
+    chat_detour: Callable[[str, str], None] | None = None,
+) -> int:
     while True:
         print(prompt)
         raw = input("you> ").strip()
@@ -1509,7 +1653,10 @@ def _prompt_positive_int(*, prompt: str, default_value: int | None) -> int:
             value = int(raw)
         except ValueError:
             if _looks_like_small_talk(raw):
-                print("agent> Please provide a positive integer value.")
+                if chat_detour is not None:
+                    chat_detour(raw, "To continue, provide a positive integer value.")
+                else:
+                    print("agent> Please provide a positive integer value.")
             else:
                 print("agent> Invalid number. Please provide a positive integer.")
             continue
@@ -1518,7 +1665,12 @@ def _prompt_positive_int(*, prompt: str, default_value: int | None) -> int:
         print("agent> Value must be > 0.")
 
 
-def _prompt_positive_float(*, prompt: str, default_value: float | None) -> float:
+def _prompt_positive_float(
+    *,
+    prompt: str,
+    default_value: float | None,
+    chat_detour: Callable[[str, str], None] | None = None,
+) -> float:
     while True:
         print(prompt)
         raw = input("you> ").strip()
@@ -1528,7 +1680,10 @@ def _prompt_positive_float(*, prompt: str, default_value: float | None) -> float
             value = float(raw)
         except ValueError:
             if _looks_like_small_talk(raw):
-                print("agent> Please provide a positive numeric value.")
+                if chat_detour is not None:
+                    chat_detour(raw, "To continue, provide a positive numeric value.")
+                else:
+                    print("agent> Please provide a positive numeric value.")
             else:
                 print("agent> Invalid number. Please provide a positive numeric value.")
             continue
@@ -1537,7 +1692,12 @@ def _prompt_positive_float(*, prompt: str, default_value: float | None) -> float
         print("agent> Value must be > 0.")
 
 
-def _prompt_fraction(*, prompt: str, default_value: float) -> float:
+def _prompt_fraction(
+    *,
+    prompt: str,
+    default_value: float,
+    chat_detour: Callable[[str, str], None] | None = None,
+) -> float:
     while True:
         print(prompt)
         raw = input("you> ").strip()
@@ -1547,7 +1707,10 @@ def _prompt_fraction(*, prompt: str, default_value: float) -> float:
             value = float(raw)
         except ValueError:
             if _looks_like_small_talk(raw):
-                print("agent> Please provide a number between 0 and 1.")
+                if chat_detour is not None:
+                    chat_detour(raw, "To continue, provide a number between 0 and 1.")
+                else:
+                    print("agent> Please provide a number between 0 and 1.")
             else:
                 print("agent> Invalid value. Please provide a number between 0 and 1.")
             continue
@@ -1556,7 +1719,12 @@ def _prompt_fraction(*, prompt: str, default_value: float) -> float:
         print("agent> Threshold must be in (0, 1].")
 
 
-def _prompt_numeric_value(*, prompt: str, default_value: float) -> float:
+def _prompt_numeric_value(
+    *,
+    prompt: str,
+    default_value: float,
+    chat_detour: Callable[[str, str], None] | None = None,
+) -> float:
     while True:
         print(prompt)
         raw = input("you> ").strip()
@@ -1566,12 +1734,18 @@ def _prompt_numeric_value(*, prompt: str, default_value: float) -> float:
             return float(raw)
         except ValueError:
             if _looks_like_small_talk(raw):
-                print("agent> Please provide a numeric value.")
+                if chat_detour is not None:
+                    chat_detour(raw, "To continue, provide a numeric value.")
+                else:
+                    print("agent> Please provide a numeric value.")
             else:
                 print("agent> Invalid value. Please provide a numeric value.")
 
 
-def _prompt_manual_row_range() -> tuple[int, int]:
+def _prompt_manual_row_range(
+    *,
+    chat_detour: Callable[[str, str], None] | None = None,
+) -> tuple[int, int]:
     while True:
         print("agent> Enter manual row range as `start,end` (0-based, inclusive).")
         raw = input("you> ").strip()
@@ -1579,7 +1753,10 @@ def _prompt_manual_row_range() -> tuple[int, int]:
         if parsed is not None:
             return parsed
         if _looks_like_small_talk(raw):
-            print("agent> Use numeric row range like `100,2500`.")
+            if chat_detour is not None:
+                chat_detour(raw, "To continue, provide a numeric row range like `100,2500`.")
+            else:
+                print("agent> Use numeric row range like `100,2500`.")
             continue
         print("agent> Invalid range. Use `start,end` with end >= start.")
 
@@ -1635,7 +1812,55 @@ def _print_header_preview(preflight: dict[str, Any]) -> None:
         print(f"agent>   {idx}. {name}")
 
 
-def _rewrite_unhelpful_response(*, agent: str, user_message: str, response: str) -> str:
+def _llm_chat_detour(
+    *,
+    agent: str,
+    user_message: str,
+    session_context: dict[str, Any],
+    session_messages: list[dict[str, str]],
+    config_path: str | None,
+) -> str:
+    turn_context = dict(session_context)
+    turn_context["session_messages"] = list(session_messages)
+    turn_context["chat_only"] = True
+    try:
+        result = _invoke_agent_once_with_recovery(
+            agent=agent,
+            user_message=user_message,
+            context=turn_context,
+            config_path=config_path,
+        )
+        event = result.get("event", {})
+        response = str(event.get("message", "")).strip()
+        if not response:
+            response = "[empty response]"
+        session_messages.append({"role": "user", "content": user_message})
+        session_messages.append({"role": "assistant", "content": response})
+        session_messages[:] = session_messages[-20:]
+        session_context["last_event"] = _compact_event_for_context(event)
+        return response
+    except Exception as exc:
+        response = _runtime_error_fallback_message(
+            agent=agent,
+            user_message=user_message,
+            error=exc,
+        )
+        session_messages.append({"role": "user", "content": user_message})
+        session_messages.append({"role": "assistant", "content": response})
+        session_messages[:] = session_messages[-20:]
+        session_context["last_event"] = _compact_event_for_context(
+            {"status": "respond", "message": response, "error": "runtime_error"}
+        )
+        return response
+
+
+def _rewrite_unhelpful_response(
+    *,
+    agent: str,
+    user_message: str,
+    response: str,
+    chat_detour: Callable[[str], str] | None = None,
+) -> str:
     if agent != "analyst":
         return response
     lowered = response.lower()
@@ -1645,13 +1870,18 @@ def _rewrite_unhelpful_response(*, agent: str, user_message: str, response: str)
         "too many invalid actions",
     )
     if any(marker in lowered for marker in fallback_markers):
+        no_data_path = _extract_first_data_path(user_message) is None
+        if no_data_path and chat_detour is not None:
+            detour = chat_detour(user_message).strip()
+            if detour:
+                return detour
         if _is_casual_chat_message(user_message):
-            return _casual_chat_response(user_message)
-        if _extract_first_data_path(user_message) is None:
+            return "I hit a tool-loop issue, but I can still chat. Ask again and I will answer directly."
+        if no_data_path:
             return (
-                "I can help with that. For data analysis, paste a .csv/.xlsx path. "
-                "If you want general guidance, ask directly (for example: "
-                "'what checks do you run before correlation?')."
+                "I hit a tool-loop issue on that request. "
+                "If you want analysis, paste a .csv/.xlsx path. "
+                "If you want a conceptual answer, ask directly and I will respond."
             )
     return response
 
@@ -1675,7 +1905,11 @@ def _is_casual_chat_message(text: str) -> bool:
         "thanks",
         "thank you",
     }
-    return any(phrase in normalized for phrase in phrases)
+    if any(phrase in normalized for phrase in phrases):
+        return True
+    if normalized.endswith("?") and _extract_first_data_path(normalized) is None:
+        return True
+    return False
 
 
 def _casual_chat_response(user_message: str) -> str:
@@ -1710,7 +1944,12 @@ def _runtime_error_fallback_message(*, agent: str, user_message: str, error: Exc
             "Local LLM runtime is not reachable at the configured endpoint. "
             "Start it with `corr2surrogate setup-local-llm` (or launch your local provider) and retry."
         )
-    return f"Runtime error: {error}"
+    if agent == "analyst":
+        return (
+            "I hit an internal runtime error in this step. "
+            "The session is still active; you can retry, change inputs, or use /reset."
+        )
+    return "I hit an internal runtime error. Please retry."
 
 
 def _invoke_agent_once_with_recovery(
