@@ -1,10 +1,10 @@
-﻿# Corr2Surrogate
+# Corr2Surrogate
 
 Corr2Surrogate is a local-first framework for converting real-world sensor data into validated surrogate-model candidates.
 
 ## What It Does
 - Agent 1 (`Analyst`) ingests CSV/XLS/XLSX data, checks data quality, runs correlation analysis, and ranks surrogate candidates.
-- Agent 2 (`Modeler`) is designed to train/evaluate surrogate models with reproducible artifacts and checkpoints.
+- Agent 2 (`Modeler`) is designed to train/evaluate surrogate models with reproducible artifacts and checkpoints. (not yet implemented)
 
 ## Key Capabilities
 - CSV/XLS/XLSX ingestion with sheet selection and header/data-start inference
