@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
+from corr2surrogate.core.json_utils import dumps_json
 from corr2surrogate.orchestration.default_tools import build_default_registry
 from corr2surrogate.orchestration.harness_runner import run_local_agent_once
 from corr2surrogate.orchestration.local_llm_setup import setup_local_llm
@@ -258,9 +259,9 @@ def main(argv: list[str] | None = None) -> int:
                 user_message=args.message,
                 error=exc,
             )
-            print(json.dumps({"status": "error", "message": message}, indent=2))
+            print(dumps_json({"status": "error", "message": message}, indent=2))
             return 1
-        print(json.dumps(result, indent=2))
+        print(dumps_json(result, indent=2))
         return 0
 
     if args.command == "run-agent-session":
@@ -294,9 +295,9 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_seconds=int(args.timeout_seconds),
             )
         except Exception as exc:
-            print(json.dumps({"ready": False, "error": str(exc)}, indent=2))
+            print(dumps_json({"ready": False, "error": str(exc)}, indent=2))
             return 1
-        print(json.dumps(result, indent=2))
+        print(dumps_json(result, indent=2))
         return 0
 
     if args.command == "run-agent1-analysis":
@@ -354,7 +355,7 @@ def main(argv: list[str] | None = None) -> int:
             tool_args["run_id"] = args.run_id
 
         result = registry.execute("run_agent1_analysis", _drop_none_fields(tool_args))
-        print(json.dumps(result.output, indent=2))
+        print(dumps_json(result.output, indent=2))
         return 0
 
     parser.error(f"Unsupported command '{args.command}'.")
@@ -428,7 +429,8 @@ def _run_agent_session(
         if default_dataset_path is not None:
             print(
                 "agent> Dataset choice: paste a CSV/XLSX path or type `default` "
-                f"to run the built-in test dataset: `{default_dataset_path}`."
+                "to run the built-in test dataset: "
+                f"`{_path_for_display(default_dataset_path)}`."
             )
         else:
             print(
@@ -499,7 +501,7 @@ def _run_agent_session(
         if command == "/context":
             snapshot = dict(session_context)
             snapshot["session_messages"] = session_messages
-            print(json.dumps(snapshot, indent=2))
+            print(dumps_json(snapshot, indent=2))
             continue
         if command == "/reset":
             session_context = dict(base_context)
@@ -637,7 +639,7 @@ def _run_agent_session(
             print(f"agent> {stage_reminder}")
             response = f"{response}\n{stage_reminder}"
         if show_json:
-            print(json.dumps(result, indent=2))
+            print(dumps_json(result, indent=2))
 
         session_messages.append({"role": "user", "content": user_message})
         session_messages.append({"role": "assistant", "content": response})
@@ -708,7 +710,7 @@ def _run_analyst_autopilot_turn(
             "event": {"status": "respond", "message": response, "error": "missing_path"},
         }
 
-    print(f"agent> Detected data file: {data_path}")
+    print(f"agent> Detected data file: {_path_for_display(Path(data_path))}")
     preflight_args: dict[str, Any] = {"path": data_path}
     preflight = _execute_registry_tool(registry, "prepare_ingestion_step", preflight_args)
     print(f"agent> Ingestion check: {preflight.get('message', '')}")
@@ -895,9 +897,11 @@ def _run_analyst_autopilot_turn(
     print(f"agent> {report_line}")
     top3_correlations = _extract_top3_correlations_global(analysis)
     if chat_reply_only is not None:
-        prompt = _build_analysis_interpretation_prompt(analysis)
-        interpretation = chat_reply_only(prompt).strip()
-        if interpretation and not _looks_like_llm_failure_message(interpretation):
+        interpretation = _generate_analysis_interpretation(
+            analysis=analysis,
+            chat_reply_only=chat_reply_only,
+        )
+        if interpretation:
             print("agent> LLM interpretation:")
             for line in interpretation.splitlines():
                 text = line.strip()
@@ -927,6 +931,23 @@ def _run_analyst_autopilot_turn(
         },
     }
     return {"response": response, "event": event}
+
+
+def _generate_analysis_interpretation(
+    *,
+    analysis: dict[str, Any],
+    chat_reply_only: Callable[[str], str],
+) -> str:
+    primary_prompt = _build_analysis_interpretation_prompt(analysis)
+    primary = chat_reply_only(primary_prompt).strip()
+    if primary and not _looks_like_llm_failure_message(primary):
+        return primary
+
+    compact_prompt = _build_compact_analysis_interpretation_prompt(analysis)
+    compact = chat_reply_only(compact_prompt).strip()
+    if compact and not _looks_like_llm_failure_message(compact):
+        return compact
+    return ""
 
 
 def _build_analysis_interpretation_prompt(analysis: dict[str, Any]) -> str:
@@ -980,7 +1001,29 @@ def _build_analysis_interpretation_prompt(analysis: dict[str, Any]) -> str:
         "the predictor_signal, target_signal, best_method, and best_abs_score from "
         "`top_3_correlated_predictors`. "
         "Do not invent values.\n"
-        f"RESULTS_JSON={json.dumps(summary, ensure_ascii=False)}"
+        f"RESULTS_JSON={dumps_json(summary, ensure_ascii=False)}"
+    )
+
+
+def _build_compact_analysis_interpretation_prompt(analysis: dict[str, Any]) -> str:
+    quality = analysis.get("quality") if isinstance(analysis.get("quality"), dict) else {}
+    top3 = _extract_top3_correlations_global(analysis)
+    rows = quality.get("rows", "n/a")
+    completeness = quality.get("completeness_score", "n/a")
+    warnings = quality.get("warnings") if isinstance(quality.get("warnings"), list) else []
+    top3_line = _format_top3_correlations_line(top3) if top3 else "Top 3 correlated predictors: n/a"
+    return (
+        "You are Agent 1's scientific narrator. Use concise plain text.\n"
+        "Summarize in 4 numbered points:\n"
+        "1) data quality,\n"
+        "2) strongest evidence,\n"
+        "3) key risks,\n"
+        "4) immediate next actions.\n"
+        "Mandatory: include one bullet that starts with `Top 3 correlated predictors:` exactly.\n"
+        f"rows={rows}\n"
+        f"completeness_score={completeness}\n"
+        f"warnings={warnings[:5]}\n"
+        f"{top3_line}\n"
     )
 
 
@@ -1236,6 +1279,14 @@ def _resolve_default_public_dataset_path() -> Path | None:
         if candidate.exists():
             return candidate.resolve()
     return None
+
+
+def _path_for_display(path: Path) -> str:
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(Path.cwd().resolve()))
+    except ValueError:
+        return str(resolved)
 
 
 def _compact_event_for_context(event: dict[str, Any]) -> dict[str, Any]:

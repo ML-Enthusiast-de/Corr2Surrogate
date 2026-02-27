@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import datetime, timezone
-import json
 import math
 from pathlib import Path
 import re
 from typing import Any
 
+from corr2surrogate.core.json_utils import write_json
 from corr2surrogate.analytics.correlations import CorrelationAnalysisBundle
 from corr2surrogate.analytics.quality_checks import QualityCheckResult
 from corr2surrogate.analytics.stationarity import StationaritySummary
@@ -155,8 +155,7 @@ def save_agent1_artifacts(
         list(structured.get("planner_trace", [])),
     )
 
-    json_path = artifact_dir / "structured_report.json"
-    json_path.write_text(json.dumps(structured, indent=2), encoding="utf-8")
+    json_path = write_json(artifact_dir / "structured_report.json", structured, indent=2)
 
     plot_paths: dict[str, str] = {}
     top_plot = _write_top_predictor_plot(

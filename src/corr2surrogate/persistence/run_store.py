@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import platform
 import subprocess
 from datetime import datetime, timezone
@@ -12,6 +11,8 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+
+from corr2surrogate.core.json_utils import write_json
 
 
 class RunStore:
@@ -47,7 +48,7 @@ class RunStore:
             "random_seed": int(random_seed),
             "runtime": self._runtime_info(),
         }
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        write_json(path, payload, indent=2)
         return str(path)
 
     def _dataset_fingerprint(self, data_path: str) -> dict[str, Any]:
@@ -93,4 +94,3 @@ class RunStore:
             "pandas_version": pd.__version__,
             "git_commit": git_commit,
         }
-

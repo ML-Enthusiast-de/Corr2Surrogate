@@ -1,5 +1,6 @@
 ﻿from dataclasses import dataclass
 from pathlib import Path
+import json
 
 from corr2surrogate.ui.cli import (
     _build_analysis_interpretation_prompt,
@@ -62,6 +63,40 @@ def test_cli_run_agent1_analysis_omits_none_fields(monkeypatch) -> None:
     assert "fill_constant_value" not in registry.last_args
     assert "row_range_start" not in registry.last_args
     assert "row_range_end" not in registry.last_args
+
+
+def test_cli_run_agent1_analysis_prints_strict_json_for_nonfinite_values(
+    monkeypatch, capsys
+) -> None:
+    class _NonFiniteRegistry:
+        def execute(self, _tool_name, _arguments):
+            return _DummyResult(
+                output={
+                    "status": "ok",
+                    "score_nan": float("nan"),
+                    "score_pos_inf": float("inf"),
+                    "score_neg_inf": float("-inf"),
+                    "nested": {"value": float("nan")},
+                }
+            )
+
+    monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: _NonFiniteRegistry())
+    exit_code = main(
+        [
+            "run-agent1-analysis",
+            "--data-path",
+            "dummy.csv",
+        ]
+    )
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "NaN" not in output
+    assert "Infinity" not in output
+    payload = json.loads(output)
+    assert payload["score_nan"] is None
+    assert payload["score_pos_inf"] is None
+    assert payload["score_neg_inf"] is None
+    assert payload["nested"]["value"] is None
 
 
 def test_cli_setup_local_llm_invokes_setup(monkeypatch) -> None:
@@ -416,6 +451,96 @@ def test_cli_run_agent_session_autopilot_interpretation_runtime_error_is_suppres
     assert "LLM interpretation unavailable for this turn." in output
     assert "Top 3 correlated predictors:" in output
     assert "I hit an internal runtime error in this step." not in output
+
+
+def test_cli_run_agent_session_autopilot_interpretation_retries_with_compact_prompt(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    data_path = tmp_path / "demo_data_interpret_retry.xlsx"
+    data_path.write_text("testdata", encoding="utf-8")
+    inputs = iter([f"Analyze {data_path}", "/exit"])
+    registry = _SessionRegistry(
+        scripted_outputs={
+            "prepare_ingestion_step": [
+                {
+                    "status": "ok",
+                    "message": "Ingestion ready.",
+                    "options": [],
+                    "selected_sheet": "Sheet1",
+                    "available_sheets": ["Sheet1"],
+                    "header_row": 0,
+                    "data_start_row": 1,
+                    "header_confidence": 0.98,
+                    "needs_user_confirmation": False,
+                }
+            ],
+            "run_agent1_analysis": [
+                {
+                    "status": "ok",
+                    "data_mode": "time_series",
+                    "target_count": 1,
+                    "candidate_count": 1,
+                    "report_path": "reports/demo_data_interpret_retry/agent1_20260225_120000.md",
+                    "quality": {
+                        "rows": 100,
+                        "columns": 4,
+                        "completeness_score": 0.99,
+                        "warnings": [],
+                    },
+                    "correlations": {
+                        "target_analyses": [
+                            {
+                                "target_signal": "t1",
+                                "predictor_results": [
+                                    {
+                                        "predictor_signal": "p1",
+                                        "best_method": "pearson",
+                                        "best_abs_score": 0.98,
+                                        "sample_count": 100,
+                                    },
+                                    {
+                                        "predictor_signal": "p2",
+                                        "best_method": "spearman",
+                                        "best_abs_score": 0.95,
+                                        "sample_count": 100,
+                                    },
+                                    {
+                                        "predictor_signal": "p3",
+                                        "best_method": "distance_corr",
+                                        "best_abs_score": 0.90,
+                                        "sample_count": 100,
+                                    },
+                                ],
+                            }
+                        ]
+                    },
+                }
+            ],
+        }
+    )
+    calls = {"n": 0}
+    failure_text = (
+        "I hit an internal runtime error in this step. "
+        "The session is still active; you can retry, change inputs, or use /reset."
+    )
+
+    def fake_run_local_agent_once(**_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"event": {"message": failure_text}}
+        return {"event": {"message": "Recovered interpretation on retry."}}
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", fake_run_local_agent_once)
+
+    exit_code = main(["run-agent-session", "--agent", "analyst"])
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert calls["n"] >= 2
+    assert "LLM interpretation:" in output
+    assert "Recovered interpretation on retry." in output
+    assert "LLM interpretation unavailable for this turn." not in output
 
 
 def test_analysis_interpretation_prompt_contains_global_top3_correlations() -> None:

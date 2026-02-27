@@ -36,11 +36,11 @@ cd Corr2Surrogate
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 ```
 3. Set up local LLM runtime (Qwen 4B local profile):
 ```powershell
-corr2surrogate setup-local-llm --provider llama_cpp --install-provider
+& .\.venv\Scripts\corr2surrogate.exe setup-local-llm --provider llama_cpp --install-provider
 ```
 4. Start analyst session:
 ```powershell
@@ -113,7 +113,7 @@ $env:C2S_MODEL="gpt-4.1-mini"
 # optional:
 # $env:C2S_ENDPOINT="https://api.openai.com/v1/chat/completions"
 
-corr2surrogate setup-local-llm --provider openai
+& .\.venv\Scripts\corr2surrogate.exe setup-local-llm --provider openai
 ```
 
 ### Bash/Zsh
@@ -167,16 +167,25 @@ Outputs are grouped by dataset slug under `reports/<dataset_slug>/`:
 ## Quality and Security Checks
 Run tests:
 ```bash
-python -m pytest
+./.venv/bin/python -m pytest
 ```
 Run leak scan before commit/push:
 ```bash
-c2s-guard
+./.venv/bin/c2s-guard
 # or
-python -m corr2surrogate.ui.cli scan-git-safety
+./.venv/bin/python -m corr2surrogate.ui.cli scan-git-safety
+```
+
+Windows equivalents:
+```powershell
+& .\.venv\Scripts\python.exe -m pytest
+& .\.venv\Scripts\c2s-guard.exe
+# or
+& .\.venv\Scripts\python.exe -m corr2surrogate.ui.cli scan-git-safety
 ```
 
 ## Troubleshooting
+- `corr2surrogate` without path only works when the venv is active or the script is on `PATH`.
 - If `corr2surrogate` is not recognized on Windows, use:
 ```powershell
 & .\.venv\Scripts\corr2surrogate.exe --help

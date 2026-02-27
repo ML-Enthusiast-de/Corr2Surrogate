@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from corr2surrogate.core.json_utils import write_json
+
 
 @dataclass(frozen=True)
 class ModelCheckpoint:
@@ -153,7 +155,7 @@ class ModelCheckpointStore:
 
     def _write_checkpoint_file(self, checkpoint: ModelCheckpoint) -> None:
         output = self.base_dir / f"{checkpoint.checkpoint_id}.json"
-        output.write_text(json.dumps(checkpoint.to_dict(), indent=2), encoding="utf-8")
+        write_json(output, checkpoint.to_dict(), indent=2)
 
 
 def _new_checkpoint_id() -> str:

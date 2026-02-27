@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from corr2surrogate.core.json_utils import write_json
 from corr2surrogate.modeling.normalization import MinMaxNormalizer
 
 
@@ -51,7 +51,7 @@ class ArtifactStore:
             "extra": extra or {},
         }
         output = Path(run_dir) / "model_params.json"
-        output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        write_json(output, payload, indent=2)
         return output
 
     def save_normalizer(

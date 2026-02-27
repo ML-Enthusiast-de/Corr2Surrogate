@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from corr2surrogate.core.json_utils import write_json
 from .evaluation import regression_metrics
 
 
@@ -122,8 +123,7 @@ class IncrementalLinearSurrogate:
         """Persist model state as JSON."""
         output = Path(path)
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(json.dumps(self.state_dict(), indent=2), encoding="utf-8")
-        return output
+        return write_json(output, self.state_dict(), indent=2)
 
     @classmethod
     def from_state_dict(cls, state: dict[str, Any]) -> "IncrementalLinearSurrogate":
