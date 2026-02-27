@@ -1,140 +1,107 @@
-# Corr2Surrogate
+﻿# Corr2Surrogate
 
-Local-first, privacy-preserving framework that converts real-world sensor data into scientifically validated surrogate models.
+Corr2Surrogate is a local-first framework for converting real-world sensor data into validated surrogate-model candidates.
 
-## Core Workflow
-- Agent 1 (`Analyst`) handles ingestion, quality checks, correlation/dependency analysis, and surrogateability ranking.
-- Agent 2 (`Modeler`) trains surrogate models, validates against acceptance criteria, and saves reproducible artifacts.
+## What It Does
+- Agent 1 (`Analyst`) ingests CSV/XLS/XLSX data, checks data quality, runs correlation analysis, and ranks surrogate candidates.
+- Agent 2 (`Modeler`) is designed to train/evaluate surrogate models with reproducible artifacts and checkpoints.
 
-## Key Features
-- Input formats: `.csv`, `.xlsx`, `.xls`
-- Multi-sheet Excel support with explicit sheet selection prompt
-- Header/data-start inference with user confirmation on low confidence
-- Optional Min-Max normalization with saved state for inference de-normalization
-- Saved optimization outputs (`model_params.json`) and normalization state
-- Agent 1 complete analysis pipeline:
-  - quality checks (missingness, duplicates, outliers, timestamp integrity)
-  - stationarity assessment per signal
-  - multi-technique correlation scan (Pearson/Spearman/Kendall/distance/lagged)
-  - feature-engineering opportunity detection (transforms/interactions/lag features)
-  - dependency-aware surrogate ranking
-- Model savepoints/checkpoints:
-  - Load an existing trained model
-  - Add additional data and retrain from checkpoint
-  - Create child checkpoints for traceable model evolution
-- Post-test diagnostics:
-  - Detect where model performs poorly
-  - Suggest concrete new lab/testbench data trajectories to improve coverage
-- User-forced modeling directives:
-  - Model target signal `A` with user-defined predictors `[B, C, ...]`
-  - Run even if correlation ranking is weak
-- Dependency-aware ranking:
-  - Penalizes or blocks candidates that depend on other virtualized signals without stable physical anchors
-- System knowledge injection:
-  - Mark critical signals
-  - Mark physically required / non-virtualizable signals
-- Agentic loops:
-  - If quality is below criteria, continue iterations with guidance
-  - Recommend more data, architecture changes, or feature changes when stalled
+## Key Capabilities
+- CSV/XLS/XLSX ingestion with sheet selection and header/data-start inference
+- Quality checks (missingness, duplicates, outliers, timestamp integrity)
+- Correlation analysis (Pearson, Spearman, Kendall, distance, lag-aware)
+- Feature-engineering scans (including `rate_change`)
+- Dependency-aware surrogate ranking
+- Dataset-scoped reports and artifact export
+- Local runtime by default; optional API mode via explicit opt-in
 
-## Privacy
-- Put sensitive data in `data/private/`
-- `data/private/`, generated `artifacts/*`, and `reports/*` are git-ignored by default
+## Privacy Defaults
+- Keep private datasets in `data/private/`.
+- `data/private/`, `reports/`, and `artifacts/` are git-ignored by default.
 
-## Design Principles
-- Local-first execution (no data leaves the machine)
-- Deterministic scientific tooling behind agent decisions
-- Reproducibility through run artifacts and policy-controlled orchestration
-- Transparent user communication at each critical decision point
+## Prerequisites
+- Python `>=3.10` (project default tested with Python 3.11)
+- Git
+- For local LLM mode:
+  - Windows: `llama.cpp` or Ollama
+  - macOS: `llama.cpp` (recommended) or Ollama
 
-## Project Docs
-- Blueprint: `PROJECT_LAYOUT.md`
-- Runtime defaults: `configs/default.yaml`
-- Harness contract (agents + tool use + local runtime): `HARNESS_CONTRACT.md`
+## Quickstart (Windows)
+1. Clone and enter repo:
+```powershell
+git clone <your-repo-url>
+cd Corr2Surrogate
+```
+2. Create virtual environment and install:
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+```
+3. Set up local LLM runtime (Qwen 4B local profile):
+```powershell
+corr2surrogate setup-local-llm --provider llama_cpp --install-provider
+```
+4. Start analyst session:
+```powershell
+# works even if you stay in conda base/ml
+& .\.venv\Scripts\corr2surrogate.exe run-agent-session --agent analyst
+```
 
-## Agent Behavior Control
-Default behavior is controlled by system prompts and config, not fine-tuning.
-
-Where to edit:
-- System prompts:
-  - `src/corr2surrogate/agents/prompts/analyst_system.txt`
-  - `src/corr2surrogate/agents/prompts/modeler_system.txt`
-- Prompt overrides in config:
-  - `prompts.analyst_system_path`
-  - `prompts.modeler_system_path`
-  - `prompts.extra_instructions`
-- Runtime behavior:
-  - `runtime.temperature`
-  - `runtime.provider`
-  - `runtime.profiles.*`
-  - `runtime.endpoints.*`
-
-Fine-tuning is optional and not required for MVP. Start with strong system prompts + strict tool contracts.
-
-## Portable Setup
-1. Clone the repo:
+## Quickstart (macOS)
+1. Install `llama.cpp`:
+```bash
+brew install llama.cpp
+```
+2. Clone and enter repo:
 ```bash
 git clone <your-repo-url>
 cd Corr2Surrogate
 ```
-2. Create and activate a virtual environment:
+3. Create virtual environment and install:
 ```bash
-python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# Linux/macOS
+python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install -e ".[dev]"
 ```
-3. Install dependencies:
+4. Set up local LLM runtime:
 ```bash
-pip install -e ".[dev]"
+corr2surrogate setup-local-llm --provider llama_cpp
 ```
-4. Run tests:
+5. Start analyst session:
 ```bash
-python -m pytest
+./.venv/bin/corr2surrogate run-agent-session --agent analyst
 ```
 
-## Harness Modules
-- `src/corr2surrogate/orchestration/tool_registry.py`
-- `src/corr2surrogate/orchestration/agent_loop.py`
-- `src/corr2surrogate/orchestration/runtime_policy.py`
-- `src/corr2surrogate/orchestration/local_provider.py`
-- `src/corr2surrogate/orchestration/default_tools.py`
-- `src/corr2surrogate/orchestration/harness_runner.py`
+## Analyst Session Usage
+At startup you can:
+- paste a `.csv/.xlsx/.xls` path, or
+- type `default` to run the built-in public test dataset.
 
-These modules are OS-agnostic and avoid machine-specific paths. Runtime behavior is controlled through `configs/default.yaml` and optional environment overrides:
-- `C2S_CONFIG_PATH`
-- `C2S_PROVIDER`
-- `C2S_PROFILE`
-- `C2S_OFFLINE_MODE`
-- `C2S_REQUIRE_LOCAL_MODELS`
-- `C2S_BLOCK_REMOTE_ENDPOINTS`
-- `C2S_API_CALLS_ALLOWED`
-- `C2S_MODEL`
-- `C2S_ENDPOINT`
-- `C2S_API_KEY`
-- `C2S_REMOTE_DEFAULT_MODEL`
+Default dataset note:
+- `data/public/public_testbench_dataset_20k_minmax.csv` is sanitized and intentionally includes ~5% missing values in three representative signals (`B`, `D`, `F`), while all other signals and `time` remain complete. This lets users test missing-data handling and leakage warnings without collapsing row count when trying `drop_rows`.
 
-## CLI
-Set up local LLM runtime (recommended before first agent run):
-```bash
-# Use configured provider/profile from config
-corr2surrogate setup-local-llm
+Useful commands:
+- `/help`
+- `/context`
+- `/reset`
+- `/exit`
 
-# CPU local path (llama.cpp + Qwen 4B Q4_K_M GGUF)
-corr2surrogate setup-local-llm --provider llama_cpp --install-provider
-```
+Target selection shortcuts:
+- `list`
+- `list <filter>`
+- `all`
+- comma-separated signal names
+- numeric index
 
-Run one local agent turn:
-```bash
-# Optional provider/model overrides (PowerShell)
-$env:C2S_PROVIDER="llama_cpp"
-$env:C2S_MODEL="c2s-4b"
+Hypothesis syntax:
+- Correlation: `hypothesis corr target:pred1,pred2; target2:pred3`
+- Feature: `hypothesis feature target:signal->rate_change; signal2->square`
 
-corr2surrogate run-agent-once --agent analyst --message "Load data/private/run1.csv and tell me next step"
-```
+## Optional API Mode (Explicit Opt-In)
+Default policy is local-only. API mode must be explicitly enabled.
 
-Optional remote API mode (explicit opt-in):
+### PowerShell
 ```powershell
 $env:C2S_PROVIDER="openai"
 $env:C2S_REQUIRE_LOCAL_MODELS="false"
@@ -143,133 +110,80 @@ $env:C2S_API_CALLS_ALLOWED="true"
 $env:C2S_OFFLINE_MODE="false"
 $env:C2S_API_KEY="<your_api_key>"
 $env:C2S_MODEL="gpt-4.1-mini"
-# optional custom endpoint:
+# optional:
 # $env:C2S_ENDPOINT="https://api.openai.com/v1/chat/completions"
-```
-You can validate this mode with:
-```bash
+
 corr2surrogate setup-local-llm --provider openai
 ```
 
-Run interactive multi-turn session:
-```powershell
-& .\.venv\Scripts\corr2surrogate.exe run-agent-session --agent analyst
-```
-If you prefer short commands, activate `.venv` first and then use `corr2surrogate ...`.
-At startup, analyst session now asks for dataset choice:
-- paste a new `.csv` / `.xlsx` path, or
-- type `default` to use `data/public/public_testbench_dataset_20k_minmax.csv` (if present).
+### Bash/Zsh
+```bash
+export C2S_PROVIDER=openai
+export C2S_REQUIRE_LOCAL_MODELS=false
+export C2S_BLOCK_REMOTE_ENDPOINTS=false
+export C2S_API_CALLS_ALLOWED=true
+export C2S_OFFLINE_MODE=false
+export C2S_API_KEY=<your_api_key>
+export C2S_MODEL=gpt-4.1-mini
+# optional:
+# export C2S_ENDPOINT=https://api.openai.com/v1/chat/completions
 
-Session commands:
-- `/help`
-- `/context`
-- `/reset`
-- `/exit`
-
-Run Analyst on XLSX (PowerShell):
-```powershell
-& .\.venv\Scripts\corr2surrogate.exe run-agent-session --agent analyst
-# then paste:
-# C:\path\to\Corr2Surrogate\data\private\your_data.xlsx
+corr2surrogate setup-local-llm --provider openai
 ```
-Activation-based alternative:
-```powershell
-.\.venv\Scripts\Activate.ps1
-corr2surrogate run-agent-session --agent analyst
-```
-Behavior:
-- Agent detects the file path and runs deterministic ingestion + Agent 1 analysis.
-- If sheet/header is ambiguous, Agent asks in CLI and continues after your input.
-- In sheet/header/target prompts, casual chat still works and the agent steers you back to the pending decision.
-- For large datasets, Agent asks if you want full data or a sample subset (uniform/head/tail + row count).
-- If NaN or uneven row coverage is detected, Agent asks how to proceed (`keep`, `drop_rows`, `fill_median`, `fill_constant`, `drop_sparse_rows`, `trim_dense_window`, `manual_range`).
-- For wide datasets, Agent asks for target focus; type `list` (or `list <filter>`) to show signal names.
-- At target selection, you can add user hypotheses inline:
-  - correlation: `hypothesis corr target:pred1,pred2; target2:pred3`
-  - feature engineering: `hypothesis feature target:signal->rate_change; signal2->square`
-- For time-like datasets, Agent asks whether lag analysis is expected and lets you choose lag dimension (`samples` or `seconds`) and search window.
-- Report is saved in dataset-related folder:
-  - `reports/<dataset_slug>/agent1_<timestamp>.md`
-  - example: `reports/rde_v19_1_143_kopie/agent1_20260225_120501.md`
-- Report content includes per-target top 10 predictors with correlation type/strength (pearson, spearman, kendall, distance, lagged) plus top feature-engineering opportunities.
-- User hypotheses are investigated additionally and reported explicitly (including requested `rate_change` feature checks).
-- Agent 1 now also includes:
-  - confidence + stability layer for top predictors (bootstrap CI, approximate p-value, window stability),
-  - confounder-aware stats (partial correlation + conditional MI for top predictors),
-  - planner/critic preprocessing strategy search (candidate plans scored before final run),
-  - sensor diagnostics and trust scoring (saturation/quantization/drift/dropout/stuck),
-  - experiment trajectory recommendations for targeted new data collection,
-  - run lineage (`.lineage.json`) for reproducibility,
-  - artifact export folder with CSV/JSON (and optional plot when `matplotlib` is available).
 
-Run deterministic Agent 1 analysis directly:
+## Deterministic Agent 1 (No LLM Call)
 ```bash
 corr2surrogate run-agent1-analysis --data-path data/private/run1.csv --timestamp-column time
 ```
-Useful flags for advanced analysis:
+
+Example with advanced options:
 ```bash
 corr2surrogate run-agent1-analysis \
   --data-path data/private/run1.csv \
   --timestamp-column time \
+  --target-signals y \
+  --max-lag 12 \
   --confidence-top-k 10 \
   --bootstrap-rounds 40 \
   --stability-windows 4 \
   --strategy-search-candidates 4
 ```
-Optional hypothesis JSON args:
+
+## Behavior and Prompt Control
+- Runtime defaults: `configs/default.yaml`
+- Analyst prompt: `src/corr2surrogate/agents/prompts/analyst_system.txt`
+- Modeler prompt: `src/corr2surrogate/agents/prompts/modeler_system.txt`
+- Optional prompt overrides:
+  - `prompts.analyst_system_path`
+  - `prompts.modeler_system_path`
+  - `prompts.extra_instructions`
+
+## Output Structure
+Outputs are grouped by dataset slug under `reports/<dataset_slug>/`:
+- Markdown report: `agent1_<timestamp>.md`
+- Lineage JSON: `agent1_<timestamp>.lineage.json`
+- Artifact directory: `agent1_<timestamp>_artifacts/`
+
+## Quality and Security Checks
+Run tests:
 ```bash
-corr2surrogate run-agent1-analysis \
-  --data-path data/private/run1.csv \
-  --user-hypotheses-json '[{"target_signal":"y","predictor_signals":["x1","x2"],"user_reason":"lab hypothesis"}]' \
-  --feature-hypotheses-json '[{"target_signal":"y","base_signal":"x1","transformation":"rate_change","user_reason":"dynamics expected"}]'
+python -m pytest
 ```
-Outputs are saved under `reports/<dataset_slug>/`:
-- markdown report: `agent1_<timestamp>.md`
-- run lineage: `agent1_<timestamp>.lineage.json`
-- artifacts folder: `agent1_<timestamp>_artifacts/`
-
-## Troubleshooting (Windows)
-If PowerShell says `corr2surrogate` is not recognized:
-1. Make sure you are using Python 3.10+ (project requires `>=3.10`).
-2. Create a local venv and install:
-```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -e ".[dev]"
-```
-3. Run CLI (works even when you stay in `base`/`ml`):
-```powershell
-.\.venv\Scripts\corr2surrogate.exe --help
-```
-If you prefer activating first:
-```powershell
-.\.venv\Scripts\Activate.ps1
-corr2surrogate --help
-```
-If execution policy blocks activation, use direct executable calls:
-```powershell
-.\.venv\Scripts\corr2surrogate.exe run-agent-session --agent analyst
-```
-If local chat turns fail due provider endpoint not reachable, start/check local runtime:
-```powershell
-corr2surrogate setup-local-llm
-```
-Session mode also performs a best-effort local-runtime recovery and retries once before returning an error.
-
 Run leak scan before commit/push:
 ```bash
 c2s-guard
-```
-
-Or via module:
-```bash
+# or
 python -m corr2surrogate.ui.cli scan-git-safety
 ```
 
-Enable automatic pre-commit leak checks:
+## Troubleshooting
+- If `corr2surrogate` is not recognized on Windows, use:
+```powershell
+& .\.venv\Scripts\corr2surrogate.exe --help
+```
+- If local provider is not reachable, run:
 ```bash
-git config core.hooksPath .githooks
-chmod +x .githooks/pre-commit
+corr2surrogate setup-local-llm
 ```
 
 ## License

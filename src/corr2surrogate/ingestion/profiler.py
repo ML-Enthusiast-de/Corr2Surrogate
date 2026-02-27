@@ -1,1 +1,1 @@
-﻿"""Data profiling placeholder."""
+﻿"""Dataset profiling utilities."""

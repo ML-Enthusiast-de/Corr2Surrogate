@@ -1,1 +1,1 @@
-﻿"""API entrypoint placeholder."""
+"""API entrypoint module."""

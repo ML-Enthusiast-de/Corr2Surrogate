@@ -1,1 +1,1 @@
-﻿"""Schema definitions placeholder."""
+﻿"""Schema definitions for Corr2Surrogate."""

@@ -1,1 +1,1 @@
-﻿"""Logging setup placeholder."""
+﻿"""Logging utilities for Corr2Surrogate."""

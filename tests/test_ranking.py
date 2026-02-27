@@ -35,3 +35,20 @@ def test_dependency_aware_ranking_marks_missing_physical_path_infeasible() -> No
         enforce_physical_dependency=True,
     )
     assert not ranked[0].feasible
+
+
+def test_dependency_aware_ranking_without_constraints_does_not_assume_virtual() -> None:
+    candidates = [
+        CandidateSignal(
+            target_signal="virtual_c",
+            base_score=0.8,
+            required_signals=["virtual_b"],
+        ),
+    ]
+    ranked = rank_surrogate_candidates(
+        candidates=candidates,
+        enforce_physical_dependency=True,
+    )
+    assert ranked[0].feasible
+    assert ranked[0].missing_physical_dependencies == []
+    assert "feasibility is unverified" in ranked[0].rationale.lower()

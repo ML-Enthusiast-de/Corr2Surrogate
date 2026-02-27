@@ -278,20 +278,24 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.command == "setup-local-llm":
-        result = setup_local_llm(
-            config_path=args.config,
-            provider=args.provider,
-            profile_name=args.profile,
-            model=args.model,
-            endpoint=args.endpoint,
-            install_provider=bool(args.install_provider),
-            start_runtime=not bool(args.no_start_runtime),
-            pull_model=not bool(args.no_pull_model),
-            download_model=not bool(args.no_download_model),
-            llama_model_path=args.llama_model_path,
-            llama_model_url=args.llama_model_url,
-            timeout_seconds=int(args.timeout_seconds),
-        )
+        try:
+            result = setup_local_llm(
+                config_path=args.config,
+                provider=args.provider,
+                profile_name=args.profile,
+                model=args.model,
+                endpoint=args.endpoint,
+                install_provider=bool(args.install_provider),
+                start_runtime=not bool(args.no_start_runtime),
+                pull_model=not bool(args.no_pull_model),
+                download_model=not bool(args.no_download_model),
+                llama_model_path=args.llama_model_path,
+                llama_model_url=args.llama_model_url,
+                timeout_seconds=int(args.timeout_seconds),
+            )
+        except Exception as exc:
+            print(json.dumps({"ready": False, "error": str(exc)}, indent=2))
+            return 1
         print(json.dumps(result, indent=2))
         return 0
 
@@ -408,6 +412,11 @@ def _run_agent_session(
         default_dataset_path = _resolve_default_public_dataset_path()
         print("agent> I can chat, inspect CSV/XLSX data, run Agent 1 analysis, and save reports.")
         print(
+            "agent> Runtime mode: local LLM by default. Optional API mode: set "
+            "C2S_PROVIDER=openai, C2S_API_CALLS_ALLOWED=true, "
+            "C2S_REQUIRE_LOCAL_MODELS=false, C2S_OFFLINE_MODE=false, C2S_API_KEY=<key>."
+        )
+        print(
             "agent> Useful commands: /help, /context, /reset, /exit. "
             "At target selection use: list, list <filter>, all, or comma-separated names."
         )
@@ -431,6 +440,8 @@ def _run_agent_session(
         print("agent> Useful commands: /help, /context, /reset, /exit.")
     session_messages: list[dict[str, str]] = []
     session_context = dict(base_context)
+    if agent == "analyst":
+        session_context.setdefault("workflow_stage", "awaiting_dataset_path")
     registry = build_default_registry()
     turns = 0
 
@@ -468,6 +479,16 @@ def _run_agent_session(
                     "`hypothesis corr target:pred1,pred2` or "
                     "`hypothesis feature target:signal->rate_change`."
                 )
+                print(
+                    "agent> Local runtime setup: "
+                    "`corr2surrogate setup-local-llm --provider llama_cpp --install-provider` "
+                    "(Windows) or `corr2surrogate setup-local-llm --provider llama_cpp` (macOS/Linux)."
+                )
+                print(
+                    "agent> API mode (optional): set C2S_PROVIDER=openai, "
+                    "C2S_API_CALLS_ALLOWED=true, C2S_REQUIRE_LOCAL_MODELS=false, "
+                    "C2S_OFFLINE_MODE=false, C2S_API_KEY=<key>, then restart or /reset."
+                )
                 if default_dataset_path is not None:
                     print(
                         "agent> Type `default` to analyze the built-in public test dataset."
@@ -482,6 +503,8 @@ def _run_agent_session(
             continue
         if command == "/reset":
             session_context = dict(base_context)
+            if agent == "analyst":
+                session_context["workflow_stage"] = "awaiting_dataset_path"
             session_messages = []
             print("Session state reset.")
             continue
@@ -496,6 +519,16 @@ def _run_agent_session(
                     config_path=config_path,
                 )
 
+            def _chat_reply_internal(detour_user_message: str) -> str:
+                return _llm_chat_detour(
+                    agent=agent,
+                    user_message=detour_user_message,
+                    session_context=session_context,
+                    session_messages=session_messages,
+                    config_path=config_path,
+                    record_in_history=False,
+                )
+
             def _chat_detour_with_reprompt(detour_user_message: str, reminder: str) -> None:
                 reply = _chat_reply_only(detour_user_message)
                 if reply:
@@ -507,6 +540,7 @@ def _run_agent_session(
                     user_message=user_message,
                     registry=registry,
                     chat_detour=_chat_detour_with_reprompt,
+                    chat_reply_only=_chat_reply_internal,
                 )
             except Exception as exc:
                 response = _runtime_error_fallback_message(
@@ -531,10 +565,18 @@ def _run_agent_session(
                 summary_event = autopilot["event"]
                 if summary_event.get("error"):
                     print(f"agent> {response}")
+                    session_context["workflow_stage"] = "awaiting_dataset_path"
                 session_messages.append({"role": "user", "content": user_message})
                 session_messages.append({"role": "assistant", "content": response})
                 session_messages = session_messages[-20:]
                 session_context["last_event"] = _compact_event_for_context(summary_event)
+                if not summary_event.get("error"):
+                    session_context["workflow_stage"] = "analysis_completed"
+                    tool_output = summary_event.get("tool_output")
+                    if isinstance(tool_output, dict):
+                        report_path = tool_output.get("report_path")
+                        if isinstance(report_path, str) and report_path.strip():
+                            session_context["last_report_path"] = report_path
                 turns += 1
                 if max_turns > 0 and turns >= max_turns:
                     print(f"Reached max turns ({max_turns}). Session ended.")
@@ -543,6 +585,10 @@ def _run_agent_session(
 
         turn_context = dict(session_context)
         turn_context["session_messages"] = list(session_messages)
+        turn_context["recent_user_prompts"] = _recent_user_prompts(
+            session_messages=session_messages,
+            limit=5,
+        )
         try:
             result = _invoke_agent_once_with_recovery(
                 agent=agent,
@@ -581,7 +627,15 @@ def _run_agent_session(
                 else None
             ),
         )
+        stage_reminder = _analyst_stage_reprompt_message(
+            agent=agent,
+            session_context=session_context,
+            user_message=user_message,
+        )
         print(f"agent> {response}")
+        if stage_reminder:
+            print(f"agent> {stage_reminder}")
+            response = f"{response}\n{stage_reminder}"
         if show_json:
             print(json.dumps(result, indent=2))
 
@@ -596,11 +650,34 @@ def _run_agent_session(
             return 0
 
 
+def _analyst_stage_reprompt_message(
+    *,
+    agent: str,
+    session_context: dict[str, Any],
+    user_message: str,
+) -> str:
+    if agent != "analyst":
+        return ""
+    stage = str(session_context.get("workflow_stage", "")).strip().lower()
+    if stage != "awaiting_dataset_path":
+        return ""
+    lowered = user_message.strip().lower()
+    if lowered == "default":
+        return ""
+    if _extract_first_data_path(user_message) is not None:
+        return ""
+    return (
+        "To continue, paste a CSV/XLSX path or type `default` "
+        "to run the built-in test dataset."
+    )
+
+
 def _run_analyst_autopilot_turn(
     *,
     user_message: str,
     registry: Any,
     chat_detour: Callable[[str, str], None] | None = None,
+    chat_reply_only: Callable[[str], str] | None = None,
 ) -> dict[str, Any] | None:
     detected: Path | None = None
     if user_message.strip().lower() == "default":
@@ -816,6 +893,27 @@ def _run_analyst_autopilot_turn(
     report_line = f"Report saved: {report_path}"
     print(f"agent> {summary}")
     print(f"agent> {report_line}")
+    top3_correlations = _extract_top3_correlations_global(analysis)
+    if chat_reply_only is not None:
+        prompt = _build_analysis_interpretation_prompt(analysis)
+        interpretation = chat_reply_only(prompt).strip()
+        if interpretation and not _looks_like_llm_failure_message(interpretation):
+            print("agent> LLM interpretation:")
+            for line in interpretation.splitlines():
+                text = line.strip()
+                if text:
+                    print(f"agent> {text}")
+            if top3_correlations and not _interpretation_mentions_top3(
+                interpretation=interpretation,
+                top3=top3_correlations,
+            ):
+                print(f"agent> {_format_top3_correlations_line(top3_correlations)}")
+        elif top3_correlations:
+            print(
+                "agent> LLM interpretation unavailable for this turn. "
+                "Showing deterministic correlation summary."
+            )
+            print(f"agent> {_format_top3_correlations_line(top3_correlations)}")
 
     response = f"{summary} {report_line}"
     event = {
@@ -829,6 +927,121 @@ def _run_analyst_autopilot_turn(
         },
     }
     return {"response": response, "event": event}
+
+
+def _build_analysis_interpretation_prompt(analysis: dict[str, Any]) -> str:
+    quality = analysis.get("quality") if isinstance(analysis.get("quality"), dict) else {}
+    ranking = analysis.get("ranking") if isinstance(analysis.get("ranking"), list) else []
+    correlations = analysis.get("correlations")
+    target_analyses = []
+    if isinstance(correlations, dict):
+        maybe_targets = correlations.get("target_analyses")
+        if isinstance(maybe_targets, list):
+            target_analyses = maybe_targets
+
+    top_ranked: list[dict[str, Any]] = []
+    for item in ranking[:3]:
+        if not isinstance(item, dict):
+            continue
+        top_ranked.append(
+            {
+                "target_signal": item.get("target_signal"),
+                "adjusted_score": item.get("adjusted_score"),
+                "feasible": item.get("feasible"),
+                "rationale": item.get("rationale"),
+            }
+        )
+
+    top_predictors = _extract_top3_correlations_global(analysis)
+
+    warnings = quality.get("warnings") if isinstance(quality, dict) else []
+    if not isinstance(warnings, list):
+        warnings = []
+
+    summary = {
+        "data_mode": analysis.get("data_mode"),
+        "target_count": analysis.get("target_count"),
+        "candidate_count": analysis.get("candidate_count"),
+        "quality": {
+            "rows": quality.get("rows"),
+            "columns": quality.get("columns"),
+            "completeness_score": quality.get("completeness_score"),
+            "warnings": [str(item) for item in warnings[:6]],
+        },
+        "top_ranked_signals": top_ranked,
+        "top_3_correlated_predictors": top_predictors,
+    }
+
+    return (
+        "Interpret these Agent 1 results for a lab engineer. "
+        "Give a concise scientific readout in 5-8 bullets: "
+        "overall assessment, strongest evidence, risks/uncertainties, and immediate next actions. "
+        "Mandatory: include one bullet that starts with `Top 3 correlated predictors:` and list "
+        "the predictor_signal, target_signal, best_method, and best_abs_score from "
+        "`top_3_correlated_predictors`. "
+        "Do not invent values.\n"
+        f"RESULTS_JSON={json.dumps(summary, ensure_ascii=False)}"
+    )
+
+
+def _extract_top3_correlations_global(analysis: dict[str, Any]) -> list[dict[str, Any]]:
+    correlations = analysis.get("correlations")
+    target_analyses: list[dict[str, Any]] = []
+    if isinstance(correlations, dict):
+        maybe_targets = correlations.get("target_analyses")
+        if isinstance(maybe_targets, list):
+            target_analyses = [row for row in maybe_targets if isinstance(row, dict)]
+
+    flattened: list[dict[str, Any]] = []
+    for target in target_analyses:
+        target_signal = str(target.get("target_signal", "")).strip()
+        predictor_rows = target.get("predictor_results")
+        if not isinstance(predictor_rows, list):
+            continue
+        for row in predictor_rows:
+            if not isinstance(row, dict):
+                continue
+            score = _float_value_or_none(row.get("best_abs_score"))
+            predictor_signal = str(row.get("predictor_signal", "")).strip()
+            best_method = str(row.get("best_method", "")).strip()
+            if not predictor_signal or score is None:
+                continue
+            flattened.append(
+                {
+                    "target_signal": target_signal,
+                    "predictor_signal": predictor_signal,
+                    "best_method": best_method or "n/a",
+                    "best_abs_score": float(score),
+                    "sample_count": row.get("sample_count"),
+                }
+            )
+
+    flattened.sort(
+        key=lambda item: float(item.get("best_abs_score", 0.0)),
+        reverse=True,
+    )
+    return flattened[:3]
+
+
+def _format_top3_correlations_line(top3: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for row in top3:
+        predictor = str(row.get("predictor_signal", "n/a"))
+        target = str(row.get("target_signal", "n/a"))
+        method = str(row.get("best_method", "n/a"))
+        score = _float_value_or_none(row.get("best_abs_score"))
+        score_text = f"{score:.3f}" if score is not None else "n/a"
+        parts.append(f"{predictor}->{target} ({method}, abs={score_text})")
+    return "Top 3 correlated predictors: " + "; ".join(parts)
+
+
+def _interpretation_mentions_top3(*, interpretation: str, top3: list[dict[str, Any]]) -> bool:
+    lowered = interpretation.lower()
+    return all(
+        str(row.get("predictor_signal", "")).strip().lower() in lowered
+        for row in top3
+        if str(row.get("predictor_signal", "")).strip()
+    )
 
 
 def _execute_registry_tool(registry: Any, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1550,6 +1763,14 @@ def _prompt_data_issue_handling(
             f"(examples: {preview})."
         )
         print(
+            "agent> Leakage note: if missing-value statistics are fit on full data before "
+            "train/validation/test split, evaluation can be optimistic."
+        )
+        print(
+            "agent> Split-safe rule for modeling: split first, fit missing-data handling on "
+            "train only, then apply the same transform to validation/test."
+        )
+        print(
             "agent> Choose missing-data handling: "
             "`keep`, `drop_rows`, `fill_median`, `fill_constant` [keep]."
         )
@@ -1569,6 +1790,20 @@ def _prompt_data_issue_handling(
                         chat_detour=chat_detour,
                     )
                     plan["fill_constant_value"] = float(value)
+                    print(
+                        "agent> Leakage note: fill_constant is usually low leakage risk only "
+                        "if the constant is fixed a priori."
+                    )
+                elif answer == "fill_median":
+                    print(
+                        "agent> Leakage warning: fill_median computed on full data is "
+                        "data leakage for downstream train/test evaluation."
+                    )
+                elif answer == "drop_rows":
+                    print(
+                        "agent> Caution: drop_rows avoids statistic leakage, but can still bias "
+                        "split distributions if done globally before splitting."
+                    )
                 break
             if _looks_like_small_talk(answer):
                 if chat_detour is not None:
@@ -1783,6 +2018,14 @@ def _safe_float_or_none(value: Any) -> float | None:
     return parsed
 
 
+def _float_value_or_none(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed
+
+
 def _print_signal_names(signals: list[str], *, query: str) -> None:
     q = query.strip().lower()
     if q:
@@ -1819,9 +2062,14 @@ def _llm_chat_detour(
     session_context: dict[str, Any],
     session_messages: list[dict[str, str]],
     config_path: str | None,
+    record_in_history: bool = True,
 ) -> str:
     turn_context = dict(session_context)
     turn_context["session_messages"] = list(session_messages)
+    turn_context["recent_user_prompts"] = _recent_user_prompts(
+        session_messages=session_messages,
+        limit=5,
+    )
     turn_context["chat_only"] = True
     try:
         result = _invoke_agent_once_with_recovery(
@@ -1834,10 +2082,11 @@ def _llm_chat_detour(
         response = str(event.get("message", "")).strip()
         if not response:
             response = "[empty response]"
-        session_messages.append({"role": "user", "content": user_message})
-        session_messages.append({"role": "assistant", "content": response})
-        session_messages[:] = session_messages[-20:]
-        session_context["last_event"] = _compact_event_for_context(event)
+        if record_in_history:
+            session_messages.append({"role": "user", "content": user_message})
+            session_messages.append({"role": "assistant", "content": response})
+            session_messages[:] = session_messages[-20:]
+            session_context["last_event"] = _compact_event_for_context(event)
         return response
     except Exception as exc:
         response = _runtime_error_fallback_message(
@@ -1845,12 +2094,13 @@ def _llm_chat_detour(
             user_message=user_message,
             error=exc,
         )
-        session_messages.append({"role": "user", "content": user_message})
-        session_messages.append({"role": "assistant", "content": response})
-        session_messages[:] = session_messages[-20:]
-        session_context["last_event"] = _compact_event_for_context(
-            {"status": "respond", "message": response, "error": "runtime_error"}
-        )
+        if record_in_history:
+            session_messages.append({"role": "user", "content": user_message})
+            session_messages.append({"role": "assistant", "content": response})
+            session_messages[:] = session_messages[-20:]
+            session_context["last_event"] = _compact_event_for_context(
+                {"status": "respond", "message": response, "error": "runtime_error"}
+            )
         return response
 
 
@@ -1952,6 +2202,16 @@ def _runtime_error_fallback_message(*, agent: str, user_message: str, error: Exc
     return "I hit an internal runtime error. Please retry."
 
 
+def _looks_like_llm_failure_message(message: str) -> bool:
+    lowered = message.lower()
+    return (
+        "local llm runtime is not reachable" in lowered
+        or ("provider connection error" in lowered and "http" in lowered)
+        or "i hit an internal runtime error in this step" in lowered
+        or "session is still active; you can retry" in lowered
+    )
+
+
 def _invoke_agent_once_with_recovery(
     *,
     agent: str,
@@ -2004,6 +2264,21 @@ def _is_provider_connection_error(error: Exception) -> bool:
         "failed to establish a new connection",
     )
     return any(marker in lowered for marker in markers)
+
+
+def _recent_user_prompts(*, session_messages: list[dict[str, str]], limit: int) -> list[str]:
+    collected: list[str] = []
+    for item in reversed(session_messages):
+        if str(item.get("role", "")).strip().lower() != "user":
+            continue
+        text = str(item.get("content", "")).strip()
+        if not text:
+            continue
+        collected.append(text)
+        if len(collected) >= max(1, int(limit)):
+            break
+    collected.reverse()
+    return collected
 
 
 def _looks_like_small_talk(text: str) -> bool:

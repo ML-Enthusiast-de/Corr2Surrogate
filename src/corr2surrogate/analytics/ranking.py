@@ -54,6 +54,10 @@ def rank_surrogate_candidates(
     without a stable physical anchor.
     """
     target_set = {c.target_signal for c in candidates}
+    physical_constraints_provided = (
+        physically_available_signals is not None
+        or non_virtualizable_signals is not None
+    )
     physical_set = set(physically_available_signals or [])
     non_virtualizable_set = set(non_virtualizable_signals or [])
     ranked: list[RankedSignal] = []
@@ -66,7 +70,7 @@ def rank_surrogate_candidates(
         )
         missing_physical = (
             sorted(set(required) - set(physical_dependencies))
-            if enforce_physical_dependency and required
+            if enforce_physical_dependency and required and physical_constraints_provided
             else []
         )
 
@@ -81,6 +85,15 @@ def rank_surrogate_candidates(
             reasons.append(
                 "Depends on signals also selected for virtualization: "
                 + ", ".join(blocked_virtual)
+            )
+        if (
+            enforce_physical_dependency
+            and required
+            and not physical_constraints_provided
+        ):
+            reasons.append(
+                "Physical dependency constraints were not provided; "
+                "feasibility is unverified."
             )
         if missing_physical:
             feasible = False

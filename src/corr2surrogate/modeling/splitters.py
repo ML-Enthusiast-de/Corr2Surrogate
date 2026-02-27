@@ -1,1 +1,1 @@
-﻿"""Data splitting strategies placeholder."""
+﻿"""Data splitting strategies for modeling workflows."""

@@ -440,8 +440,17 @@ def _tool_run_agent1_analysis(
             max_lag=max_lag,
         )
         chosen = _critic_choose_strategy(planner_trace)
-        critic_decision = chosen
-        selected_plan = _candidate_plan_by_id(candidate_plans, chosen.get("selected_candidate_id")) or user_plan
+        planner_recommended_id = str(chosen.get("selected_candidate_id", "user_plan"))
+        selected_plan = dict(user_plan)
+        critic_decision = {
+            "selected_candidate_id": "user_plan",
+            "planner_recommended_candidate_id": planner_recommended_id,
+            "rationale": (
+                "User-configured preprocessing is locked and always applied. "
+                f"Planner recommendation `{planner_recommended_id}` was advisory only."
+            ),
+            "margin": chosen.get("margin"),
+        }
     else:
         selected_plan = user_plan
         planner_trace = []
@@ -979,6 +988,9 @@ def _apply_preprocessing_plan(
             "fill_constant_value": fill_constant_value,
             "applied": False,
             "rows_after": initial_rows,
+            "split_leakage_risk": "none",
+            "split_leakage_note": "",
+            "recommended_split_safe_policy": "",
         },
         "row_coverage_plan": {
             "strategy": row_coverage_strategy,
@@ -1035,6 +1047,12 @@ def _apply_preprocessing_plan(
         metadata["missing_data_plan"]["strategy"] = "fill_constant"
         metadata["missing_data_plan"]["fill_constant_value"] = fill_value
     metadata["missing_data_plan"]["rows_after"] = int(len(prepared))
+    metadata["missing_data_plan"].update(
+        _missing_data_split_leakage_info(
+            strategy=str(metadata["missing_data_plan"].get("strategy", "keep")),
+            fill_constant_value=metadata["missing_data_plan"].get("fill_constant_value"),
+        )
+    )
 
     coverage_strategy = row_coverage_strategy.strip().lower()
     if coverage_strategy in {"drop_sparse_rows", "drop_sparse"}:
@@ -1069,6 +1087,54 @@ def _apply_preprocessing_plan(
         )
     metadata["final_rows"] = int(len(prepared))
     return prepared, metadata
+
+
+def _missing_data_split_leakage_info(
+    *,
+    strategy: str,
+    fill_constant_value: Any,
+) -> dict[str, str]:
+    normalized = strategy.strip().lower()
+    split_policy = (
+        "For model training/evaluation: split first, fit missing-data handling on train only, "
+        "then apply unchanged transform to validation/test."
+    )
+    if normalized in {"fill_median", "median"}:
+        return {
+            "split_leakage_risk": "high",
+            "split_leakage_note": (
+                "fill_median estimates statistics from the full analyzed dataset in Agent 1. "
+                "Reusing this preprocessing before train/validation/test split leaks "
+                "validation/test distribution information."
+            ),
+            "recommended_split_safe_policy": split_policy,
+        }
+    if normalized in {"fill_constant", "constant"}:
+        return {
+            "split_leakage_risk": "low",
+            "split_leakage_note": (
+                "fill_constant is leakage-safe only when the constant is fixed a priori "
+                f"(configured value: {fill_constant_value}). "
+                "If the value is tuned using full data, it still introduces leakage."
+            ),
+            "recommended_split_safe_policy": split_policy,
+        }
+    if normalized == "drop_rows":
+        return {
+            "split_leakage_risk": "low",
+            "split_leakage_note": (
+                "drop_rows does not use global statistics, but dropping on the full dataset can "
+                "still bias split distributions. Apply row-dropping consistently per split."
+            ),
+            "recommended_split_safe_policy": split_policy,
+        }
+    return {
+        "split_leakage_risk": "none",
+        "split_leakage_note": (
+            "No imputation statistics are learned in this step (`keep`)."
+        ),
+        "recommended_split_safe_policy": split_policy,
+    }
 
 
 def _planner_generate_strategy_candidates(

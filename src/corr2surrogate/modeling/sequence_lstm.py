@@ -1,1 +1,1 @@
-﻿"""LSTM model placeholder."""
+﻿"""Sequence LSTM model components."""

@@ -1,7 +1,13 @@
-from dataclasses import dataclass
+﻿from dataclasses import dataclass
 from pathlib import Path
 
-from corr2surrogate.ui.cli import main
+from corr2surrogate.ui.cli import (
+    _build_analysis_interpretation_prompt,
+    _extract_top3_correlations_global,
+    _format_top3_correlations_line,
+    _interpretation_mentions_top3,
+    main,
+)
 
 
 @dataclass
@@ -31,6 +37,10 @@ class _SessionRegistry:
         if outputs:
             return _DummyResult(output=outputs.pop(0))
         return _DummyResult(output={"status": "ok"})
+
+
+def _stub_llm_interpretation(**_kwargs):
+    return {"event": {"message": "LLM interpretation summary."}}
 
 
 def test_cli_run_agent1_analysis_omits_none_fields(monkeypatch) -> None:
@@ -75,6 +85,24 @@ def test_cli_setup_local_llm_invokes_setup(monkeypatch) -> None:
     assert captured["provider"] == "llama_cpp"
     assert captured["download_model"] is False
     assert captured["start_runtime"] is False
+
+
+def test_cli_setup_local_llm_handles_runtime_error(monkeypatch, capsys) -> None:
+    def fake_setup_local_llm(**_kwargs):
+        raise RuntimeError("policy-blocked")
+
+    monkeypatch.setattr("corr2surrogate.ui.cli.setup_local_llm", fake_setup_local_llm)
+    exit_code = main(
+        [
+            "setup-local-llm",
+            "--provider",
+            "openai",
+        ]
+    )
+    assert exit_code == 1
+    output = capsys.readouterr().out
+    assert "\"ready\": false" in output.lower()
+    assert "policy-blocked" in output
 
 
 def test_cli_run_agent_session_basic_flow(monkeypatch) -> None:
@@ -155,9 +183,43 @@ def test_cli_run_agent_session_persists_messages_between_turns(monkeypatch) -> N
     assert second_context_messages[1]["role"] == "assistant"
 
 
-def test_cli_run_agent_session_analyst_autopilot_runs_analysis(monkeypatch, tmp_path: Path) -> None:
+def test_cli_run_agent_session_context_includes_last_five_user_prompts(monkeypatch) -> None:
+    calls = []
+    inputs = iter(
+        [
+            "q1",
+            "q2",
+            "q3",
+            "q4",
+            "q5",
+            "q6",
+            "/exit",
+        ]
+    )
+
+    def fake_run_local_agent_once(*, agent, user_message, context, config_path):
+        calls.append(
+            {
+                "user_message": user_message,
+                "context": context,
+            }
+        )
+        return {"event": {"message": f"reply to {user_message}"}}
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", fake_run_local_agent_once)
+    exit_code = main(["run-agent-session", "--agent", "analyst"])
+    assert exit_code == 0
+    assert len(calls) == 6
+    sixth_context = calls[5]["context"]
+    assert sixth_context["recent_user_prompts"] == ["q1", "q2", "q3", "q4", "q5"]
+
+
+def test_cli_run_agent_session_analyst_autopilot_runs_analysis(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
     data_path = tmp_path / "demo_data.xlsx"
-    data_path.write_text("placeholder", encoding="utf-8")
+    data_path.write_text("testdata", encoding="utf-8")
     inputs = iter([f"Analyze {data_path}", "/exit"])
     registry = _SessionRegistry(
         scripted_outputs={
@@ -181,6 +243,33 @@ def test_cli_run_agent_session_analyst_autopilot_runs_analysis(monkeypatch, tmp_
                     "target_count": 8,
                     "candidate_count": 4,
                     "report_path": "reports/demo_data/agent1_20260225_120000.md",
+                    "correlations": {
+                        "target_analyses": [
+                            {
+                                "target_signal": "t1",
+                                "predictor_results": [
+                                    {
+                                        "predictor_signal": "p1",
+                                        "best_method": "pearson",
+                                        "best_abs_score": 0.98,
+                                        "sample_count": 100,
+                                    },
+                                    {
+                                        "predictor_signal": "p2",
+                                        "best_method": "spearman",
+                                        "best_abs_score": 0.95,
+                                        "sample_count": 100,
+                                    },
+                                    {
+                                        "predictor_signal": "p3",
+                                        "best_method": "distance_corr",
+                                        "best_abs_score": 0.90,
+                                        "sample_count": 100,
+                                    },
+                                ],
+                            }
+                        ]
+                    },
                 }
             ],
         }
@@ -188,21 +277,22 @@ def test_cli_run_agent_session_analyst_autopilot_runs_analysis(monkeypatch, tmp_
 
     monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
     monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
-    monkeypatch.setattr(
-        "corr2surrogate.ui.cli.run_local_agent_once",
-        lambda **_: (_ for _ in ()).throw(AssertionError("LLM path should not run for autopilot")),
-    )
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
 
     exit_code = main(["run-agent-session", "--agent", "analyst"])
     assert exit_code == 0
     assert registry.calls[0][0] == "prepare_ingestion_step"
     assert registry.calls[1][0] == "run_agent1_analysis"
     assert Path(registry.calls[1][1]["data_path"]).resolve() == data_path.resolve()
+    output = capsys.readouterr().out
+    assert "LLM interpretation:" in output
+    assert "LLM interpretation summary." in output
+    assert "Top 3 correlated predictors:" in output
 
 
 def test_cli_run_agent_session_analyst_autopilot_multi_sheet(monkeypatch, tmp_path: Path) -> None:
     data_path = tmp_path / "multi_sheet.xlsx"
-    data_path.write_text("placeholder", encoding="utf-8")
+    data_path.write_text("testdata", encoding="utf-8")
     inputs = iter([f"Analyze {data_path}", "2", "/exit"])
     registry = _SessionRegistry(
         scripted_outputs={
@@ -243,6 +333,7 @@ def test_cli_run_agent_session_analyst_autopilot_multi_sheet(monkeypatch, tmp_pa
     )
     monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
     monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
 
     exit_code = main(["run-agent-session", "--agent", "analyst"])
     assert exit_code == 0
@@ -252,11 +343,122 @@ def test_cli_run_agent_session_analyst_autopilot_multi_sheet(monkeypatch, tmp_pa
     assert registry.calls[2][1]["sheet_name"] == "S2"
 
 
+def test_cli_run_agent_session_autopilot_interpretation_runtime_error_is_suppressed(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    data_path = tmp_path / "demo_data_runtime.xlsx"
+    data_path.write_text("testdata", encoding="utf-8")
+    inputs = iter([f"Analyze {data_path}", "/exit"])
+    registry = _SessionRegistry(
+        scripted_outputs={
+            "prepare_ingestion_step": [
+                {
+                    "status": "ok",
+                    "message": "Ingestion ready.",
+                    "options": [],
+                    "selected_sheet": "Sheet1",
+                    "available_sheets": ["Sheet1"],
+                    "header_row": 0,
+                    "data_start_row": 1,
+                    "header_confidence": 0.98,
+                    "needs_user_confirmation": False,
+                }
+            ],
+            "run_agent1_analysis": [
+                {
+                    "status": "ok",
+                    "data_mode": "time_series",
+                    "target_count": 1,
+                    "candidate_count": 1,
+                    "report_path": "reports/demo_data_runtime/agent1_20260225_120000.md",
+                    "correlations": {
+                        "target_analyses": [
+                            {
+                                "target_signal": "t1",
+                                "predictor_results": [
+                                    {
+                                        "predictor_signal": "p1",
+                                        "best_method": "pearson",
+                                        "best_abs_score": 0.98,
+                                        "sample_count": 100,
+                                    },
+                                    {
+                                        "predictor_signal": "p2",
+                                        "best_method": "spearman",
+                                        "best_abs_score": 0.95,
+                                        "sample_count": 100,
+                                    },
+                                    {
+                                        "predictor_signal": "p3",
+                                        "best_method": "distance_corr",
+                                        "best_abs_score": 0.90,
+                                        "sample_count": 100,
+                                    },
+                                ],
+                            }
+                        ]
+                    },
+                }
+            ],
+        }
+    )
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr(
+        "corr2surrogate.ui.cli.run_local_agent_once",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    exit_code = main(["run-agent-session", "--agent", "analyst"])
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "LLM interpretation unavailable for this turn." in output
+    assert "Top 3 correlated predictors:" in output
+    assert "I hit an internal runtime error in this step." not in output
+
+
+def test_analysis_interpretation_prompt_contains_global_top3_correlations() -> None:
+    analysis = {
+        "data_mode": "time_series",
+        "target_count": 1,
+        "candidate_count": 1,
+        "quality": {"rows": 100, "columns": 4, "completeness_score": 1.0, "warnings": []},
+        "ranking": [],
+        "correlations": {
+            "target_analyses": [
+                {
+                    "target_signal": "target",
+                    "predictor_results": [
+                        {"predictor_signal": "sig_a", "best_method": "pearson", "best_abs_score": 0.91},
+                        {"predictor_signal": "sig_b", "best_method": "spearman", "best_abs_score": 0.88},
+                        {"predictor_signal": "sig_c", "best_method": "distance_corr", "best_abs_score": 0.85},
+                    ],
+                }
+            ]
+        },
+    }
+    top3 = _extract_top3_correlations_global(analysis)
+    assert [item["predictor_signal"] for item in top3] == ["sig_a", "sig_b", "sig_c"]
+    prompt = _build_analysis_interpretation_prompt(analysis)
+    assert "top_3_correlated_predictors" in prompt
+    assert "Top 3 correlated predictors:" in prompt
+    assert "sig_a" in prompt
+    assert "sig_b" in prompt
+    assert "sig_c" in prompt
+    line = _format_top3_correlations_line(top3)
+    assert "sig_a->target" in line
+    assert _interpretation_mentions_top3(
+        interpretation="Top 3 correlated predictors: sig_a, sig_b, sig_c",
+        top3=top3,
+    )
+
+
 def test_cli_run_agent_session_analyst_autopilot_multi_sheet_handles_small_talk(
     monkeypatch, capsys, tmp_path: Path
 ) -> None:
     data_path = tmp_path / "multi_sheet_chat.xlsx"
-    data_path.write_text("placeholder", encoding="utf-8")
+    data_path.write_text("testdata", encoding="utf-8")
     inputs = iter([f"Analyze {data_path}", "how are you?", "2", "/exit"])
     registry = _SessionRegistry(
         scripted_outputs={
@@ -313,7 +515,7 @@ def test_cli_run_agent_session_analyst_autopilot_multi_sheet_handles_small_talk(
 
 def test_cli_run_agent_session_analyst_autopilot_header_override(monkeypatch, tmp_path: Path) -> None:
     data_path = tmp_path / "low_conf.xlsx"
-    data_path.write_text("placeholder", encoding="utf-8")
+    data_path.write_text("testdata", encoding="utf-8")
     inputs = iter([f"Analyze {data_path}", "n", "3,4", "/exit"])
     registry = _SessionRegistry(
         scripted_outputs={
@@ -354,6 +556,7 @@ def test_cli_run_agent_session_analyst_autopilot_header_override(monkeypatch, tm
     )
     monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
     monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
 
     exit_code = main(["run-agent-session", "--agent", "analyst"])
     assert exit_code == 0
@@ -369,7 +572,7 @@ def test_cli_run_agent_session_analyst_autopilot_header_confirmation_handles_sma
     monkeypatch, capsys, tmp_path: Path
 ) -> None:
     data_path = tmp_path / "header_chat.xlsx"
-    data_path.write_text("placeholder", encoding="utf-8")
+    data_path.write_text("testdata", encoding="utf-8")
     inputs = iter([f"Analyze {data_path}", "hi", "Y", "/exit"])
     registry = _SessionRegistry(
         scripted_outputs={
@@ -429,7 +632,7 @@ def test_cli_run_agent_session_analyst_autopilot_header_override_handles_small_t
     monkeypatch, capsys, tmp_path: Path
 ) -> None:
     data_path = tmp_path / "header_override_chat.xlsx"
-    data_path.write_text("placeholder", encoding="utf-8")
+    data_path.write_text("testdata", encoding="utf-8")
     inputs = iter([f"Analyze {data_path}", "n", "how are you?", "3,4", "/exit"])
     registry = _SessionRegistry(
         scripted_outputs={
@@ -489,7 +692,7 @@ def test_cli_run_agent_session_analyst_target_prompt_accepts_list_command(
     monkeypatch, tmp_path: Path
 ) -> None:
     data_path = tmp_path / "wide.xlsx"
-    data_path.write_text("placeholder", encoding="utf-8")
+    data_path.write_text("testdata", encoding="utf-8")
     numeric_signals = [f"sig_{idx}" for idx in range(1, 46)]
     inputs = iter([f"Analyze {data_path}", "list the signal names", "sig_20", "/exit"])
     registry = _SessionRegistry(
@@ -525,6 +728,7 @@ def test_cli_run_agent_session_analyst_target_prompt_accepts_list_command(
 
     monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
     monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
 
     exit_code = main(["run-agent-session", "--agent", "analyst"])
     assert exit_code == 0
@@ -536,7 +740,7 @@ def test_cli_run_agent_session_analyst_target_prompt_accepts_hypothesis_command(
     monkeypatch, tmp_path: Path
 ) -> None:
     data_path = tmp_path / "wide_hypothesis.xlsx"
-    data_path.write_text("placeholder", encoding="utf-8")
+    data_path.write_text("testdata", encoding="utf-8")
     numeric_signals = [f"sig_{idx}" for idx in range(1, 46)]
     inputs = iter(
         [
@@ -579,6 +783,7 @@ def test_cli_run_agent_session_analyst_target_prompt_accepts_hypothesis_command(
 
     monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
     monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
 
     exit_code = main(["run-agent-session", "--agent", "analyst"])
     assert exit_code == 0
@@ -593,7 +798,7 @@ def test_cli_run_agent_session_analyst_target_prompt_handles_small_talk(
     monkeypatch, capsys, tmp_path: Path
 ) -> None:
     data_path = tmp_path / "wide_chat.xlsx"
-    data_path.write_text("placeholder", encoding="utf-8")
+    data_path.write_text("testdata", encoding="utf-8")
     numeric_signals = [f"sig_{idx}" for idx in range(1, 46)]
     inputs = iter([f"Analyze {data_path}", "how are you?", "sig_2", "/exit"])
     registry = _SessionRegistry(
@@ -735,6 +940,30 @@ def test_cli_run_agent_session_how_are_you_uses_llm(monkeypatch, capsys) -> None
     assert "LLM says I am fine." in output
 
 
+def test_cli_run_agent_session_awaiting_dataset_stage_reprompts_after_chat(
+    monkeypatch, capsys
+) -> None:
+    inputs = iter(["how are you", "do you want a path?", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+
+    def fake_run_local_agent_once(*, agent, user_message, context, config_path):
+        if user_message.lower().startswith("how are you"):
+            return {"event": {"message": "Hello! How can I assist you today?"}}
+        return {
+            "event": {
+                "message": "Could you clarify what you mean by path?"
+            }
+        }
+
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", fake_run_local_agent_once)
+    exit_code = main(["run-agent-session", "--agent", "analyst"])
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Hello! How can I assist you today?" in output
+    assert "Could you clarify what you mean by path?" in output
+    assert "To continue, paste a CSV/XLSX path or type `default`" in output
+
+
 def test_cli_run_agent_session_provider_connection_error_is_friendly(monkeypatch, capsys) -> None:
     inputs = iter(["what happened", "/exit"])
     monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
@@ -783,7 +1012,7 @@ def test_cli_run_agent_session_analyst_autopilot_drops_none_optional_args(
     monkeypatch, tmp_path: Path
 ) -> None:
     data_path = tmp_path / "autopilot_drop_none.csv"
-    data_path.write_text("placeholder", encoding="utf-8")
+    data_path.write_text("testdata", encoding="utf-8")
     signals = ["time"] + [f"S{i}" for i in range(1, 72)]
     inputs = iter([f"Analyze {data_path}", "y", "66", "n", "/exit"])
     registry = _SessionRegistry(
@@ -828,6 +1057,7 @@ def test_cli_run_agent_session_analyst_autopilot_drops_none_optional_args(
 
     monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
     monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
     exit_code = main(["run-agent-session", "--agent", "analyst"])
     assert exit_code == 0
     assert registry.calls[1][0] == "run_agent1_analysis"
@@ -842,7 +1072,7 @@ def test_cli_run_agent_session_analyst_autopilot_drops_none_optional_args(
 
 def test_cli_run_agent_session_analyst_lag_prompt_sets_max_lag(monkeypatch, tmp_path: Path) -> None:
     data_path = tmp_path / "lag_flow.xlsx"
-    data_path.write_text("placeholder", encoding="utf-8")
+    data_path.write_text("testdata", encoding="utf-8")
     inputs = iter([f"Analyze {data_path}", "y", "samples", "12", "/exit"])
     registry = _SessionRegistry(
         scripted_outputs={
@@ -879,6 +1109,7 @@ def test_cli_run_agent_session_analyst_lag_prompt_sets_max_lag(monkeypatch, tmp_
 
     monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
     monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
     exit_code = main(["run-agent-session", "--agent", "analyst"])
     assert exit_code == 0
     assert registry.calls[1][0] == "run_agent1_analysis"
@@ -887,10 +1118,10 @@ def test_cli_run_agent_session_analyst_lag_prompt_sets_max_lag(monkeypatch, tmp_
 
 
 def test_cli_run_agent_session_analyst_prompts_missing_and_length_handling(
-    monkeypatch, tmp_path: Path
+    monkeypatch, capsys, tmp_path: Path
 ) -> None:
     data_path = tmp_path / "nan_len_flow.xlsx"
-    data_path.write_text("placeholder", encoding="utf-8")
+    data_path.write_text("testdata", encoding="utf-8")
     inputs = iter([f"Analyze {data_path}", "fill_median", "trim_dense_window", "0.85", "/exit"])
     registry = _SessionRegistry(
         scripted_outputs={
@@ -932,6 +1163,7 @@ def test_cli_run_agent_session_analyst_prompts_missing_and_length_handling(
 
     monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
     monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
     exit_code = main(["run-agent-session", "--agent", "analyst"])
     assert exit_code == 0
     assert registry.calls[1][0] == "run_agent1_analysis"
@@ -939,6 +1171,9 @@ def test_cli_run_agent_session_analyst_prompts_missing_and_length_handling(
     assert args["missing_data_strategy"] == "fill_median"
     assert args["row_coverage_strategy"] == "trim_dense_window"
     assert float(args["sparse_row_min_fraction"]) == 0.85
+    output = capsys.readouterr().out
+    assert "Leakage note" in output
+    assert "split first" in output.lower()
 
 
 def test_cli_run_agent_session_analyst_default_dataset_runs_autopilot(
@@ -984,6 +1219,7 @@ def test_cli_run_agent_session_analyst_default_dataset_runs_autopilot(
         "corr2surrogate.ui.cli._resolve_default_public_dataset_path",
         lambda: default_path,
     )
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
     exit_code = main(["run-agent-session", "--agent", "analyst"])
     assert exit_code == 0
     assert registry.calls[0][0] == "prepare_ingestion_step"
@@ -1022,7 +1258,7 @@ def test_cli_run_agent_session_prints_header_preview_on_confirmation(
     monkeypatch, capsys, tmp_path: Path
 ) -> None:
     data_path = tmp_path / "header_preview.xlsx"
-    data_path.write_text("placeholder", encoding="utf-8")
+    data_path.write_text("testdata", encoding="utf-8")
     inputs = iter([f"Analyze {data_path}", "Y", "/exit"])
     registry = _SessionRegistry(
         scripted_outputs={
@@ -1074,6 +1310,7 @@ def test_cli_run_agent_session_prints_header_preview_on_confirmation(
 
     monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
     monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
     exit_code = main(["run-agent-session", "--agent", "analyst"])
     assert exit_code == 0
     output = capsys.readouterr().out

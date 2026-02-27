@@ -1,1 +1,1 @@
-﻿"""Uncertainty estimation placeholder."""
+﻿"""Uncertainty estimation utilities."""

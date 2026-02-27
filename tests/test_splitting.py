@@ -1,1 +1,1 @@
-﻿"""Splitting tests placeholder."""
+﻿"""Tests for data-splitting behavior."""

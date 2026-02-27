@@ -53,11 +53,11 @@ def run_quality_checks(
     constant_columns = [
         col
         for col in numeric_columns
-        if pd.to_numeric(frame[col], errors="coerce").nunique(dropna=True) <= 1
+        if _coerce_numeric_like(frame[col]).nunique(dropna=True) <= 1
     ]
     outlier_counts = {
         col: _count_outliers(
-            pd.to_numeric(frame[col], errors="coerce"),
+            _coerce_numeric_like(frame[col]),
             z_threshold=outlier_z_threshold,
         )
         for col in numeric_columns
@@ -76,7 +76,7 @@ def run_quality_checks(
 
     if ts_col is not None:
         ts_series = frame[ts_col]
-        numeric_ts = pd.to_numeric(ts_series, errors="coerce")
+        numeric_ts = _coerce_numeric_like(ts_series)
         numeric_ratio = float(numeric_ts.notna().mean()) if len(ts_series) > 0 else 0.0
         if numeric_ratio >= 0.95:
             valid_ts = numeric_ts.dropna()
@@ -166,10 +166,26 @@ def _numeric_columns(frame: pd.DataFrame, *, exclude: set[str]) -> list[str]:
     for col in frame.columns:
         if col in exclude:
             continue
-        numeric = pd.to_numeric(frame[col], errors="coerce")
+        numeric = _coerce_numeric_like(frame[col])
         if numeric.notna().sum() >= 3:
             cols.append(col)
     return cols
+
+
+def _coerce_numeric_like(series: pd.Series) -> pd.Series:
+    direct = pd.to_numeric(series, errors="coerce")
+    if len(series) == 0:
+        return direct
+    direct_ratio = float(direct.notna().mean())
+    if direct_ratio >= 0.95:
+        return direct
+
+    text = series.astype("string")
+    normalized = text.str.replace(" ", "", regex=False).str.replace(",", ".", regex=False)
+    comma_decimal = pd.to_numeric(normalized, errors="coerce")
+    if float(comma_decimal.notna().mean()) > direct_ratio:
+        return comma_decimal
+    return direct
 
 
 def _resolve_timestamp_column(frame: pd.DataFrame, *, explicit: str | None) -> str | None:

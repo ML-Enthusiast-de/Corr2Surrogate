@@ -226,8 +226,8 @@ def _build_markdown(structured: dict[str, Any]) -> str:
         f"- Columns: {quality['columns']}",
         f"- Completeness score: {quality['completeness_score']:.3f}",
         f"- Duplicate rows: {quality['duplicate_rows']}",
-        f"- Extreme outlier columns: {', '.join(quality['extreme_outlier_columns']) or 'none'}",
     ])
+    lines.extend(_render_outlier_section(quality))
     if quality["warnings"]:
         lines.append("- Warnings:")
         for warning in quality["warnings"]:
@@ -363,7 +363,7 @@ def _build_markdown(structured: dict[str, Any]) -> str:
             lines.append("")
     lines.extend(["", "## Sensor Diagnostics"])
     lines.extend(_render_sensor_diagnostics(sensor_diagnostics))
-    lines.extend(["", "## Experiment Recommendations"])
+    lines.extend(["", "## Experiment Recommendations (Pre-Model, Agent 1)"])
     lines.extend(_render_experiment_recommendations(recommendations))
     lines.extend(["", "## Dependency-Aware Ranking"])
     for item in ranking:
@@ -394,7 +394,7 @@ def _render_preprocessing_section(preprocessing: dict[str, Any]) -> list[str]:
     sample_plan = preprocessing.get("sample_plan") or {}
     missing_plan = preprocessing.get("missing_data_plan") or {}
     coverage_plan = preprocessing.get("row_coverage_plan") or {}
-    return [
+    lines = [
         f"- Initial rows: {preprocessing.get('initial_rows', 'n/a')}",
         f"- Final rows analyzed: {preprocessing.get('final_rows', 'n/a')}",
         "- Sample plan: "
@@ -414,6 +414,59 @@ def _render_preprocessing_section(preprocessing: dict[str, Any]) -> list[str]:
         f"range=[{coverage_plan.get('row_range_start')}, {coverage_plan.get('row_range_end')}], "
         f"rows_after={coverage_plan.get('rows_after')}",
     ]
+    leakage_risk = str(missing_plan.get("split_leakage_risk", "none"))
+    leakage_note = str(missing_plan.get("split_leakage_note", "")).strip()
+    split_policy = str(missing_plan.get("recommended_split_safe_policy", "")).strip()
+    lines.append(f"- Split leakage risk (missing-data plan): `{leakage_risk}`.")
+    if leakage_note:
+        lines.append(f"- Split leakage note: {leakage_note}")
+    if split_policy:
+        lines.append(f"- Split-safe policy: {split_policy}")
+    return lines
+
+
+def _render_outlier_section(quality: dict[str, Any]) -> list[str]:
+    rows = int(quality.get("rows", 0) or 0)
+    threshold = max(5, int(0.02 * rows))
+    outlier_counts_raw = quality.get("outlier_count_by_column") or {}
+    outlier_counts: dict[str, int] = {}
+    if isinstance(outlier_counts_raw, dict):
+        for key, value in outlier_counts_raw.items():
+            try:
+                outlier_counts[str(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+
+    extreme = [str(col) for col in quality.get("extreme_outlier_columns", [])]
+    lines = [
+        "- Outlier detection method: robust-z (|z|>4.0) OR Tukey-IQR fence "
+        "(outside [Q1-1.5*IQR, Q3+1.5*IQR]).",
+        f"- Extreme outlier rule: outlier_count > max(5, 2% of rows) = {threshold}.",
+    ]
+    if not extreme:
+        lines.append("- Extreme outlier columns: none.")
+        return lines
+
+    lines.append(
+        f"- Extreme outlier columns: {', '.join(extreme)}."
+    )
+    lines.append("")
+    lines.extend(
+        [
+            "| Column | Outlier Count | Fraction of Rows |",
+            "|---|---:|---:|",
+        ]
+    )
+    ranked = sorted(
+        ((col, outlier_counts.get(col, 0)) for col in extreme),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    denom = max(rows, 1)
+    for col, count in ranked:
+        frac = count / denom
+        lines.append(f"| `{col}` | {count} | {frac:.3%} |")
+    return lines
 
 
 def _render_agentic_section(
@@ -515,8 +568,15 @@ def _render_sensor_diagnostics(payload: dict[str, Any]) -> list[str]:
 
 def _render_experiment_recommendations(recommendations: list[dict[str, Any]]) -> list[str]:
     if not recommendations:
-        return ["- No additional recommendations generated."]
-    lines: list[str] = []
+        return [
+            "- These are pre-model data-collection suggestions from Agent 1 "
+            "(correlation/stability/diagnostic driven, not post-training error analysis).",
+            "- No additional recommendations generated.",
+        ]
+    lines: list[str] = [
+        "- These are pre-model data-collection suggestions from Agent 1 "
+        "(correlation/stability/diagnostic driven, not post-training error analysis)."
+    ]
     for idx, row in enumerate(recommendations[:10], start=1):
         lines.append(
             f"{idx}. target=`{row.get('target_signal')}` "

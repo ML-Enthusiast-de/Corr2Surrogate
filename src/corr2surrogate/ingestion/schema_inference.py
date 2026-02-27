@@ -1,1 +1,1 @@
-﻿"""Schema inference placeholder."""
+﻿"""Schema inference helpers for tabular data."""

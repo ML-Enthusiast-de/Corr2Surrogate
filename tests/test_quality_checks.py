@@ -38,3 +38,18 @@ def test_run_quality_checks_numeric_time_column_has_no_false_duplicate_timestamp
     assert payload["invalid_timestamps"] == 0
     assert payload["monotonic_timestamp"] is True
     assert not any("duplicate timestamps" in item for item in payload["warnings"])
+
+
+def test_run_quality_checks_comma_decimal_time_column_has_no_false_duplicates() -> None:
+    frame = pd.DataFrame(
+        {
+            "time": ["0,0", "0,000127", "0,000254", "0,000382", "0,000509"],
+            "sensor_a": [1.0, 2.0, 3.0, 4.0, 5.0],
+        }
+    )
+    result = run_quality_checks(frame, timestamp_column="time")
+    payload = result.to_dict()
+    assert payload["duplicate_timestamps"] == 0
+    assert payload["invalid_timestamps"] == 0
+    assert payload["monotonic_timestamp"] is True
+    assert not any("duplicate timestamps" in item for item in payload["warnings"])
