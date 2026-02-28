@@ -26,6 +26,7 @@ def build_agent1_report_payload(
     forced_requests: list[dict[str, Any]] | None = None,
     preprocessing: dict[str, Any] | None = None,
     sensor_diagnostics: dict[str, Any] | None = None,
+    model_strategy_recommendations: dict[str, Any] | None = None,
     experiment_recommendations: list[dict[str, Any]] | None = None,
     planner_trace: list[dict[str, Any]] | None = None,
     critic_decision: dict[str, Any] | None = None,
@@ -48,6 +49,7 @@ def build_agent1_report_payload(
         "forced_requests": forced_requests or [],
         "preprocessing": preprocessing or {},
         "sensor_diagnostics": sensor_diagnostics or {},
+        "model_strategy_recommendations": model_strategy_recommendations or {},
         "experiment_recommendations": experiment_recommendations or [],
         "planner_trace": planner_trace or [],
         "critic_decision": critic_decision or {},
@@ -102,6 +104,8 @@ def save_agent1_artifacts(
     feature_rows: list[dict[str, Any]] = []
     hypothesis_pair_rows: list[dict[str, Any]] = []
     hypothesis_feature_rows: list[dict[str, Any]] = []
+    model_strategy_rows: list[dict[str, Any]] = []
+    model_probe_rows: list[dict[str, Any]] = []
     for target in structured.get("correlations", {}).get("target_analyses", []):
         target_signal = str(target.get("target_signal", "unknown"))
         for rank, row in enumerate(list(target.get("predictor_results", []))[:10], start=1):
@@ -126,6 +130,26 @@ def save_agent1_artifacts(
             merged["target_signal"] = target_signal
             merged["rank"] = rank
             hypothesis_feature_rows.append(merged)
+
+    for target in (structured.get("model_strategy_recommendations") or {}).get(
+        "target_recommendations", []
+    ):
+        target_signal = str(target.get("target_signal", "unknown"))
+        flattened = {
+            key: value
+            for key, value in dict(target).items()
+            if key != "candidate_models"
+        }
+        flattened["target_signal"] = target_signal
+        flattened["priority_model_families"] = ", ".join(
+            str(item) for item in (target.get("priority_model_families") or [])
+        )
+        model_strategy_rows.append(flattened)
+        for rank, item in enumerate(list(target.get("candidate_models", [])), start=1):
+            merged = dict(item)
+            merged["target_signal"] = target_signal
+            merged["rank"] = rank
+            model_probe_rows.append(merged)
 
     csv_paths: dict[str, str] = {}
     csv_paths["top_predictors"] = _write_rows_csv(
@@ -153,6 +177,14 @@ def save_agent1_artifacts(
     csv_paths["planner_trace"] = _write_rows_csv(
         artifact_dir / "planner_trace.csv",
         list(structured.get("planner_trace", [])),
+    )
+    csv_paths["model_strategy_recommendations"] = _write_rows_csv(
+        artifact_dir / "model_strategy_recommendations.csv",
+        model_strategy_rows,
+    )
+    csv_paths["model_strategy_probes"] = _write_rows_csv(
+        artifact_dir / "model_strategy_probes.csv",
+        model_probe_rows,
     )
 
     json_path = write_json(artifact_dir / "structured_report.json", structured, indent=2)
@@ -203,6 +235,7 @@ def _build_markdown(structured: dict[str, Any]) -> str:
     lineage_path = structured.get("lineage_path")
     artifact_paths = structured.get("artifact_paths") or {}
     user_hypotheses = structured.get("user_hypotheses") or {}
+    model_strategy = structured.get("model_strategy_recommendations") or {}
 
     lines: list[str] = [
         "# Agent 1 Analysis Report",
@@ -360,6 +393,8 @@ def _build_markdown(structured: dict[str, Any]) -> str:
                         f"note={row_dict.get('hypothesis_note', '')}"
                     )
             lines.append("")
+    lines.extend(["", "## Model Strategy Recommendations (Agent 2 Planning)"])
+    lines.extend(_render_model_strategy_section(model_strategy))
     lines.extend(["", "## Sensor Diagnostics"])
     lines.extend(_render_sensor_diagnostics(sensor_diagnostics))
     lines.extend(["", "## Experiment Recommendations (Pre-Model, Agent 1)"])
@@ -562,6 +597,56 @@ def _render_sensor_diagnostics(payload: dict[str, Any]) -> list[str]:
                 f"{_fmt(_safe_float(row.get('stuck_run_fraction')))} | "
                 f"{row.get('flags', [])} |"
             )
+    return lines
+
+
+def _render_model_strategy_section(payload: dict[str, Any]) -> list[str]:
+    targets = list(payload.get("target_recommendations", []))
+    if not targets:
+        return ["- No model-strategy recommendations were generated."]
+    lines: list[str] = [
+        "- Agent 1 runs lightweight probe models to estimate which Agent 2 families should be tested first.",
+        "- Planned Agent 2 order should stay pragmatic: linear/lagged baselines first, then tree ensembles, then sequence models only when justified.",
+    ]
+    for target in targets:
+        target_signal = str(target.get("target_signal", "unknown"))
+        priority = ", ".join(str(item) for item in (target.get("priority_model_families") or []))
+        lines.extend(
+            [
+                f"### `{target_signal}`",
+                f"- Recommended model family: `{target.get('recommended_model_family', 'n/a')}`",
+                f"- Search order: {priority or 'n/a'}",
+                f"- Tree model worth testing: {target.get('tree_model_worth_testing', False)}",
+                f"- Sequence model worth testing: {target.get('sequence_model_worth_testing', False)}",
+                f"- Rationale: {target.get('rationale', '')}",
+            ]
+        )
+        probes = list(target.get("candidate_models", []))
+        if probes:
+            lines.extend(
+                [
+                    "",
+                    "| Probe Model | MAE | RMSE | R2 | Gain vs Linear | Notes |",
+                    "|---|---:|---:|---:|---:|---|",
+                ]
+            )
+            for item in probes:
+                lines.append(
+                    "| "
+                    f"`{item.get('model_family', 'n/a')}` | "
+                    f"{_fmt(_safe_float(item.get('mae')))} | "
+                    f"{_fmt(_safe_float(item.get('rmse')))} | "
+                    f"{_fmt(_safe_float(item.get('r2')))} | "
+                    f"{_fmt(_safe_float(item.get('relative_mae_gain_vs_linear')))} | "
+                    f"{item.get('notes', '')} |"
+                )
+        else:
+            lines.append(
+                "- Probe-model score table omitted because screening did not have enough complete rows for a stable validation split."
+            )
+        lines.append("")
+    if lines and lines[-1] == "":
+        lines.pop()
     return lines
 
 

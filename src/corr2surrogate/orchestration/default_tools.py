@@ -14,6 +14,7 @@ from corr2surrogate.analytics import (
     assess_stationarity,
     build_agent1_report_payload,
     build_candidate_signals_from_correlations,
+    recommend_model_strategies,
     recommend_data_trajectories,
     recommendations_to_dict,
     run_correlation_analysis,
@@ -69,7 +70,8 @@ def build_default_registry() -> ToolRegistry:
         name="run_agent1_analysis",
         description=(
             "Run full Agent 1 analysis: quality checks, stationarity, multi-technique "
-            "correlations, feature opportunities, and dependency-aware ranking."
+            "correlations, feature opportunities, lightweight probe-model screening, "
+            "model-family recommendations, and dependency-aware ranking."
         ),
         input_schema={
             "type": "object",
@@ -489,6 +491,11 @@ def _tool_run_agent1_analysis(
     )
     stationarity_columns = [item.target_signal for item in correlations.target_analyses]
     stationarity = assess_stationarity(frame, signal_columns=stationarity_columns)
+    model_strategy = recommend_model_strategies(
+        frame=frame,
+        correlations=correlations,
+        max_lag=max_lag,
+    )
     recommendations = recommend_data_trajectories(
         frame=frame,
         correlations=correlations.to_dict(),
@@ -542,6 +549,7 @@ def _tool_run_agent1_analysis(
         forced_requests=[asdict(item) for item in forced_directives],
         preprocessing=preprocessing,
         sensor_diagnostics=diagnostics.to_dict(),
+        model_strategy_recommendations=model_strategy.to_dict(),
         experiment_recommendations=recommendations_to_dict(recommendations),
         planner_trace=planner_trace,
         critic_decision=critic_decision,
@@ -569,6 +577,7 @@ def _tool_run_agent1_analysis(
         forced_requests=[asdict(item) for item in forced_directives],
         preprocessing=preprocessing,
         sensor_diagnostics=diagnostics.to_dict(),
+        model_strategy_recommendations=model_strategy.to_dict(),
         experiment_recommendations=recommendations_to_dict(recommendations),
         planner_trace=planner_trace,
         critic_decision=critic_decision,
@@ -601,6 +610,7 @@ def _tool_run_agent1_analysis(
         "stationarity": stationarity.to_dict(),
         "correlations": correlations.to_dict(),
         "sensor_diagnostics": diagnostics.to_dict(),
+        "model_strategy_recommendations": model_strategy.to_dict(),
         "experiment_recommendations": recommendations_to_dict(recommendations),
         "planner_trace": planner_trace,
         "critic_decision": critic_decision,

@@ -18,5 +18,12 @@ Scientific behavior:
 - Correlation findings are evidence, not causality.
 - Respect system knowledge constraints (critical/non-virtualizable signals).
 - Support user-forced target/predictor requests even when correlation is weak.
+- Use `run_agent1_analysis` as the primary scientific tool because it now includes:
+  - multi-technique correlations
+  - feature-engineering scans
+  - lightweight probe-model screening
+  - model-family recommendations for Agent 2
+- Treat tree or sequence recommendations as escalation signals, not defaults:
+  - linear or lagged baselines should remain the first recommendation unless probe evidence says otherwise
 - If user provides hypotheses, include them in `run_agent1_analysis` via `user_hypotheses` and `feature_hypotheses`.
 - If user asks to reuse an existing model, route to checkpoint listing/loading and retraining flow.

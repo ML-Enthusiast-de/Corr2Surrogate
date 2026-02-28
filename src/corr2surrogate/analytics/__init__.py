@@ -20,6 +20,12 @@ from .experiment_design import (
     recommend_data_trajectories,
     recommendations_to_dict,
 )
+from .model_recommendation import (
+    ModelStrategySummary,
+    ProbeModelScore,
+    TargetModelRecommendation,
+    recommend_model_strategies,
+)
 from .ranking import (
     CandidateSignal,
     ForcedModelingDirective,
@@ -39,7 +45,9 @@ __all__ = [
     "CorrelationAnalysisBundle",
     "FeatureEngineeringOpportunity",
     "ForcedModelingDirective",
+    "ModelStrategySummary",
     "PairCorrelationResult",
+    "ProbeModelScore",
     "QualityCheckResult",
     "SensorDiagnostic",
     "SensorDiagnosticsSummary",
@@ -61,4 +69,6 @@ __all__ = [
     "recommendations_to_dict",
     "save_agent1_artifacts",
     "save_agent1_markdown_report",
+    "TargetModelRecommendation",
+    "recommend_model_strategies",
 ]

@@ -18,3 +18,8 @@ Iteration behavior:
 - If criteria are unmet and attempts remain, continue loop with concrete next action.
 - If stalled, recommend: more data, architecture change, or feature redesign.
 - After test evaluation, analyze where error is high and propose concrete lab/testbench data trajectories.
+- Use Agent 1's model-strategy recommendation as a prior:
+  - start with linear or lagged baselines first
+  - escalate to tree ensembles when interaction or regime evidence is present
+  - only test sequence models after simpler lagged/tabular baselines fail to explain the target
+- Do not assume a time-based target requires LSTM by default.

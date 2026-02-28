@@ -6,21 +6,14 @@ from corr2surrogate.orchestration.default_tools import build_default_registry
 def test_run_agent1_analysis_tool_end_to_end(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.chdir(tmp_path)
     csv_path = tmp_path / "data.csv"
+    rows = ["time,sensor_a,sensor_b,target"]
+    for idx in range(30):
+        sensor_a = 1.0 + 0.5 * idx
+        sensor_b = 0.1 + 0.05 * (idx % 6)
+        target = 1.5 * sensor_a + 0.3 * sensor_b + 0.2
+        rows.append(f"{idx},{sensor_a:.3f},{sensor_b:.3f},{target:.3f}")
     csv_path.write_text(
-        "\n".join(
-            [
-                "time,sensor_a,sensor_b,target",
-                "0,1.0,0.1,2.0",
-                "1,1.5,0.1,3.0",
-                "2,2.0,0.2,4.0",
-                "3,2.5,0.2,5.0",
-                "4,3.0,0.3,6.0",
-                "5,3.5,0.3,7.0",
-                "6,4.0,0.4,8.0",
-                "7,4.5,0.4,9.0",
-                "8,5.0,0.5,10.0",
-            ]
-        ),
+        "\n".join(rows),
         encoding="utf-8",
     )
 
@@ -65,6 +58,7 @@ def test_run_agent1_analysis_tool_end_to_end(monkeypatch, tmp_path: Path) -> Non
     assert payload["forced_requests"]
     assert payload["user_hypotheses"]
     assert payload["feature_hypotheses"]
+    assert payload["model_strategy_recommendations"]["target_recommendations"]
     assert payload["report_path"] is not None
     assert payload["lineage_path"]
     assert payload["artifact_paths"]["artifact_dir"]
@@ -78,10 +72,12 @@ def test_run_agent1_analysis_tool_end_to_end(monkeypatch, tmp_path: Path) -> Non
     assert "Agentic Planning" in markdown
     assert "Sensor Diagnostics" in markdown
     assert "Experiment Recommendations" in markdown
+    assert "Model Strategy Recommendations (Agent 2 Planning)" in markdown
     assert "Split leakage risk (missing-data plan)" in markdown
     assert "Correlation Details (Top 10 Predictors per Target)" in markdown
     assert "| Category | Target | Rank | Predictor | Correlation Type | Strength |" in markdown
     assert "Feature Engineering Opportunities (Top 10)" in markdown
+    assert "| Probe Model | MAE | RMSE | R2 | Gain vs Linear | Notes |" in markdown
     assert "User Hypothesis Checks" in markdown
 
 

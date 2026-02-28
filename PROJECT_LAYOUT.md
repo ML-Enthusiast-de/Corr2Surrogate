@@ -21,11 +21,18 @@ Outputs:
 - Sheet selection handling for multi-sheet Excel
 - Header/data-start inference with confidence checks
 - Data quality checks and correlation/dependency analysis
+- Lightweight probe-model screening on shortlisted predictors:
+  - linear ridge baseline
+  - interaction-aware ridge
+  - piecewise tree proxy
+  - lagged linear probe for time-series
+- Residual nonlinearity, regime, and lag diagnostics
 - Ranking of surrogate candidates with dependency-awareness
 - Supports user-forced directives:
   - Model specific target(s) with specific predictor sensors, even with weak correlation
 - Produces handoff with:
   - ranking, forced directives, system knowledge, normalization plan, loop policy
+  - model-strategy prior for Agent 2 (search order, tree-worth-testing, sequence-worth-testing)
 
 ### Agent 2 (`Modeler`)
 - Reads handoff and enforces constraints/policies
@@ -41,6 +48,10 @@ Outputs:
   - more data
   - different architecture
   - feature/lag redesign
+- Planned model order:
+  - linear / lagged linear baseline first
+  - tree ensembles next when Agent 1 finds interaction or regime evidence
+  - sequence models only after simpler lagged/tabular baselines fail
 
 ## 4. Critical Behavioral Requirements
 - Correlation is not the only trigger for modeling:
@@ -63,6 +74,7 @@ Outputs:
 - `normalization`
 - `acceptance_criteria`
 - `loop_policy`
+- `model_strategy_recommendation`
 
 ## 6. Ranking Strategy
 Dependency-aware ranking logic:
@@ -82,6 +94,11 @@ Guidance includes:
 - collect more representative data
 - switch architecture class
 - adjust regularization / feature engineering / temporal windowing
+
+Model-selection rule:
+- Agent 2 must treat Agent 1's recommendation as a prior, not a hard decision.
+- If a simple baseline already performs well, keep it unless the higher-capacity model delivers meaningful validated improvement.
+- Time-series does not automatically imply LSTM.
 
 ## 8. Persistence and Reproducibility
 Persist per run:
@@ -113,11 +130,12 @@ Corr2Surrogate/
 ## 10. Implementation Phases
 Phase 1:
 - ingestion + profiling + ranking + forced directives
+- probe-model screening + model-family recommendation prior
 - baseline training + artifact persistence
 
 Phase 2:
-- temporal modeling + robust optimization loops
+- tree ensembles + lagged tabular modeling + robust optimization loops
 - stronger diagnostics and failure guidance
 
 Phase 3:
-- drift monitoring + uncertainty calibration + governance hardening
+- sequence models + drift monitoring + uncertainty calibration + governance hardening

@@ -3,14 +3,17 @@
 Corr2Surrogate is a local-first framework for converting real-world sensor data into validated surrogate-model candidates.
 
 ## What It Does
-- Agent 1 (`Analyst`) ingests CSV/XLS/XLSX data, checks data quality, runs correlation analysis, and ranks surrogate candidates.
-- Agent 2 (`Modeler`) is designed to train/evaluate surrogate models with reproducible artifacts and checkpoints. (not yet implemented)
+- Agent 1 (`Analyst`) ingests CSV/XLS/XLSX data, checks data quality, runs correlation analysis, ranks surrogate candidates, and performs lightweight probe-model screening to recommend which model families Agent 2 should test first.
+- Agent 2 (`Modeler`) is designed to train/evaluate surrogate models with reproducible artifacts and checkpoints. The intended search order is pragmatic: start with linear or lagged baselines, escalate to tree ensembles when interaction or piecewise evidence is real, and only test sequence models when temporal probes justify it. (full implementation still pending)
 
 ## Key Capabilities
 - CSV/XLS/XLSX ingestion with sheet selection and header/data-start inference
 - Quality checks (missingness, duplicates, outliers, timestamp integrity)
 - Correlation analysis (Pearson, Spearman, Kendall, distance, lag-aware)
 - Feature-engineering scans (including `rate_change`)
+- Probe-model screening (linear, interaction-aware, piecewise tree proxy, lagged linear)
+- Residual nonlinearity and regime diagnostics to support model-family selection
+- Model-family recommendations for Agent 2 search order
 - Dependency-aware surrogate ranking
 - Dataset-scoped reports and artifact export
 - Local runtime by default; optional API mode via explicit opt-in
@@ -98,6 +101,15 @@ Hypothesis syntax:
 - Correlation: `hypothesis corr target:pred1,pred2; target2:pred3`
 - Feature: `hypothesis feature target:signal->rate_change; signal2->square`
 
+Agent 1 also produces model-strategy guidance for Agent 2:
+- start with `linear_ridge` or `lagged_linear` baselines
+- treat `tree_ensemble_candidate` as "worth testing next" only when probe gains or regime evidence are material
+- only test `sequence_model_candidate` when temporal probes justify it after lagged/tabular baselines
+
+Interpretation rule:
+- a detected nonlinear dependence alone is not enough to recommend trees or sequence models
+- Agent 1 uses cheap validation probes to decide whether those heavier families are likely to outperform the linear baseline
+
 ## Optional API Mode (Explicit Opt-In)
 Default policy is local-only. API mode must be explicitly enabled.
 
@@ -149,6 +161,20 @@ corr2surrogate run-agent1-analysis \
   --strategy-search-candidates 4
 ```
 
+## Planned Agent 2 Modeling Roadmap
+Agent 1 now emits a model-strategy prior for each target. Agent 2 should treat that as a search-order hint, not a guarantee.
+
+Recommended model families to implement next:
+- Steady-state / tabular: `Ridge` or `ElasticNet` baseline first
+- Nonlinear tabular: tree ensembles (`RandomForest`, `ExtraTrees`, `HistGradientBoosting`) after the linear baseline
+- Time-series: lagged linear baseline first
+- Stronger time-series tabular: lag-window tree ensembles after lagged linear
+- Sequence models: `GRU`/`LSTM` only when lagged/tabular probes still leave meaningful residual dynamics
+
+Operational rule:
+- do not jump directly to LSTM just because a target is time-based
+- require evidence from lag benefit, autocorrelation, and failed simpler baselines first
+
 ## Behavior and Prompt Control
 - Runtime defaults: `configs/default.yaml`
 - Analyst prompt: `src/corr2surrogate/agents/prompts/analyst_system.txt`
@@ -163,6 +189,7 @@ Outputs are grouped by dataset slug under `reports/<dataset_slug>/`:
 - Markdown report: `agent1_<timestamp>.md`
 - Lineage JSON: `agent1_<timestamp>.lineage.json`
 - Artifact directory: `agent1_<timestamp>_artifacts/`
+- Agent 1 report now includes a dedicated "Model Strategy Recommendations (Agent 2 Planning)" section with probe-model scores and suggested search order.
 
 ## Quality and Security Checks
 Run tests:
