@@ -36,6 +36,16 @@ class TargetModelRecommendation:
     target_signal: str
     recommended_model_family: str
     priority_model_families: list[str]
+    probe_predictor_signals: list[str]
+    probe_complete_rows: int
+    best_probe_model_family: str
+    best_probe_mae: float
+    best_probe_rmse: float
+    best_probe_r2: float
+    best_probe_gain_vs_linear: float
+    recommendation_statement: str
+    recommendation_confidence: str
+    recommendation_confidence_score: float
     rationale: str
     tree_model_worth_testing: bool
     sequence_model_worth_testing: bool
@@ -110,6 +120,19 @@ def _recommend_for_target(
             target_signal=target_signal,
             recommended_model_family="insufficient_signal_support",
             priority_model_families=["collect_more_data"],
+            probe_predictor_signals=[],
+            probe_complete_rows=0,
+            best_probe_model_family="none",
+            best_probe_mae=float("nan"),
+            best_probe_rmse=float("nan"),
+            best_probe_r2=float("nan"),
+            best_probe_gain_vs_linear=0.0,
+            recommendation_statement=(
+                f"For target `{target_signal}`, no probe-model recommendation is possible because "
+                "correlation screening did not yield usable predictors."
+            ),
+            recommendation_confidence="low",
+            recommendation_confidence_score=0.0,
             rationale="No usable predictors survived correlation screening.",
             tree_model_worth_testing=False,
             sequence_model_worth_testing=False,
@@ -134,6 +157,19 @@ def _recommend_for_target(
             target_signal=target_signal,
             recommended_model_family="insufficient_data_probe",
             priority_model_families=["linear_ridge", "collect_more_data"],
+            probe_predictor_signals=list(predictor_cols),
+            probe_complete_rows=int(len(numeric)),
+            best_probe_model_family="none",
+            best_probe_mae=float("nan"),
+            best_probe_rmse=float("nan"),
+            best_probe_r2=float("nan"),
+            best_probe_gain_vs_linear=0.0,
+            recommendation_statement=(
+                f"For target `{target_signal}`, collect more complete rows before using the "
+                "model-family recommendation for Agent 2."
+            ),
+            recommendation_confidence="low",
+            recommendation_confidence_score=0.1,
             rationale="Too few complete numeric rows for reliable probe-model screening.",
             tree_model_worth_testing=False,
             sequence_model_worth_testing=False,
@@ -161,6 +197,19 @@ def _recommend_for_target(
             target_signal=target_signal,
             recommended_model_family="insufficient_data_probe",
             priority_model_families=["linear_ridge", "collect_more_data"],
+            probe_predictor_signals=list(predictor_cols),
+            probe_complete_rows=int(len(numeric)),
+            best_probe_model_family="none",
+            best_probe_mae=float("nan"),
+            best_probe_rmse=float("nan"),
+            best_probe_r2=float("nan"),
+            best_probe_gain_vs_linear=0.0,
+            recommendation_statement=(
+                f"For target `{target_signal}`, the probe split was too small for a reliable "
+                "quick recommendation. Collect more data or reduce missingness first."
+            ),
+            recommendation_confidence="low",
+            recommendation_confidence_score=0.1,
             rationale="Probe split left too few rows for train/validation screening.",
             tree_model_worth_testing=False,
             sequence_model_worth_testing=False,
@@ -217,7 +266,7 @@ def _recommend_for_target(
         )
     )
 
-    piecewise_metrics = _piecewise_probe_metrics(
+    tree_metrics = _tree_probe_metrics(
         train=train,
         val=val,
         target_signal=target_signal,
@@ -225,12 +274,12 @@ def _recommend_for_target(
     )
     candidates.append(
         _probe_score(
-            model_family="piecewise_bin_probe",
-            metrics=piecewise_metrics,
+            model_family="tiny_tree_probe",
+            metrics=tree_metrics,
             baseline_mae=baseline_mae,
             train_samples=len(train),
             validation_samples=len(val),
-            notes="Quantile-binned piecewise lookup as a cheap tree proxy.",
+            notes="Depth-limited regression tree on the top ranked predictors.",
         )
     )
 
@@ -272,13 +321,13 @@ def _recommend_for_target(
     )
     target_autocorr = _autocorr_lag1(numeric[target_signal].to_numpy(dtype=float))
 
-    best_tree_proxy_mae = min(
+    best_tree_probe_mae = min(
         interaction_metrics["mae"],
-        piecewise_metrics["mae"],
+        tree_metrics["mae"],
     )
     interaction_gain = max(
         0.0,
-        (baseline_mae - best_tree_proxy_mae) / max(baseline_mae, 1e-12),
+        (baseline_mae - best_tree_probe_mae) / max(baseline_mae, 1e-12),
     )
     tree_model_worth_testing = bool(
         interaction_gain >= 0.05
@@ -316,11 +365,39 @@ def _recommend_for_target(
         lag_benefit=lag_benefit,
         target_autocorr_lag1=target_autocorr,
     )
+    recommendation_statement = _build_recommendation_statement(
+        target_signal=target_signal,
+        recommended_model_family=recommended_model_family,
+        best_candidate=best_candidate,
+        tree_model_worth_testing=tree_model_worth_testing,
+        sequence_model_worth_testing=sequence_model_worth_testing,
+    )
+    confidence_label, confidence_score = _recommendation_confidence(
+        recommended_model_family=recommended_model_family,
+        best_candidate=best_candidate,
+        interaction_gain=interaction_gain,
+        regime_strength=regime_strength,
+        residual_nonlinearity_score=residual_nonlinearity_score,
+        lag_benefit=lag_benefit,
+        tree_model_worth_testing=tree_model_worth_testing,
+        sequence_model_worth_testing=sequence_model_worth_testing,
+        probe_complete_rows=int(len(numeric)),
+    )
 
     return TargetModelRecommendation(
         target_signal=target_signal,
         recommended_model_family=recommended_model_family,
         priority_model_families=priority,
+        probe_predictor_signals=list(predictor_cols),
+        probe_complete_rows=int(len(numeric)),
+        best_probe_model_family=best_candidate.model_family,
+        best_probe_mae=float(best_candidate.mae),
+        best_probe_rmse=float(best_candidate.rmse),
+        best_probe_r2=float(best_candidate.r2),
+        best_probe_gain_vs_linear=float(best_candidate_gain),
+        recommendation_statement=recommendation_statement,
+        recommendation_confidence=confidence_label,
+        recommendation_confidence_score=float(confidence_score),
         rationale=rationale,
         tree_model_worth_testing=tree_model_worth_testing,
         sequence_model_worth_testing=sequence_model_worth_testing,
@@ -468,64 +545,140 @@ def _apply_interaction_features(
     return out
 
 
-def _piecewise_probe_metrics(
+def _tree_probe_metrics(
     *,
     train: pd.DataFrame,
     val: pd.DataFrame,
     target_signal: str,
     predictor_cols: list[str],
 ) -> dict[str, float]:
-    features = predictor_cols[:2] if len(predictor_cols) >= 2 else predictor_cols[:1]
+    features = predictor_cols[: max(1, min(4, len(predictor_cols)))]
     if not features:
         return {"mae": float("nan"), "rmse": float("nan"), "r2": float("nan")}
 
-    target_train = train[target_signal].to_numpy(dtype=float)
-    target_val = val[target_signal].to_numpy(dtype=float)
-    global_mean = float(np.mean(target_train))
+    x_train = train[features].to_numpy(dtype=float)
+    y_train = train[target_signal].to_numpy(dtype=float)
+    x_val = val[features].to_numpy(dtype=float)
+    y_val = val[target_signal].to_numpy(dtype=float)
+    min_leaf = max(4, min(12, int(len(train) * 0.08)))
+    tree = _fit_tiny_regression_tree(
+        x_train=x_train,
+        y_train=y_train,
+        depth=0,
+        max_depth=3,
+        min_leaf=min_leaf,
+    )
+    pred = _predict_tiny_regression_tree(tree=tree, x=x_val)
+    return _regression_metrics(y_val, pred)
 
-    bin_payloads: list[tuple[np.ndarray, np.ndarray]] = []
-    for col in features:
-        values = train[col].to_numpy(dtype=float)
-        edges = np.quantile(values, [0.0, 0.25, 0.5, 0.75, 1.0])
-        unique_edges = np.unique(edges)
-        if len(unique_edges) < 2:
-            unique_edges = np.array([np.min(values), np.max(values)], dtype=float)
-        bin_payloads.append((unique_edges, _digitize(values, unique_edges)))
 
-    cell_means: dict[tuple[int, ...], float] = {}
-    cell_counts: dict[tuple[int, ...], int] = {}
-    one_dim_means: dict[int, float] = {}
-    one_dim_counts: dict[int, int] = {}
-    primary_bins = bin_payloads[0][1]
-    for idx in range(len(train)):
-        key = tuple(int(payload[1][idx]) for payload in bin_payloads)
-        cell_means[key] = cell_means.get(key, 0.0) + float(target_train[idx])
-        cell_counts[key] = cell_counts.get(key, 0) + 1
-        primary = int(primary_bins[idx])
-        one_dim_means[primary] = one_dim_means.get(primary, 0.0) + float(target_train[idx])
-        one_dim_counts[primary] = one_dim_counts.get(primary, 0) + 1
-    for key, total in list(cell_means.items()):
-        cell_means[key] = total / max(cell_counts.get(key, 1), 1)
-    for key, total in list(one_dim_means.items()):
-        one_dim_means[key] = total / max(one_dim_counts.get(key, 1), 1)
+def _fit_tiny_regression_tree(
+    *,
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    depth: int,
+    max_depth: int,
+    min_leaf: int,
+) -> dict[str, Any]:
+    leaf_value = float(np.mean(y_train)) if len(y_train) > 0 else 0.0
+    if (
+        depth >= max_depth
+        or len(y_train) < max(2 * int(min_leaf), 8)
+        or float(np.var(y_train)) <= 1e-12
+    ):
+        return {"leaf": True, "value": leaf_value}
 
-    val_bins: list[np.ndarray] = []
-    for col, (edges, _) in zip(features, bin_payloads):
-        values = val[col].to_numpy(dtype=float)
-        val_bins.append(_digitize(values, edges))
-
-    pred = np.empty(len(val), dtype=float)
-    for idx in range(len(val)):
-        key = tuple(int(arr[idx]) for arr in val_bins)
-        if key in cell_means:
-            pred[idx] = float(cell_means[key])
+    best_feature = -1
+    best_threshold = float("nan")
+    best_score = float("inf")
+    n_features = int(x_train.shape[1]) if x_train.ndim == 2 else 0
+    for feature_idx in range(n_features):
+        values = x_train[:, feature_idx]
+        finite_values = values[np.isfinite(values)]
+        if finite_values.size < max(2 * int(min_leaf), 8):
             continue
-        primary = int(val_bins[0][idx])
-        if primary in one_dim_means:
-            pred[idx] = float(one_dim_means[primary])
-            continue
-        pred[idx] = global_mean
-    return _regression_metrics(target_val, pred)
+        thresholds = _candidate_thresholds(finite_values)
+        for threshold in thresholds:
+            left_mask = values <= threshold
+            right_mask = ~left_mask
+            left_count = int(np.sum(left_mask))
+            right_count = int(np.sum(right_mask))
+            if left_count < min_leaf or right_count < min_leaf:
+                continue
+            score = _sum_squared_error(y_train[left_mask]) + _sum_squared_error(y_train[right_mask])
+            if score < best_score:
+                best_score = score
+                best_feature = feature_idx
+                best_threshold = float(threshold)
+
+    if best_feature < 0 or not math.isfinite(best_threshold):
+        return {"leaf": True, "value": leaf_value}
+
+    values = x_train[:, best_feature]
+    left_mask = values <= best_threshold
+    right_mask = ~left_mask
+    return {
+        "leaf": False,
+        "value": leaf_value,
+        "feature_index": int(best_feature),
+        "threshold": float(best_threshold),
+        "left": _fit_tiny_regression_tree(
+            x_train=x_train[left_mask],
+            y_train=y_train[left_mask],
+            depth=depth + 1,
+            max_depth=max_depth,
+            min_leaf=min_leaf,
+        ),
+        "right": _fit_tiny_regression_tree(
+            x_train=x_train[right_mask],
+            y_train=y_train[right_mask],
+            depth=depth + 1,
+            max_depth=max_depth,
+            min_leaf=min_leaf,
+        ),
+    }
+
+
+def _predict_tiny_regression_tree(*, tree: dict[str, Any], x: np.ndarray) -> np.ndarray:
+    if x.ndim != 2:
+        raise ValueError("x must be 2D.")
+    pred = np.empty(x.shape[0], dtype=float)
+    for idx in range(x.shape[0]):
+        pred[idx] = _predict_tiny_regression_tree_row(tree=tree, row=x[idx])
+    return pred
+
+
+def _predict_tiny_regression_tree_row(*, tree: dict[str, Any], row: np.ndarray) -> float:
+    node = tree
+    while not bool(node.get("leaf", False)):
+        feature_index = int(node["feature_index"])
+        threshold = float(node["threshold"])
+        if float(row[feature_index]) <= threshold:
+            node = dict(node["left"])
+        else:
+            node = dict(node["right"])
+    return float(node.get("value", 0.0))
+
+
+def _candidate_thresholds(values: np.ndarray) -> np.ndarray:
+    unique = np.unique(values)
+    if unique.size <= 1:
+        return np.array([], dtype=float)
+    if unique.size <= 12:
+        return ((unique[:-1] + unique[1:]) / 2.0).astype(float)
+    quantiles = np.linspace(0.1, 0.9, 9)
+    candidates = np.unique(np.quantile(values, quantiles))
+    lower = float(np.min(values))
+    upper = float(np.max(values))
+    candidates = candidates[(candidates > lower) & (candidates < upper)]
+    return candidates.astype(float)
+
+
+def _sum_squared_error(values: np.ndarray) -> float:
+    if values.size == 0:
+        return 0.0
+    centered = values - float(np.mean(values))
+    return float(np.sum(np.square(centered)))
 
 
 def _digitize(values: np.ndarray, edges: np.ndarray) -> np.ndarray:
@@ -671,7 +824,7 @@ def _select_model_family(
                     ["lagged_linear", "tree_ensemble_candidate", "linear_ridge"],
                 )
             return ("lagged_linear", ["lagged_linear", "linear_ridge"])
-        if best_probe in {"interaction_ridge", "piecewise_bin_probe"} and best_probe_gain >= 0.03:
+        if best_probe in {"interaction_ridge", "tiny_tree_probe"} and best_probe_gain >= 0.03:
             return (
                 "tree_ensemble_candidate",
                 ["linear_ridge", "tree_ensemble_candidate", "lagged_linear"],
@@ -688,7 +841,7 @@ def _select_model_family(
             )
         return ("linear_ridge", ["linear_ridge", "lagged_linear"])
 
-    if best_probe in {"interaction_ridge", "piecewise_bin_probe"} and best_probe_gain >= 0.03:
+    if best_probe in {"interaction_ridge", "tiny_tree_probe"} and best_probe_gain >= 0.03:
         return (
             "tree_ensemble_candidate",
             ["linear_ridge", "tree_ensemble_candidate"],
@@ -698,6 +851,102 @@ def _select_model_family(
     if best_probe == "interaction_ridge" and best_probe_gain >= 0.02:
         return ("interaction_ridge", ["linear_ridge", "interaction_ridge"])
     return ("linear_ridge", ["linear_ridge", "tree_ensemble_candidate"])
+
+
+def _build_recommendation_statement(
+    *,
+    target_signal: str,
+    recommended_model_family: str,
+    best_candidate: ProbeModelScore,
+    tree_model_worth_testing: bool,
+    sequence_model_worth_testing: bool,
+) -> str:
+    base = (
+        f"For target `{target_signal}`, start with `{recommended_model_family}`. "
+        f"The strongest quick screen was `{best_candidate.model_family}` "
+        f"(MAE={best_candidate.mae:.4f}, R2={best_candidate.r2:.3f}, "
+        f"gain_vs_linear={best_candidate.relative_mae_gain_vs_linear:.3f})."
+        if math.isfinite(best_candidate.mae) and math.isfinite(best_candidate.r2)
+        else f"For target `{target_signal}`, start with `{recommended_model_family}`."
+    )
+    if recommended_model_family == "tree_ensemble_candidate":
+        return (
+            base
+            + " A tree-based family is recommended next because nonlinear or regime-like "
+            "structure appears material even after the linear baseline."
+        )
+    if recommended_model_family == "lagged_linear":
+        tail = " Lagged effects improved the quick validation screen enough to justify a temporal tabular baseline first."
+        if tree_model_worth_testing:
+            tail += " Tree ensembles are still worth testing after that baseline."
+        return base + tail
+    if recommended_model_family == "sequence_model_candidate":
+        return (
+            base
+            + " Sequence models are worth testing only after simpler lagged/tabular baselines, "
+            "because meaningful temporal residual structure remains."
+        )
+    if recommended_model_family == "interaction_ridge":
+        return (
+            base
+            + " Simple explicit nonlinear interactions appear helpful, but the evidence is not "
+            "strong enough yet to skip interpretable tabular baselines."
+        )
+    tail = " The linear baseline remains the strongest or most reliable first step."
+    if tree_model_worth_testing:
+        tail += " Tree models are a secondary follow-up, not the primary recommendation."
+    if sequence_model_worth_testing:
+        tail += " Sequence models are worth revisiting only if lagged baselines still leave residual structure."
+    return base + tail
+
+
+def _recommendation_confidence(
+    *,
+    recommended_model_family: str,
+    best_candidate: ProbeModelScore,
+    interaction_gain: float,
+    regime_strength: float,
+    residual_nonlinearity_score: float,
+    lag_benefit: float,
+    tree_model_worth_testing: bool,
+    sequence_model_worth_testing: bool,
+    probe_complete_rows: int,
+) -> tuple[str, float]:
+    score = 0.10
+    if probe_complete_rows >= 40:
+        score += 0.10
+    if probe_complete_rows >= 100:
+        score += 0.10
+    if math.isfinite(best_candidate.r2):
+        score += min(0.20, max(0.0, best_candidate.r2) * 0.20)
+    if math.isfinite(best_candidate.relative_mae_gain_vs_linear):
+        score += min(0.20, max(0.0, best_candidate.relative_mae_gain_vs_linear) * 2.5)
+
+    if recommended_model_family == "linear_ridge":
+        score += 0.20 if best_candidate.model_family == "linear_ridge" else 0.05
+        if max(interaction_gain, lag_benefit) < 0.03 and residual_nonlinearity_score < 0.15:
+            score += 0.15
+    elif recommended_model_family == "lagged_linear":
+        score += min(0.25, max(0.0, lag_benefit) * 3.0)
+        if tree_model_worth_testing:
+            score += 0.05
+    elif recommended_model_family == "tree_ensemble_candidate":
+        score += min(0.20, max(0.0, interaction_gain) * 2.0)
+        score += min(0.10, max(0.0, regime_strength) * 0.25)
+        score += min(0.10, max(0.0, residual_nonlinearity_score) * 0.30)
+    elif recommended_model_family == "sequence_model_candidate":
+        score += min(0.20, max(0.0, lag_benefit) * 2.5)
+        if sequence_model_worth_testing:
+            score += 0.10
+    elif recommended_model_family in {"insufficient_data_probe", "insufficient_signal_support"}:
+        score = min(score, 0.20)
+
+    score = float(max(0.0, min(1.0, score)))
+    if score >= 0.70:
+        return "high", score
+    if score >= 0.45:
+        return "medium", score
+    return "low", score
 
 
 def _build_rationale(

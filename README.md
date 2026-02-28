@@ -11,9 +11,10 @@ Corr2Surrogate is a local-first framework for converting real-world sensor data 
 - Quality checks (missingness, duplicates, outliers, timestamp integrity)
 - Correlation analysis (Pearson, Spearman, Kendall, distance, lag-aware)
 - Feature-engineering scans (including `rate_change`)
-- Probe-model screening (linear, interaction-aware, piecewise tree proxy, lagged linear)
+- Probe-model screening (linear, interaction-aware, tiny regression tree, lagged linear)
 - Residual nonlinearity and regime diagnostics to support model-family selection
 - Model-family recommendations for Agent 2 search order
+- Evidence-backed recommendation blocks with probe inputs, quick metrics, and confidence
 - Dependency-aware surrogate ranking
 - Dataset-scoped reports and artifact export
 - Local runtime by default; optional API mode via explicit opt-in

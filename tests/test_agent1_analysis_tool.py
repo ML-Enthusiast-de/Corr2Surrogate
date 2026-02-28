@@ -59,6 +59,11 @@ def test_run_agent1_analysis_tool_end_to_end(monkeypatch, tmp_path: Path) -> Non
     assert payload["user_hypotheses"]
     assert payload["feature_hypotheses"]
     assert payload["model_strategy_recommendations"]["target_recommendations"]
+    model_rec = payload["model_strategy_recommendations"]["target_recommendations"][0]
+    assert model_rec["probe_predictor_signals"]
+    assert model_rec["best_probe_model_family"]
+    assert model_rec["recommendation_statement"]
+    assert model_rec["recommendation_confidence"] in {"low", "medium", "high"}
     assert payload["report_path"] is not None
     assert payload["lineage_path"]
     assert payload["artifact_paths"]["artifact_dir"]
@@ -77,6 +82,10 @@ def test_run_agent1_analysis_tool_end_to_end(monkeypatch, tmp_path: Path) -> Non
     assert "Correlation Details (Top 10 Predictors per Target)" in markdown
     assert "| Category | Target | Rank | Predictor | Correlation Type | Strength |" in markdown
     assert "Feature Engineering Opportunities (Top 10)" in markdown
+    assert "Probe inputs:" in markdown
+    assert "Evidence summary:" in markdown
+    assert "Recommendation statement:" in markdown
+    assert "Recommendation confidence:" in markdown
     assert "| Probe Model | MAE | RMSE | R2 | Gain vs Linear | Notes |" in markdown
     assert "User Hypothesis Checks" in markdown
 

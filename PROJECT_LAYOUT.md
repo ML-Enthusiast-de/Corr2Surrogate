@@ -24,7 +24,7 @@ Outputs:
 - Lightweight probe-model screening on shortlisted predictors:
   - linear ridge baseline
   - interaction-aware ridge
-  - piecewise tree proxy
+  - tiny regression tree baseline
   - lagged linear probe for time-series
 - Residual nonlinearity, regime, and lag diagnostics
 - Ranking of surrogate candidates with dependency-awareness
@@ -32,7 +32,7 @@ Outputs:
   - Model specific target(s) with specific predictor sensors, even with weak correlation
 - Produces handoff with:
   - ranking, forced directives, system knowledge, normalization plan, loop policy
-  - model-strategy prior for Agent 2 (search order, tree-worth-testing, sequence-worth-testing)
+  - evidence-backed model-strategy prior for Agent 2 (probe inputs, quick metrics, confidence, search order)
 
 ### Agent 2 (`Modeler`)
 - Reads handoff and enforces constraints/policies

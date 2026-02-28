@@ -144,6 +144,9 @@ def save_agent1_artifacts(
         flattened["priority_model_families"] = ", ".join(
             str(item) for item in (target.get("priority_model_families") or [])
         )
+        flattened["probe_predictor_signals"] = ", ".join(
+            str(item) for item in (target.get("probe_predictor_signals") or [])
+        )
         model_strategy_rows.append(flattened)
         for rank, item in enumerate(list(target.get("candidate_models", [])), start=1):
             merged = dict(item)
@@ -611,14 +614,32 @@ def _render_model_strategy_section(payload: dict[str, Any]) -> list[str]:
     for target in targets:
         target_signal = str(target.get("target_signal", "unknown"))
         priority = ", ".join(str(item) for item in (target.get("priority_model_families") or []))
+        probe_predictors = ", ".join(
+            f"`{item}`" for item in (target.get("probe_predictor_signals") or [])
+        )
+        confidence_label = str(target.get("recommendation_confidence", "n/a"))
+        confidence_score = _safe_float(target.get("recommendation_confidence_score"))
         lines.extend(
             [
                 f"### `{target_signal}`",
+                f"- Probe inputs: predictors={probe_predictors or 'n/a'}, complete_rows={_fmt_int(target.get('probe_complete_rows'))}",
+                "- Evidence summary: "
+                f"best_probe=`{target.get('best_probe_model_family', 'n/a')}`, "
+                f"MAE={_fmt(_safe_float(target.get('best_probe_mae')))}, "
+                f"RMSE={_fmt(_safe_float(target.get('best_probe_rmse')))}, "
+                f"R2={_fmt(_safe_float(target.get('best_probe_r2')))}, "
+                f"gain_vs_linear={_fmt(_safe_float(target.get('best_probe_gain_vs_linear')))}, "
+                f"interaction_gain={_fmt(_safe_float(target.get('interaction_gain')))}, "
+                f"regime_strength={_fmt(_safe_float(target.get('regime_strength')))}, "
+                f"residual_nonlinearity={_fmt(_safe_float(target.get('residual_nonlinearity_score')))}, "
+                f"lag_benefit={_fmt(_safe_float(target.get('lag_benefit')))}",
                 f"- Recommended model family: `{target.get('recommended_model_family', 'n/a')}`",
                 f"- Search order: {priority or 'n/a'}",
+                f"- Recommendation statement: {target.get('recommendation_statement', '')}",
+                f"- Recommendation confidence: `{confidence_label}` ({_fmt(confidence_score)})",
                 f"- Tree model worth testing: {target.get('tree_model_worth_testing', False)}",
                 f"- Sequence model worth testing: {target.get('sequence_model_worth_testing', False)}",
-                f"- Rationale: {target.get('rationale', '')}",
+                f"- Technical rationale: {target.get('rationale', '')}",
             ]
         )
         probes = list(target.get("candidate_models", []))

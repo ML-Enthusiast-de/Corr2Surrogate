@@ -22,6 +22,10 @@ def test_recommend_model_strategies_prefers_linear_for_linear_signal() -> None:
     rec = summary.target_recommendations[0]
     assert rec.recommended_model_family == "linear_ridge"
     assert rec.priority_model_families[0] == "linear_ridge"
+    assert set(rec.probe_predictor_signals) == {"sensor_a", "sensor_b"}
+    assert rec.best_probe_model_family in {"linear_ridge", "interaction_ridge"}
+    assert rec.recommendation_confidence in {"medium", "high"}
+    assert "For target `target`, start with `linear_ridge`." in rec.recommendation_statement
 
 
 def test_recommend_model_strategies_flags_tree_candidate_for_interactions() -> None:
@@ -46,3 +50,6 @@ def test_recommend_model_strategies_flags_tree_candidate_for_interactions() -> N
     assert rec.tree_model_worth_testing is True
     assert rec.recommended_model_family == "tree_ensemble_candidate"
     assert "tree_ensemble_candidate" in rec.priority_model_families
+    assert any(item.model_family == "tiny_tree_probe" for item in rec.candidate_models)
+    assert rec.best_probe_model_family in {"tiny_tree_probe", "interaction_ridge"}
+    assert "For target `target`, start with `tree_ensemble_candidate`." in rec.recommendation_statement
