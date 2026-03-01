@@ -33,6 +33,14 @@ class CandidateMetrics:
         return asdict(self)
 
 
+_MODEL_TIEBREAK = {
+    "linear_ridge": 0,
+    "lagged_linear": 1,
+    "bagged_tree_ensemble": 2,
+    "lagged_tree_ensemble": 3,
+}
+
+
 def normalize_candidate_model_family(requested_model_family: str) -> str | None:
     """Normalize user-facing model names to implemented candidate identifiers."""
     normalized = requested_model_family.strip().lower().replace("-", "_")
@@ -44,6 +52,15 @@ def normalize_candidate_model_family(requested_model_family: str) -> str | None:
         "ridge": "linear_ridge",
         "linear": "linear_ridge",
         "incremental_linear_surrogate": "linear_ridge",
+        "lagged_linear": "lagged_linear",
+        "lagged": "lagged_linear",
+        "temporal_linear": "lagged_linear",
+        "arx": "lagged_linear",
+        "lagged_tree_ensemble": "lagged_tree_ensemble",
+        "lagged_tree": "lagged_tree_ensemble",
+        "lag_window_tree": "lagged_tree_ensemble",
+        "temporal_tree": "lagged_tree_ensemble",
+        "temporal_tree_ensemble": "lagged_tree_ensemble",
         "bagged_tree_ensemble": "bagged_tree_ensemble",
         "tree_ensemble": "bagged_tree_ensemble",
         "tree_ensemble_candidate": "bagged_tree_ensemble",
@@ -65,6 +82,7 @@ def train_surrogate_candidates(
     missing_data_strategy: str = "fill_median",
     fill_constant_value: float | None = None,
     compare_against_baseline: bool = True,
+    lag_horizon_samples: int | None = None,
     run_id: str | None = None,
     checkpoint_tag: str | None = None,
     data_references: list[str] | None = None,
@@ -105,6 +123,7 @@ def train_surrogate_candidates(
         target_column=target_column,
     )
     linear_rows_used = linear_model.fit_dataframe(prepared_frames["train"])
+    rows_used_by_model: dict[str, int] = {"linear_ridge": int(linear_rows_used)}
     linear_candidate = _candidate_metrics_from_model(
         model_family="linear_ridge",
         model=linear_model,
@@ -116,11 +135,65 @@ def train_surrogate_candidates(
     if requested is None:
         raise ValueError(
             "Requested model is not implemented. "
-            "Supported: auto, linear_ridge/ridge/linear, "
+            "Supported: auto, linear_ridge/ridge/linear, lagged_linear/lagged/temporal_linear/arx, "
+            "lagged_tree_ensemble/lagged_tree/lag_window_tree/temporal_tree, "
             "bagged_tree_ensemble/tree/tree_ensemble/extra_trees/hist_gradient_boosting."
         )
 
     candidates: list[CandidateMetrics] = [linear_candidate]
+    lagged_model: LaggedLinearSurrogate | None = None
+    lagged_horizon = _resolve_lag_horizon(
+        data_mode=data_mode,
+        requested=requested,
+        lag_horizon_samples=lag_horizon_samples,
+        split=split,
+    )
+    if requested in {"lagged_linear", "lagged_tree_ensemble"} and lagged_horizon is None:
+        raise ValueError(
+            "Lagged model families require time-series structure and a usable timestamp column."
+        )
+    if lagged_horizon is not None and (compare_against_baseline or requested == "lagged_linear"):
+        lagged_model = LaggedLinearSurrogate(
+            feature_columns=feature_columns,
+            target_column=target_column,
+            lag_horizon=lagged_horizon,
+        )
+        lagged_rows_used = lagged_model.fit_dataframe(prepared_frames["train"])
+        rows_used_by_model["lagged_linear"] = int(lagged_rows_used)
+        candidates.append(
+            _candidate_metrics_with_context(
+                model_family="lagged_linear",
+                model=lagged_model,
+                frames=prepared_frames,
+                notes=(
+                    "Lagged tabular ridge baseline with current and historical predictor windows. "
+                    f"Lag horizon={lagged_horizon} samples. Train rows used={lagged_rows_used}."
+                ),
+            )
+        )
+
+    lagged_tree_model: LaggedTreeEnsembleSurrogate | None = None
+    if lagged_horizon is not None and (compare_against_baseline or requested == "lagged_tree_ensemble"):
+        lagged_tree_model = LaggedTreeEnsembleSurrogate(
+            feature_columns=feature_columns,
+            target_column=target_column,
+            lag_horizon=lagged_horizon,
+        )
+        lagged_tree_rows_used = lagged_tree_model.fit_dataframe(prepared_frames["train"])
+        rows_used_by_model["lagged_tree_ensemble"] = int(lagged_tree_rows_used)
+        candidates.append(
+            _candidate_metrics_with_context(
+                model_family="lagged_tree_ensemble",
+                model=lagged_tree_model,
+                frames=prepared_frames,
+                notes=(
+                    "Lag-window bagged depth-limited regression trees over current and historical "
+                    f"predictor windows. Lag horizon={lagged_horizon} samples. "
+                    f"Train rows used={lagged_tree_rows_used}."
+                ),
+            )
+        )
+
     tree_model: BaggedTreeEnsembleSurrogate | None = None
     if compare_against_baseline or requested == "bagged_tree_ensemble":
         tree_model = BaggedTreeEnsembleSurrogate(
@@ -128,6 +201,7 @@ def train_surrogate_candidates(
             target_column=target_column,
         )
         tree_rows_used = tree_model.fit_dataframe(prepared_frames["train"])
+        rows_used_by_model["bagged_tree_ensemble"] = int(tree_rows_used)
         tree_notes = (
             "Bagged depth-limited regression trees as the first nonlinear local baseline. "
             f"Train rows used={tree_rows_used}."
@@ -150,6 +224,10 @@ def train_surrogate_candidates(
     selected_model_obj: Any
     if selected_model_name == "linear_ridge":
         selected_model_obj = linear_model
+    elif selected_model_name == "lagged_linear" and lagged_model is not None:
+        selected_model_obj = lagged_model
+    elif selected_model_name == "lagged_tree_ensemble" and lagged_tree_model is not None:
+        selected_model_obj = lagged_tree_model
     elif selected_model_name == "bagged_tree_ensemble" and tree_model is not None:
         selected_model_obj = tree_model
     else:
@@ -172,6 +250,8 @@ def train_surrogate_candidates(
         best_params=_best_params_payload(
             selected_model_name=selected_model_name,
             linear_rows_used=linear_rows_used,
+            lagged_model=lagged_model,
+            lagged_tree_model=lagged_tree_model,
             tree_model=tree_model,
             requested=requested,
         ),
@@ -185,6 +265,7 @@ def train_surrogate_candidates(
             "selected_model_family": selected_candidate.model_family,
             "best_validation_model_family": best_by_validation.model_family,
             "data_mode": data_mode,
+            "lag_horizon_samples": int(lagged_horizon) if lagged_horizon is not None else 0,
             "split": split.to_dict(),
             "preprocessing": preprocessing,
             "comparison": [item.to_dict() for item in candidates],
@@ -221,7 +302,9 @@ def train_surrogate_candidates(
         "run_dir": str(run_dir),
         "model_state_path": str(model_state_path),
         "model_params_path": str(params_path),
-        "rows_used": int(prepared_frames["train"].shape[0]),
+        "lag_horizon_samples": int(lagged_horizon) if lagged_horizon is not None else 0,
+        "rows_used": int(rows_used_by_model.get(selected_model_name, prepared_frames["train"].shape[0])),
+        "rows_used_by_model": rows_used_by_model,
         "selected_metrics": {
             "train": selected_candidate.train_metrics,
             "validation": selected_candidate.validation_metrics,
@@ -317,6 +400,214 @@ class BaggedTreeEnsembleSurrogate:
         return write_json(output, self.state_dict(), indent=2)
 
 
+class LaggedLinearSurrogate:
+    """Linear surrogate over current and lagged predictor windows."""
+
+    def __init__(
+        self,
+        *,
+        feature_columns: list[str],
+        target_column: str,
+        lag_horizon: int = 3,
+        ridge: float = 1e-8,
+    ) -> None:
+        if not feature_columns:
+            raise ValueError("feature_columns cannot be empty.")
+        if int(lag_horizon) <= 0:
+            raise ValueError("lag_horizon must be > 0.")
+        self.feature_columns = list(feature_columns)
+        self.target_column = target_column
+        self.lag_horizon = int(lag_horizon)
+        self.ridge = float(ridge)
+        self._lagged_feature_columns = _lagged_feature_names(
+            feature_columns=self.feature_columns,
+            lag_horizon=self.lag_horizon,
+        )
+        self._delegate: IncrementalLinearSurrogate | None = None
+
+    def fit_dataframe(self, frame: pd.DataFrame) -> int:
+        lagged = _build_lagged_design_frame(
+            frame=frame,
+            feature_columns=self.feature_columns,
+            target_column=self.target_column,
+            lag_horizon=self.lag_horizon,
+        )
+        if lagged.shape[0] == 0:
+            raise ValueError("No valid rows available after lagged feature construction.")
+        self._delegate = IncrementalLinearSurrogate(
+            feature_columns=list(self._lagged_feature_columns),
+            target_column=self.target_column,
+            ridge=self.ridge,
+        )
+        return self._delegate.fit_dataframe(lagged)
+
+    def predict_dataframe(
+        self,
+        frame: pd.DataFrame,
+        *,
+        context_frame: pd.DataFrame | None = None,
+    ) -> np.ndarray:
+        lagged = self._lagged_frame(frame=frame, context_frame=context_frame)
+        if lagged.shape[0] == 0:
+            raise ValueError("Lagged prediction frame is empty for the requested split.")
+        return self._require_delegate().predict_dataframe(lagged)
+
+    def evaluate_dataframe(
+        self,
+        frame: pd.DataFrame,
+        *,
+        context_frame: pd.DataFrame | None = None,
+    ) -> dict[str, float]:
+        lagged = self._lagged_frame(frame=frame, context_frame=context_frame)
+        if lagged.shape[0] == 0:
+            raise ValueError("Lagged evaluation frame is empty for the requested split.")
+        return self._require_delegate().evaluate_dataframe(lagged)
+
+    def state_dict(self) -> dict[str, Any]:
+        delegate = self._require_delegate()
+        return {
+            "model_name": "lagged_linear",
+            "feature_columns": list(self.feature_columns),
+            "target_column": self.target_column,
+            "lag_horizon": int(self.lag_horizon),
+            "ridge": float(self.ridge),
+            "lagged_feature_columns": list(self._lagged_feature_columns),
+            "linear_state": delegate.state_dict(),
+        }
+
+    def save(self, path: str | Path) -> Path:
+        output = Path(path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        return write_json(output, self.state_dict(), indent=2)
+
+    def _lagged_frame(
+        self,
+        *,
+        frame: pd.DataFrame,
+        context_frame: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        return _build_lagged_design_frame(
+            frame=frame,
+            feature_columns=self.feature_columns,
+            target_column=self.target_column,
+            lag_horizon=self.lag_horizon,
+            context_frame=context_frame,
+        )
+
+    def _require_delegate(self) -> IncrementalLinearSurrogate:
+        if self._delegate is None:
+            raise RuntimeError("Lagged linear surrogate has not been fitted yet.")
+        return self._delegate
+
+
+class LaggedTreeEnsembleSurrogate:
+    """Tree ensemble over current and lagged predictor windows."""
+
+    def __init__(
+        self,
+        *,
+        feature_columns: list[str],
+        target_column: str,
+        lag_horizon: int = 3,
+        n_estimators: int = 12,
+        max_depth: int = 4,
+        min_leaf: int = 6,
+    ) -> None:
+        if not feature_columns:
+            raise ValueError("feature_columns cannot be empty.")
+        if int(lag_horizon) <= 0:
+            raise ValueError("lag_horizon must be > 0.")
+        self.feature_columns = list(feature_columns)
+        self.target_column = target_column
+        self.lag_horizon = int(lag_horizon)
+        self.n_estimators = int(n_estimators)
+        self.max_depth = int(max_depth)
+        self.min_leaf = int(min_leaf)
+        self._lagged_feature_columns = _lagged_feature_names(
+            feature_columns=self.feature_columns,
+            lag_horizon=self.lag_horizon,
+        )
+        self._delegate: BaggedTreeEnsembleSurrogate | None = None
+
+    def fit_dataframe(self, frame: pd.DataFrame) -> int:
+        lagged = _build_lagged_design_frame(
+            frame=frame,
+            feature_columns=self.feature_columns,
+            target_column=self.target_column,
+            lag_horizon=self.lag_horizon,
+        )
+        if lagged.shape[0] == 0:
+            raise ValueError("No valid rows available after lagged feature construction.")
+        self._delegate = BaggedTreeEnsembleSurrogate(
+            feature_columns=list(self._lagged_feature_columns),
+            target_column=self.target_column,
+            n_estimators=self.n_estimators,
+            max_depth=self.max_depth,
+            min_leaf=self.min_leaf,
+        )
+        return self._delegate.fit_dataframe(lagged)
+
+    def predict_dataframe(
+        self,
+        frame: pd.DataFrame,
+        *,
+        context_frame: pd.DataFrame | None = None,
+    ) -> np.ndarray:
+        lagged = self._lagged_frame(frame=frame, context_frame=context_frame)
+        if lagged.shape[0] == 0:
+            raise ValueError("Lagged prediction frame is empty for the requested split.")
+        return self._require_delegate().predict_dataframe(lagged)
+
+    def evaluate_dataframe(
+        self,
+        frame: pd.DataFrame,
+        *,
+        context_frame: pd.DataFrame | None = None,
+    ) -> dict[str, float]:
+        lagged = self._lagged_frame(frame=frame, context_frame=context_frame)
+        if lagged.shape[0] == 0:
+            raise ValueError("Lagged evaluation frame is empty for the requested split.")
+        return self._require_delegate().evaluate_dataframe(lagged)
+
+    def state_dict(self) -> dict[str, Any]:
+        delegate = self._require_delegate()
+        return {
+            "model_name": "lagged_tree_ensemble",
+            "feature_columns": list(self.feature_columns),
+            "target_column": self.target_column,
+            "lag_horizon": int(self.lag_horizon),
+            "n_estimators": int(self.n_estimators),
+            "max_depth": int(self.max_depth),
+            "min_leaf": int(self.min_leaf),
+            "lagged_feature_columns": list(self._lagged_feature_columns),
+            "tree_state": delegate.state_dict(),
+        }
+
+    def save(self, path: str | Path) -> Path:
+        output = Path(path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        return write_json(output, self.state_dict(), indent=2)
+
+    def _lagged_frame(
+        self,
+        *,
+        frame: pd.DataFrame,
+        context_frame: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        return _build_lagged_design_frame(
+            frame=frame,
+            feature_columns=self.feature_columns,
+            target_column=self.target_column,
+            lag_horizon=self.lag_horizon,
+            context_frame=context_frame,
+        )
+
+    def _require_delegate(self) -> BaggedTreeEnsembleSurrogate:
+        if self._delegate is None:
+            raise RuntimeError("Lagged tree ensemble has not been fitted yet.")
+        return self._delegate
+
+
 def _candidate_metrics_from_model(
     *,
     model_family: str,
@@ -335,12 +626,37 @@ def _candidate_metrics_from_model(
     )
 
 
+def _candidate_metrics_with_context(
+    *,
+    model_family: str,
+    model: Any,
+    frames: dict[str, pd.DataFrame],
+    notes: str,
+) -> CandidateMetrics:
+    train_metrics = model.evaluate_dataframe(frames["train"])
+    validation_metrics = model.evaluate_dataframe(
+        frames["validation"],
+        context_frame=frames["train"],
+    )
+    test_metrics = model.evaluate_dataframe(
+        frames["test"],
+        context_frame=pd.concat([frames["train"], frames["validation"]], ignore_index=True),
+    )
+    return CandidateMetrics(
+        model_family=model_family,
+        train_metrics={k: float(v) for k, v in train_metrics.items()},
+        validation_metrics={k: float(v) for k, v in validation_metrics.items()},
+        test_metrics={k: float(v) for k, v in test_metrics.items()},
+        notes=notes,
+    )
+
+
 def _select_best_candidate(candidates: list[CandidateMetrics]) -> CandidateMetrics:
     ranked = sorted(
         candidates,
         key=lambda item: (
             float(item.validation_metrics.get("mae", float("inf"))),
-            0 if item.model_family == "linear_ridge" else 1,
+            _MODEL_TIEBREAK.get(item.model_family, 9),
         ),
     )
     return ranked[0]
@@ -369,6 +685,8 @@ def _best_params_payload(
     *,
     selected_model_name: str,
     linear_rows_used: int,
+    lagged_model: LaggedLinearSurrogate | None,
+    lagged_tree_model: LaggedTreeEnsembleSurrogate | None,
     tree_model: BaggedTreeEnsembleSurrogate | None,
     requested: str,
 ) -> dict[str, Any]:
@@ -378,6 +696,22 @@ def _best_params_payload(
             "ridge": 1e-8,
             "training_rows_used": int(linear_rows_used),
         }
+    if selected_model_name == "lagged_linear" and lagged_model is not None:
+        return {
+            "requested_model_family": requested,
+            "ridge": float(lagged_model.ridge),
+            "lag_horizon_samples": int(lagged_model.lag_horizon),
+            "training_feature_count": int(len(lagged_model._lagged_feature_columns)),
+        }
+    if selected_model_name == "lagged_tree_ensemble" and lagged_tree_model is not None:
+        return {
+            "requested_model_family": requested,
+            "lag_horizon_samples": int(lagged_tree_model.lag_horizon),
+            "n_estimators": int(lagged_tree_model.n_estimators),
+            "max_depth": int(lagged_tree_model.max_depth),
+            "min_leaf": int(lagged_tree_model.min_leaf),
+            "training_feature_count": int(len(lagged_tree_model._lagged_feature_columns)),
+        }
     if tree_model is not None:
         return {
             "requested_model_family": requested,
@@ -386,6 +720,25 @@ def _best_params_payload(
             "min_leaf": int(tree_model.min_leaf),
         }
     return {"requested_model_family": requested}
+
+
+def _resolve_lag_horizon(
+    *,
+    data_mode: str,
+    requested: str,
+    lag_horizon_samples: int | None,
+    split: DatasetSplit,
+) -> int | None:
+    if data_mode != "time_series":
+        return None
+    max_safe = max(1, min(12, int(split.train_indices.size) - 2))
+    if max_safe <= 0:
+        return None
+    if lag_horizon_samples is not None:
+        return max(1, min(int(lag_horizon_samples), max_safe))
+    if requested == "lagged_linear":
+        return min(4, max_safe)
+    return min(3, max_safe)
 
 
 def _infer_data_mode(*, frame: pd.DataFrame, timestamp_column: str | None) -> str:
@@ -476,6 +829,50 @@ def _prepare_xy(
     x = subset[feature_columns].to_numpy(dtype=float)
     y = subset[target_column].to_numpy(dtype=float)
     return x, y
+
+
+def _lagged_feature_names(*, feature_columns: list[str], lag_horizon: int) -> list[str]:
+    names: list[str] = []
+    for col in feature_columns:
+        names.append(f"{col}__t")
+        for lag in range(1, int(lag_horizon) + 1):
+            names.append(f"{col}__lag{lag}")
+    return names
+
+
+def _build_lagged_design_frame(
+    *,
+    frame: pd.DataFrame,
+    feature_columns: list[str],
+    target_column: str,
+    lag_horizon: int,
+    context_frame: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    required = list(feature_columns) + [target_column]
+    _require_columns(frame, required)
+    if context_frame is not None:
+        _require_columns(context_frame, required)
+    context_len = int(len(context_frame)) if context_frame is not None else 0
+    if context_frame is not None and context_len > 0:
+        combined = pd.concat(
+            [context_frame[required], frame[required]],
+            ignore_index=True,
+        )
+    else:
+        combined = frame[required].copy().reset_index(drop=True)
+
+    out = pd.DataFrame(index=combined.index)
+    for col in feature_columns:
+        numeric = pd.to_numeric(combined[col], errors="coerce")
+        out[f"{col}__t"] = numeric
+        for lag in range(1, int(lag_horizon) + 1):
+            out[f"{col}__lag{lag}"] = numeric.shift(lag)
+    out[target_column] = pd.to_numeric(combined[target_column], errors="coerce")
+    out["_is_current"] = False
+    out.loc[context_len:, "_is_current"] = True
+    out = out.dropna()
+    out = out[out["_is_current"]].drop(columns=["_is_current"]).reset_index(drop=True)
+    return out
 
 
 def _prepare_feature_matrix(*, frame: pd.DataFrame, feature_columns: list[str]) -> np.ndarray:

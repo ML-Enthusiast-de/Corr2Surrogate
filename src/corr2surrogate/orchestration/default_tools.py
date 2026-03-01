@@ -203,8 +203,9 @@ def build_default_registry() -> ToolRegistry:
     registry.register_function(
         name="train_surrogate_candidates",
         description=(
-            "Run split-safe train/validation/test training for the linear baseline and "
-            "the first nonlinear baseline, compare them, and persist the selected model."
+            "Run split-safe train/validation/test training for the linear baseline, "
+            "the lagged temporal baselines when applicable, and the first "
+            "nonlinear baselines, compare them, and persist the selected model."
         ),
         input_schema={
             "type": "object",
@@ -224,6 +225,7 @@ def build_default_registry() -> ToolRegistry:
                 "missing_data_strategy": {"type": "string"},
                 "fill_constant_value": {"type": "number"},
                 "compare_against_baseline": {"type": "boolean"},
+                "lag_horizon_samples": {"type": "integer"},
             },
             "required": ["data_path", "target_column", "feature_columns", "requested_model_family"],
             "additionalProperties": False,
@@ -734,6 +736,7 @@ def _tool_train_surrogate_candidates(
     missing_data_strategy: str = "fill_median",
     fill_constant_value: float | None = None,
     compare_against_baseline: bool = True,
+    lag_horizon_samples: int | None = None,
 ) -> dict[str, Any]:
     frame = _load_frame(data_path=data_path, sheet_name=sheet_name)
     result = train_surrogate_candidates(
@@ -746,6 +749,7 @@ def _tool_train_surrogate_candidates(
         missing_data_strategy=missing_data_strategy,
         fill_constant_value=fill_constant_value,
         compare_against_baseline=compare_against_baseline,
+        lag_horizon_samples=lag_horizon_samples,
         run_id=run_id,
         checkpoint_tag=checkpoint_tag,
         data_references=[data_path],

@@ -170,6 +170,8 @@ Agent 1 now emits a model-strategy prior for each target. Agent 2 should treat t
 
 Current executable model families:
 - `linear_ridge`
+- `lagged_linear`
+- `lagged_tree_ensemble`
 - `bagged_tree_ensemble`
 
 Recommended model families to implement next:
@@ -212,8 +214,8 @@ This is the planned implementation order to maximize practical value while keepi
    - Optuna only after the deterministic training pipeline is correct
 
 Current state:
-- steps 2-4 are now implemented in the first modeler path
-- the next highest-value gap is richer handoff execution plus lagged/time-aware training
+- steps 1-5 are now implemented in the first modeler path
+- the next highest-value gap is extending the handoff into full acceptance-loop execution and adding stronger temporal/nonlinear families beyond the current baselines
 
 ## Modeling Entry Modes
 Two user entry paths are part of the intended product behavior:
@@ -223,7 +225,7 @@ Two user entry paths are part of the intended product behavior:
    - pass Agent 1 recommendations into Agent 2 as a prior
 2. Direct modeler mode (skip Agent 1):
    - user may immediately ask Agent 2 to build a model with explicit inputs and target
-   - current executable implementation supports `auto`, `linear_ridge`, and `bagged_tree_ensemble`
+   - current executable implementation supports `auto`, `linear_ridge`, `lagged_linear`, `lagged_tree_ensemble`, and `bagged_tree_ensemble`
    - example intent: "build model `linear_ridge` with inputs `A,B,C` and target `D`"
    - this fast path should not require a prior Agent 1 handoff
 
@@ -237,8 +239,8 @@ Example direct modeler request:
 - `build model tree with inputs torque,temp,flow and target pressure`
 
 Current implementation note:
-- the direct modeler session currently executes `auto`, `linear_ridge` / `ridge` / `linear`, and `bagged_tree_ensemble` / `tree`
-- the modeler CLI now runs a split-safe comparison between the linear baseline and the tree baseline, prints staged progress updates, then uses the LLM to interpret the result after training
+- the direct modeler session currently executes `auto`, `linear_ridge` / `ridge` / `linear`, `lagged_linear` / `lagged` / `temporal_linear` / `arx`, `lagged_tree_ensemble` / `lagged_tree` / `lag_window_tree` / `temporal_tree`, and `bagged_tree_ensemble` / `tree`
+- the modeler CLI now runs a split-safe comparison between the linear baseline and the available temporal/nonlinear comparators, performs a bounded acceptance check, optionally retries with the next safe family when policy allows it, and uses the LLM to interpret the final measured result
 
 ## User Override Rules For Agent 2
 Even when a valid Agent 1 handoff exists, the user must remain in control of the modeling scope.

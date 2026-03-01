@@ -12,6 +12,7 @@ from typing import Any, Callable
 from corr2surrogate.core.json_utils import dumps_json
 from corr2surrogate.modeling import normalize_candidate_model_family
 from corr2surrogate.orchestration.default_tools import build_default_registry
+from corr2surrogate.orchestration.handoff_contract import build_agent2_handoff_from_report_payload
 from corr2surrogate.orchestration.harness_runner import run_local_agent_once
 from corr2surrogate.orchestration.local_llm_setup import setup_local_llm
 from corr2surrogate.security.git_guard import main as git_guard_main
@@ -453,12 +454,14 @@ def _run_agent_session(
         )
         print(
             "agent> Direct build syntax: "
-            "`build model linear_ridge with inputs A,B,C and target D`."
+            "`build model linear_ridge with inputs A,B,C and target D` "
+            "or `build model lagged_linear with inputs A,B and target C`."
         )
         print(
             "agent> Current executable models: `auto`, `linear_ridge`, "
-            "`bagged_tree_ensemble` "
-            "(aliases include `ridge`, `linear`, `tree`, `tree_ensemble`, "
+            "`lagged_linear`, `lagged_tree_ensemble`, `bagged_tree_ensemble` "
+            "(aliases include `ridge`, `linear`, `lagged`, `temporal_linear`, `arx`, "
+            "`lagged_tree`, `lag_window_tree`, `temporal_tree`, `tree`, `tree_ensemble`, "
             "`extra_trees`, `hist_gradient_boosting`)."
         )
         print(
@@ -548,12 +551,14 @@ def _run_agent_session(
                 )
                 print(
                     "agent> Direct build syntax: "
-                    "`build model linear_ridge with inputs A,B,C and target D`."
+                    "`build model linear_ridge with inputs A,B,C and target D` "
+                    "or `build model lagged_linear with inputs A,B and target C`."
                 )
                 print(
                     "agent> Current executable models: `auto`, `linear_ridge`, "
-                    "`bagged_tree_ensemble` "
-                    "(aliases include `ridge`, `linear`, `tree`, `tree_ensemble`, "
+                    "`lagged_linear`, `lagged_tree_ensemble`, `bagged_tree_ensemble` "
+                    "(aliases include `ridge`, `linear`, `lagged`, `temporal_linear`, `arx`, "
+                    "`lagged_tree`, `lag_window_tree`, `temporal_tree`, `tree`, `tree_ensemble`, "
                     "`extra_trees`, `hist_gradient_boosting`)."
                 )
                 print(
@@ -1126,6 +1131,7 @@ def _run_modeler_autopilot_turn(
 
         build_request = _modeler_request_from_handoff(
             payload=handoff["payload"],
+            handoff=handoff["handoff"],
             available_signals=list(dataset.get("signal_columns", [])),
         )
         if build_request is None:
@@ -1139,6 +1145,14 @@ def _run_modeler_autopilot_turn(
                 "event": {"status": "respond", "message": response, "error": "handoff_parse_error"},
             }
 
+        session_context["active_handoff"] = handoff["handoff"]
+        handoff_info = handoff["handoff"]
+        print(
+            "agent> Handoff contract: "
+            f"data_mode=`{handoff_info.get('dataset_profile', {}).get('data_mode', 'n/a')}`, "
+            f"split=`{handoff_info.get('split_strategy', 'n/a')}`, "
+            f"acceptance={handoff_info.get('acceptance_criteria', {})}."
+        )
         print(
             "agent> Handoff suggestion: "
             f"target=`{build_request['target_raw']}`, "
@@ -1386,11 +1400,20 @@ def _parse_modeler_build_request(user_message: str) -> dict[str, Any] | None:
     if not feature_raw or not target_raw:
         return None
     data_path = _extract_first_data_path(user_message)
+    requested_model_family = match.group("model").strip()
+    normalized_model = _normalize_modeler_model_family(requested_model_family)
     return {
-        "requested_model_family": match.group("model").strip(),
+        "requested_model_family": requested_model_family,
         "feature_raw": feature_raw,
         "target_raw": target_raw,
         "data_path": str(data_path) if data_path is not None else "",
+        "acceptance_criteria": {"r2": 0.70},
+        "loop_policy": {
+            "enabled": True,
+            "max_attempts": 2,
+            "allow_architecture_switch": True,
+        },
+        "user_locked_model_family": normalized_model not in {None, "auto"},
         "source": "direct",
     }
 
@@ -1486,7 +1509,9 @@ def _execute_modeler_build_request(
         response = (
             f"Requested model `{requested_model}` is not implemented yet. "
             "Currently available: `auto`, `linear_ridge` "
-            "(aliases: `ridge`, `linear`, `incremental_linear_surrogate`), and "
+            "(aliases: `ridge`, `linear`, `incremental_linear_surrogate`), "
+            "`lagged_linear` (aliases: `lagged`, `temporal_linear`, `arx`), "
+            "`lagged_tree_ensemble` (aliases: `lagged_tree`, `lag_window_tree`, `temporal_tree`), and "
             "`bagged_tree_ensemble` (aliases: `tree`, `tree_ensemble`, `extra_trees`, `hist_gradient_boosting`)."
         )
         print(f"agent> {response}")
@@ -1496,36 +1521,168 @@ def _execute_modeler_build_request(
             "event": {"status": "respond", "message": response, "error": "model_not_implemented"},
         }
 
+    requested_normalize = bool(build_request.get("normalize", True))
+    missing_data_strategy = str(build_request.get("missing_data_strategy", "fill_median")).strip() or "fill_median"
+    fill_constant_value = build_request.get("fill_constant_value")
+    compare_against_baseline = bool(build_request.get("compare_against_baseline", True))
+    lag_horizon_samples = build_request.get("lag_horizon_samples")
+    timestamp_column = str(
+        build_request.get("timestamp_column")
+        or dataset.get("timestamp_column_hint")
+        or ""
+    ).strip() or None
+    acceptance_criteria = _safe_acceptance_criteria(build_request.get("acceptance_criteria"))
+    loop_policy = _safe_loop_policy(build_request.get("loop_policy"))
+    user_locked_model_family = bool(build_request.get("user_locked_model_family", False))
+    raw_search_order = [str(item).strip() for item in build_request.get("model_search_order", []) if str(item).strip()]
+
     print(
         "agent> Training request: "
         f"model=`{resolved_model}`, target=`{target}`, inputs={features}."
     )
-    print("agent> Step 1/3: building split-safe train/validation/test partitions.")
-    print("agent> Step 2/3: fitting train-only preprocessing (missing-data handling and optional normalization).")
-    print("agent> Step 3/3: training the linear baseline and nonlinear comparator, then selecting the requested/best candidate.")
-    tool_args: dict[str, Any] = {
-        "data_path": str(dataset.get("data_path", "")),
-        "target_column": target,
-        "feature_columns": features,
-        "requested_model_family": resolved_model,
-        "sheet_name": dataset.get("sheet_name"),
-        "timestamp_column": dataset.get("timestamp_column_hint"),
-        "checkpoint_tag": "modeler_session",
-        "normalize": True,
-        "missing_data_strategy": "fill_median",
-        "compare_against_baseline": True,
-    }
-    training = _execute_registry_tool(registry, "train_surrogate_candidates", tool_args)
-    if str(training.get("status", "")).lower() != "ok":
-        response = str(training.get("message") or "Model training failed.")
+    if build_request.get("source") == "handoff" and raw_search_order:
+        print(
+            "agent> Handoff prior: "
+            f"search_order={raw_search_order}, normalize={requested_normalize}, "
+            f"missing_data={missing_data_strategy}."
+        )
+    if timestamp_column:
+        print(f"agent> Timestamp context: using `{timestamp_column}` for data-mode-aware splitting.")
+
+    attempt = 1
+    max_attempts = int(loop_policy.get("max_attempts", 2))
+    allow_loop = bool(loop_policy.get("enabled", True))
+    allow_architecture_switch = bool(loop_policy.get("allow_architecture_switch", True))
+    current_requested_model = resolved_model
+    tried_models: set[str] = set()
+    last_training: dict[str, Any] | None = None
+    last_loop_eval: dict[str, Any] | None = None
+
+    while True:
+        tried_models.add(current_requested_model)
+        print(
+            f"agent> Attempt {attempt}/{max_attempts}: requested candidate family `{current_requested_model}`."
+        )
+        print("agent> Step 1/3: building split-safe train/validation/test partitions.")
+        print("agent> Step 2/3: fitting train-only preprocessing (missing-data handling and optional normalization).")
+        print(
+            "agent> Step 3/3: training the linear baseline and available temporal/nonlinear comparators, "
+            "then selecting the requested/best candidate."
+        )
+        tool_args = _modeler_training_tool_args(
+            dataset=dataset,
+            target=target,
+            features=features,
+            requested_model_family=current_requested_model,
+            timestamp_column=timestamp_column,
+            requested_normalize=requested_normalize,
+            missing_data_strategy=missing_data_strategy,
+            fill_constant_value=fill_constant_value,
+            compare_against_baseline=compare_against_baseline,
+            lag_horizon_samples=lag_horizon_samples,
+            checkpoint_tag=f"modeler_session_attempt_{attempt}",
+        )
+        try:
+            training = _execute_registry_tool(registry, "train_surrogate_candidates", tool_args)
+        except Exception as exc:
+            response = str(exc).strip() or _runtime_error_fallback_message(
+                agent="modeler",
+                user_message=f"train {current_requested_model}",
+                error=exc,
+            )
+            print(f"agent> {response}")
+            return {
+                "response": response,
+                "event": {"status": "respond", "message": response, "error": "training_runtime_error"},
+            }
+        if str(training.get("status", "")).lower() != "ok":
+            response = str(training.get("message") or "Model training failed.")
+            print(f"agent> {response}")
+            return {
+                "response": response,
+                "event": {"status": "respond", "message": response, "error": "training_failed"},
+            }
+
+        last_training = training
+        _print_modeler_training_summary(training=training)
+        metrics_payload = _build_model_loop_metrics(training)
+        try:
+            loop_eval = _execute_registry_tool(
+                registry,
+                "evaluate_training_iteration",
+                {
+                    "metrics": metrics_payload,
+                    "acceptance_criteria": acceptance_criteria,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                },
+            )
+        except Exception:
+            loop_eval = {
+                "should_continue": False,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "unmet_criteria": [],
+                "recommendations": [],
+                "summary": "Acceptance loop evaluation failed; keeping the current measured result.",
+            }
+        last_loop_eval = loop_eval if isinstance(loop_eval, dict) else {}
+        if last_loop_eval:
+            summary_line = str(last_loop_eval.get("summary", "")).strip()
+            if summary_line:
+                print(f"agent> Acceptance check: {summary_line}")
+            unmet = last_loop_eval.get("unmet_criteria")
+            if isinstance(unmet, list) and unmet:
+                print(f"agent> Unmet criteria: {', '.join(str(item) for item in unmet)}.")
+            recommendations = last_loop_eval.get("recommendations")
+            if isinstance(recommendations, list):
+                for rec in recommendations[:3]:
+                    text = str(rec).strip()
+                    if text:
+                        print(f"agent> Loop recommendation: {text}")
+
+        should_continue = bool((last_loop_eval or {}).get("should_continue", False))
+        if not allow_loop:
+            should_continue = False
+        if user_locked_model_family and current_requested_model != "auto":
+            if should_continue:
+                print(
+                    "agent> Architecture auto-switch is disabled because this model family was explicitly chosen by the user."
+                )
+            should_continue = False
+        if not allow_architecture_switch:
+            should_continue = False
+        if not should_continue:
+            break
+
+        next_model = _choose_model_retry_candidate(
+            training=training,
+            current_model_family=current_requested_model,
+            model_search_order=raw_search_order,
+            tried_models=tried_models,
+        )
+        if next_model is None:
+            print(
+                "agent> No additional safe model-family retry is available from the current comparison set."
+            )
+            break
+        attempt += 1
+        if attempt > max_attempts:
+            break
+        current_requested_model = next_model
+        print(
+            f"agent> Continuing bounded optimization loop with `{current_requested_model}` as the next retry."
+        )
+
+    if last_training is None:
+        response = "Model training did not produce a usable result."
         print(f"agent> {response}")
         return {
             "response": response,
-            "event": {"status": "respond", "message": response, "error": "training_failed"},
+            "event": {"status": "respond", "message": response, "error": "training_unavailable"},
         }
 
-    split_info = training.get("split") if isinstance(training.get("split"), dict) else {}
-    preprocessing = training.get("preprocessing") if isinstance(training.get("preprocessing"), dict) else {}
+    training = last_training
     selected_metrics_bundle = (
         training.get("selected_metrics") if isinstance(training.get("selected_metrics"), dict) else {}
     )
@@ -1535,37 +1692,10 @@ def _execute_modeler_build_request(
         else {}
     )
     comparison = training.get("comparison") if isinstance(training.get("comparison"), list) else []
-    print(
-        "agent> Split-safe pipeline: "
-        f"strategy={split_info.get('strategy', 'n/a')}, "
-        f"train={split_info.get('train_size', 'n/a')}, "
-        f"val={split_info.get('validation_size', 'n/a')}, "
-        f"test={split_info.get('test_size', 'n/a')}."
-    )
-    print(
-        "agent> Preprocessing policy: "
-        f"requested={preprocessing.get('missing_data_strategy_requested', 'n/a')}, "
-        f"effective={preprocessing.get('missing_data_strategy_effective', 'n/a')}, "
-        f"normalization={((training.get('normalization') or {}).get('method', 'none'))}."
-    )
-    if comparison:
-        for item in comparison:
-            if not isinstance(item, dict):
-                continue
-            val_metrics = item.get("validation_metrics") if isinstance(item.get("validation_metrics"), dict) else {}
-            test_metrics_item = item.get("test_metrics") if isinstance(item.get("test_metrics"), dict) else {}
-            print(
-                "agent> Candidate "
-                f"`{item.get('model_family', 'n/a')}`: "
-                f"val_r2={_fmt_metric(val_metrics.get('r2'))}, "
-                f"val_mae={_fmt_metric(val_metrics.get('mae'))}, "
-                f"test_r2={_fmt_metric(test_metrics_item.get('r2'))}, "
-                f"test_mae={_fmt_metric(test_metrics_item.get('mae'))}."
-            )
-
     summary = (
         "Model build complete: "
         f"requested_model={resolved_model}, "
+        f"final_attempt_model={current_requested_model}, "
         f"selected_model={training.get('selected_model_family', 'n/a')}, "
         f"best_validation_model={training.get('best_validation_model_family', 'n/a')}, "
         f"target={target}, "
@@ -1583,7 +1713,7 @@ def _execute_modeler_build_request(
         interpretation = _generate_modeling_interpretation(
             training=training,
             target_signal=target,
-            requested_model_family=resolved_model,
+            requested_model_family=current_requested_model,
             chat_reply_only=chat_reply_only,
         )
         if interpretation:
@@ -1597,9 +1727,12 @@ def _execute_modeler_build_request(
         "target_signal": target,
         "feature_signals": features,
         "requested_model_family": requested_model,
-        "resolved_model_family": training.get("selected_model_family", resolved_model),
+        "final_attempt_model_family": current_requested_model,
+        "resolved_model_family": training.get("selected_model_family", current_requested_model),
         "checkpoint_id": training.get("checkpoint_id"),
         "run_dir": training.get("run_dir"),
+        "lag_horizon_samples": int(training.get("lag_horizon_samples") or 0),
+        "acceptance_check": last_loop_eval or {},
     }
     response = f"{summary} {checkpoint_line}"
     return {
@@ -1610,11 +1743,12 @@ def _execute_modeler_build_request(
             "tool_output": {
                 "target_signal": target,
                 "feature_signals": features,
-                "resolved_model_family": training.get("selected_model_family", resolved_model),
+                "resolved_model_family": training.get("selected_model_family", current_requested_model),
                 "checkpoint_id": training.get("checkpoint_id"),
                 "run_dir": training.get("run_dir"),
                 "metrics": test_metrics,
                 "comparison": comparison,
+                "acceptance_check": last_loop_eval or {},
             },
         },
     }
@@ -1629,6 +1763,163 @@ def _fmt_metric(value: Any) -> str:
     if parsed is None:
         return "n/a"
     return f"{parsed:.4f}"
+
+
+def _modeler_training_tool_args(
+    *,
+    dataset: dict[str, Any],
+    target: str,
+    features: list[str],
+    requested_model_family: str,
+    timestamp_column: str | None,
+    requested_normalize: bool,
+    missing_data_strategy: str,
+    fill_constant_value: Any,
+    compare_against_baseline: bool,
+    lag_horizon_samples: Any,
+    checkpoint_tag: str,
+) -> dict[str, Any]:
+    return {
+        "data_path": str(dataset.get("data_path", "")),
+        "target_column": target,
+        "feature_columns": features,
+        "requested_model_family": requested_model_family,
+        "sheet_name": dataset.get("sheet_name"),
+        "timestamp_column": timestamp_column,
+        "checkpoint_tag": checkpoint_tag,
+        "normalize": requested_normalize,
+        "missing_data_strategy": missing_data_strategy,
+        "fill_constant_value": fill_constant_value,
+        "compare_against_baseline": compare_against_baseline,
+        "lag_horizon_samples": lag_horizon_samples,
+    }
+
+
+def _print_modeler_training_summary(*, training: dict[str, Any]) -> None:
+    split_info = training.get("split") if isinstance(training.get("split"), dict) else {}
+    preprocessing = training.get("preprocessing") if isinstance(training.get("preprocessing"), dict) else {}
+    comparison = training.get("comparison") if isinstance(training.get("comparison"), list) else []
+    print(
+        "agent> Split-safe pipeline: "
+        f"strategy={split_info.get('strategy', 'n/a')}, "
+        f"train={split_info.get('train_size', 'n/a')}, "
+        f"val={split_info.get('validation_size', 'n/a')}, "
+        f"test={split_info.get('test_size', 'n/a')}."
+    )
+    print(
+        "agent> Preprocessing policy: "
+        f"requested={preprocessing.get('missing_data_strategy_requested', 'n/a')}, "
+        f"effective={preprocessing.get('missing_data_strategy_effective', 'n/a')}, "
+        f"normalization={((training.get('normalization') or {}).get('method', 'none'))}."
+    )
+    if int(training.get("lag_horizon_samples") or 0) > 0:
+        print(
+            "agent> Temporal feature plan: "
+            f"lag_horizon_samples={int(training.get('lag_horizon_samples') or 0)}."
+        )
+    for item in comparison:
+        if not isinstance(item, dict):
+            continue
+        val_metrics = item.get("validation_metrics") if isinstance(item.get("validation_metrics"), dict) else {}
+        test_metrics = item.get("test_metrics") if isinstance(item.get("test_metrics"), dict) else {}
+        print(
+            "agent> Candidate "
+            f"`{item.get('model_family', 'n/a')}`: "
+            f"val_r2={_fmt_metric(val_metrics.get('r2'))}, "
+            f"val_mae={_fmt_metric(val_metrics.get('mae'))}, "
+            f"test_r2={_fmt_metric(test_metrics.get('r2'))}, "
+            f"test_mae={_fmt_metric(test_metrics.get('mae'))}."
+        )
+
+
+def _safe_acceptance_criteria(raw: Any) -> dict[str, float]:
+    if not isinstance(raw, dict):
+        return {"r2": 0.70}
+    criteria: dict[str, float] = {}
+    for key, value in raw.items():
+        name = str(key).strip()
+        if not name:
+            continue
+        try:
+            criteria[name] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return criteria or {"r2": 0.70}
+
+
+def _safe_loop_policy(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {"enabled": True, "max_attempts": 2, "allow_architecture_switch": True}
+    enabled = bool(raw.get("enabled", True))
+    try:
+        max_attempts = max(1, int(raw.get("max_attempts", 2)))
+    except (TypeError, ValueError):
+        max_attempts = 2
+    allow_architecture_switch = bool(raw.get("allow_architecture_switch", True))
+    return {
+        "enabled": enabled,
+        "max_attempts": max_attempts,
+        "allow_architecture_switch": allow_architecture_switch,
+    }
+
+
+def _build_model_loop_metrics(training: dict[str, Any]) -> dict[str, float]:
+    selected = training.get("selected_metrics") if isinstance(training.get("selected_metrics"), dict) else {}
+    train_metrics = selected.get("train") if isinstance(selected.get("train"), dict) else {}
+    val_metrics = selected.get("validation") if isinstance(selected.get("validation"), dict) else {}
+    test_metrics = selected.get("test") if isinstance(selected.get("test"), dict) else {}
+    metrics: dict[str, float] = {}
+    for key, value in test_metrics.items():
+        try:
+            metrics[str(key)] = float(value)
+        except (TypeError, ValueError):
+            continue
+    for source, prefix in ((train_metrics, "train_"), (val_metrics, "val_")):
+        for key, value in source.items():
+            try:
+                metrics[f"{prefix}{key}"] = float(value)
+            except (TypeError, ValueError):
+                continue
+    try:
+        metrics["n_samples"] = float(training.get("rows_used", 0))
+    except (TypeError, ValueError):
+        metrics["n_samples"] = 0.0
+    return metrics
+
+
+def _choose_model_retry_candidate(
+    *,
+    training: dict[str, Any],
+    current_model_family: str,
+    model_search_order: list[str],
+    tried_models: set[str],
+) -> str | None:
+    normalized_order: list[str] = []
+    for item in model_search_order:
+        normalized = _normalize_modeler_model_family(str(item))
+        if normalized is not None and normalized not in normalized_order:
+            normalized_order.append(normalized)
+    best_validation = _normalize_modeler_model_family(
+        str(training.get("best_validation_model_family", "")).strip()
+    )
+    if best_validation is not None and best_validation not in normalized_order:
+        normalized_order.append(best_validation)
+    comparison = training.get("comparison") if isinstance(training.get("comparison"), list) else []
+    for item in comparison:
+        if not isinstance(item, dict):
+            continue
+        candidate = _normalize_modeler_model_family(str(item.get("model_family", "")).strip())
+        if candidate is not None and candidate not in normalized_order:
+            normalized_order.append(candidate)
+
+    current_normalized = _normalize_modeler_model_family(current_model_family) or current_model_family
+    for candidate in normalized_order:
+        if candidate == current_normalized:
+            continue
+        if candidate in tried_models:
+            continue
+        return candidate
+    return None
 
 
 def _extract_first_json_path(user_message: str) -> Path | None:
@@ -1665,66 +1956,37 @@ def _load_modeler_handoff_payload(path: Path) -> dict[str, Any]:
         return {"error": f"Handoff file is not valid JSON: {exc}"}
     if not isinstance(payload, dict):
         return {"error": "Handoff JSON must be an object."}
-    return {"payload": payload, "data_path": payload.get("data_path", "")}
+    handoff = build_agent2_handoff_from_report_payload(payload)
+    if handoff is None:
+        return {
+            "error": (
+                "I could not derive a valid Agent 2 handoff from that report. "
+                "Ensure it is an Agent 1 structured report with target and predictor recommendations."
+            )
+        }
+    dataset_profile = handoff.dataset_profile if isinstance(handoff.dataset_profile, dict) else {}
+    return {
+        "payload": payload,
+        "handoff": handoff.to_dict(),
+        "data_path": dataset_profile.get("data_path", "") or payload.get("data_path", ""),
+    }
 
 
 def _modeler_request_from_handoff(
     *,
     payload: dict[str, Any],
+    handoff: dict[str, Any],
     available_signals: list[str],
 ) -> dict[str, Any] | None:
-    model_strategy = payload.get("model_strategy_recommendations")
-    target_recommendations = []
-    if isinstance(model_strategy, dict):
-        maybe = model_strategy.get("target_recommendations")
-        if isinstance(maybe, list):
-            target_recommendations = [item for item in maybe if isinstance(item, dict)]
-
-    primary = target_recommendations[0] if target_recommendations else None
-    target_raw = ""
-    feature_raw: list[str] = []
-    requested_model_family = "linear_ridge"
-    if primary is not None:
-        target_raw = str(primary.get("target_signal", "")).strip()
-        feature_raw = [
-            str(item).strip()
-            for item in primary.get("probe_predictor_signals", [])
-            if str(item).strip()
-        ]
-        requested_model_family = str(primary.get("recommended_model_family", "linear_ridge")).strip()
-
-    if not target_raw:
-        correlations = payload.get("correlations")
-        target_analyses = []
-        if isinstance(correlations, dict):
-            maybe = correlations.get("target_analyses")
-            if isinstance(maybe, list):
-                target_analyses = [item for item in maybe if isinstance(item, dict)]
-        if target_analyses:
-            first_target = target_analyses[0]
-            target_raw = str(first_target.get("target_signal", "")).strip()
-            predictor_rows = first_target.get("predictor_results")
-            if isinstance(predictor_rows, list):
-                for row in predictor_rows[:4]:
-                    if not isinstance(row, dict):
-                        continue
-                    predictor = str(row.get("predictor_signal", "")).strip()
-                    if predictor:
-                        feature_raw.append(predictor)
-
-    if not target_raw:
-        ranking = payload.get("ranking")
-        if isinstance(ranking, list):
-            for row in ranking:
-                if not isinstance(row, dict):
-                    continue
-                target_raw = str(row.get("target_signal", "")).strip()
-                if target_raw:
-                    break
-
+    target_raw = str(handoff.get("target_signal", "")).strip()
     if not target_raw:
         return None
 
+    feature_raw = [
+        str(item).strip()
+        for item in handoff.get("feature_signals", [])
+        if str(item).strip()
+    ]
     if not feature_raw and available_signals:
         fallback = [name for name in available_signals if name != target_raw]
         feature_raw = fallback[: min(3, len(fallback))]
@@ -1732,11 +1994,39 @@ def _modeler_request_from_handoff(
     if not feature_raw:
         return None
 
+    preprocessing = payload.get("preprocessing") if isinstance(payload.get("preprocessing"), dict) else {}
+    missing_plan = (
+        preprocessing.get("missing_data_plan")
+        if isinstance(preprocessing.get("missing_data_plan"), dict)
+        else {}
+    )
     return {
-        "requested_model_family": requested_model_family or "linear_ridge",
+        "requested_model_family": str(handoff.get("recommended_model_family", "linear_ridge")).strip() or "linear_ridge",
         "feature_raw": feature_raw,
         "target_raw": target_raw,
         "data_path": str(payload.get("data_path", "")).strip(),
+        "timestamp_column": str(handoff.get("dataset_profile", {}).get("timestamp_column", "")).strip() or None,
+        "normalize": bool(handoff.get("normalization", {}).get("enabled", True)),
+        "missing_data_strategy": str(missing_plan.get("strategy", "keep")).strip() or "keep",
+        "fill_constant_value": missing_plan.get("fill_constant_value"),
+        "compare_against_baseline": True,
+        "lag_horizon_samples": int(handoff.get("lag_horizon_samples", 0) or 0) or None,
+        "acceptance_criteria": (
+            dict(handoff.get("acceptance_criteria"))
+            if isinstance(handoff.get("acceptance_criteria"), dict)
+            else {"r2": 0.70}
+        ),
+        "loop_policy": (
+            dict(handoff.get("loop_policy"))
+            if isinstance(handoff.get("loop_policy"), dict)
+            else {"enabled": True, "max_attempts": 3, "allow_architecture_switch": True}
+        ),
+        "user_locked_model_family": False,
+        "model_search_order": [
+            str(item).strip()
+            for item in handoff.get("model_search_order", [])
+            if str(item).strip()
+        ],
         "source": "handoff",
     }
 
@@ -1755,7 +2045,7 @@ def _prompt_modeler_overrides(
         target_signal=target_raw,
         available_signals=available_signals,
     )
-    requested_model_family = _prompt_modeler_model_override(
+    requested_model_family, user_locked_model_family = _prompt_modeler_model_override(
         default_model=str(request.get("requested_model_family", "linear_ridge")).strip(),
     )
     return {
@@ -1763,6 +2053,7 @@ def _prompt_modeler_overrides(
         "target_raw": target_raw,
         "feature_raw": feature_raw,
         "requested_model_family": requested_model_family,
+        "user_locked_model_family": user_locked_model_family,
     }
 
 
@@ -1828,9 +2119,11 @@ def _prompt_modeler_feature_override(
         print("agent> I did not resolve any usable inputs. Type `list` to inspect signal names.")
 
 
-def _prompt_modeler_model_override(*, default_model: str) -> str:
+def _prompt_modeler_model_override(*, default_model: str) -> tuple[str, bool]:
     available = (
         "auto, linear_ridge (aliases: ridge, linear, incremental_linear_surrogate), "
+        "lagged_linear (aliases: lagged, temporal_linear, arx), "
+        "lagged_tree_ensemble (aliases: lagged_tree, lag_window_tree, temporal_tree), "
         "bagged_tree_ensemble (aliases: tree, tree_ensemble, extra_trees, hist_gradient_boosting)"
     )
     recommended_supported = _normalize_modeler_model_family(default_model)
@@ -1850,9 +2143,9 @@ def _prompt_modeler_model_override(*, default_model: str) -> str:
         print(f"agent> Currently implemented: {available}.")
         answer = input("you> ").strip()
         if not answer:
-            return recommended_supported or "auto"
+            return recommended_supported or "auto", False
         if _normalize_modeler_model_family(answer) is not None:
-            return answer
+            return answer, True
         print("agent> That model is not implemented yet. Please choose an available model.")
 
 
@@ -1940,6 +2233,7 @@ def _compact_modeling_summary(
         "requested_model_family": requested_model_family,
         "selected_model_family": training.get("selected_model_family"),
         "best_validation_model_family": training.get("best_validation_model_family"),
+        "lag_horizon_samples": training.get("lag_horizon_samples"),
         "split": training.get("split"),
         "preprocessing": training.get("preprocessing"),
         "normalization": training.get("normalization"),

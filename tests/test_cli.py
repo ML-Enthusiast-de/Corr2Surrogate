@@ -40,6 +40,22 @@ class _SessionRegistry:
         return _DummyResult(output={"status": "ok"})
 
 
+class _RaisingSessionRegistry(_SessionRegistry):
+    def __init__(self, scripted_outputs, *, raise_on_tool: str, message: str) -> None:
+        super().__init__(scripted_outputs)
+        self._raise_on_tool = raise_on_tool
+        self._raise_message = message
+
+    def execute(self, tool_name, arguments):
+        self.calls.append((tool_name, dict(arguments)))
+        if tool_name == self._raise_on_tool:
+            raise ValueError(self._raise_message)
+        outputs = self._scripted_outputs.get(tool_name, [])
+        if outputs:
+            return _DummyResult(output=outputs.pop(0))
+        return _DummyResult(output={"status": "ok"})
+
+
 def _stub_llm_interpretation(**_kwargs):
     return {"event": {"message": "LLM interpretation summary."}}
 
@@ -1543,12 +1559,23 @@ def test_cli_run_agent_session_modeler_handoff_allows_override_prompts(
         json.dumps(
             {
                 "data_path": str(data_path),
+                "data_mode": "steady_state",
+                "timestamp_column": None,
+                "preprocessing": {
+                    "missing_data_plan": {
+                        "strategy": "fill_median",
+                    }
+                },
                 "model_strategy_recommendations": {
                     "target_recommendations": [
                         {
                             "target_signal": "C",
                             "probe_predictor_signals": ["A", "B"],
                             "recommended_model_family": "tree_ensemble_candidate",
+                            "priority_model_families": [
+                                "linear_ridge",
+                                "tree_ensemble_candidate",
+                            ],
                         }
                     ]
                 },
@@ -1634,8 +1661,503 @@ def test_cli_run_agent_session_modeler_handoff_allows_override_prompts(
     assert registry.calls[1][1]["target_column"] == "C"
     assert registry.calls[1][1]["feature_columns"] == ["A", "B"]
     assert registry.calls[1][1]["requested_model_family"] == "bagged_tree_ensemble"
+    assert registry.calls[1][1]["normalize"] is True
+    assert registry.calls[1][1]["missing_data_strategy"] == "fill_median"
     output = capsys.readouterr().out
+    assert "Handoff contract:" in output
     assert "Handoff suggestion:" in output
     assert "Press Enter to use the recommended model `tree_ensemble_candidate`" in output
     assert "Candidate `bagged_tree_ensemble`" in output
     assert "Model build complete:" in output
+
+
+def test_cli_run_agent_session_modeler_direct_lagged_request_passes_temporal_args(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    data_path = tmp_path / "model_lagged.csv"
+    data_path.write_text("time,A,B,C\n0,1,2,3\n", encoding="utf-8")
+    inputs = iter(
+        [
+            "build model lagged_linear with inputs A,B and target C",
+            str(data_path),
+            "/exit",
+        ]
+    )
+    registry = _SessionRegistry(
+        scripted_outputs={
+            "prepare_ingestion_step": [
+                {
+                    "status": "ok",
+                    "message": "Ingestion ready.",
+                    "options": [],
+                    "selected_sheet": None,
+                    "available_sheets": [],
+                    "header_row": 0,
+                    "data_start_row": 1,
+                    "header_confidence": 1.0,
+                    "needs_user_confirmation": False,
+                    "row_count": 20,
+                    "column_count": 4,
+                    "signal_columns": ["time", "A", "B", "C"],
+                    "numeric_signal_columns": ["time", "A", "B", "C"],
+                    "timestamp_column_hint": "time",
+                }
+            ],
+            "train_surrogate_candidates": [
+                {
+                    "status": "ok",
+                    "checkpoint_id": "ckpt_lagged_1",
+                    "run_dir": "artifacts/run_lagged_1",
+                    "selected_model_family": "lagged_linear",
+                    "best_validation_model_family": "lagged_linear",
+                    "lag_horizon_samples": 4,
+                    "split": {
+                        "strategy": "blocked_time_order_70_15_15",
+                        "train_size": 14,
+                        "validation_size": 3,
+                        "test_size": 3,
+                    },
+                    "preprocessing": {
+                        "missing_data_strategy_requested": "fill_median",
+                        "missing_data_strategy_effective": "fill_median_train_only",
+                    },
+                    "normalization": {"method": "minmax"},
+                    "comparison": [
+                        {
+                            "model_family": "linear_ridge",
+                            "validation_metrics": {"r2": 0.30, "mae": 0.44},
+                            "test_metrics": {"r2": 0.28, "mae": 0.46},
+                        },
+                        {
+                            "model_family": "lagged_linear",
+                            "validation_metrics": {"r2": 0.92, "mae": 0.09},
+                            "test_metrics": {"r2": 0.90, "mae": 0.10},
+                        },
+                    ],
+                    "selected_metrics": {
+                        "test": {"r2": 0.90, "mae": 0.10},
+                    },
+                    "rows_used": 11,
+                }
+            ],
+        }
+    )
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
+
+    exit_code = main(["run-agent-session", "--agent", "modeler"])
+    assert exit_code == 0
+    assert registry.calls[1][0] == "train_surrogate_candidates"
+    assert registry.calls[1][1]["requested_model_family"] == "lagged_linear"
+    assert registry.calls[1][1]["timestamp_column"] == "time"
+    output = capsys.readouterr().out
+    assert "Timestamp context: using `time`" in output
+    assert "Temporal feature plan: lag_horizon_samples=4." in output
+    assert "Candidate `lagged_linear`" in output
+
+
+def test_cli_run_agent_session_modeler_handoff_uses_structured_contract_defaults(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    data_path = tmp_path / "model_handoff_lagged.csv"
+    data_path.write_text("time,A,C\n0,1,3\n", encoding="utf-8")
+    handoff_path = tmp_path / "structured_lagged_report.json"
+    handoff_path.write_text(
+        json.dumps(
+            {
+                "data_path": str(data_path),
+                "data_mode": "time_series",
+                "timestamp_column": "time",
+                "preprocessing": {
+                    "missing_data_plan": {
+                        "strategy": "fill_constant",
+                        "fill_constant_value": -1.0,
+                    }
+                },
+                "model_strategy_recommendations": {
+                    "target_recommendations": [
+                        {
+                            "target_signal": "C",
+                            "probe_predictor_signals": ["A"],
+                            "recommended_model_family": "lagged_linear",
+                            "priority_model_families": [
+                                "lagged_linear",
+                                "tree_ensemble_candidate",
+                                "linear_ridge",
+                            ],
+                            "recommendation_statement": "Start with lagged linear first.",
+                            "candidate_models": [
+                                {
+                                    "model_family": "lagged_linear",
+                                    "notes": "Current + lagged predictor windows up to 5 samples.",
+                                }
+                            ],
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    inputs = iter([f"use handoff {handoff_path}", "", "", "", "/exit"])
+    registry = _SessionRegistry(
+        scripted_outputs={
+            "prepare_ingestion_step": [
+                {
+                    "status": "ok",
+                    "message": "Ingestion ready.",
+                    "options": [],
+                    "selected_sheet": None,
+                    "available_sheets": [],
+                    "header_row": 0,
+                    "data_start_row": 1,
+                    "header_confidence": 1.0,
+                    "needs_user_confirmation": False,
+                    "row_count": 32,
+                    "column_count": 3,
+                    "signal_columns": ["time", "A", "C"],
+                    "numeric_signal_columns": ["time", "A", "C"],
+                    "timestamp_column_hint": "time",
+                }
+            ],
+            "train_surrogate_candidates": [
+                {
+                    "status": "ok",
+                    "checkpoint_id": "ckpt_lagged_handoff",
+                    "run_dir": "artifacts/run_lagged_handoff",
+                    "selected_model_family": "lagged_linear",
+                    "best_validation_model_family": "lagged_linear",
+                    "lag_horizon_samples": 5,
+                    "split": {
+                        "strategy": "blocked_time_order_70_15_15",
+                        "train_size": 22,
+                        "validation_size": 5,
+                        "test_size": 5,
+                    },
+                    "preprocessing": {
+                        "missing_data_strategy_requested": "fill_constant",
+                        "missing_data_strategy_effective": "fill_constant_train_policy",
+                    },
+                    "normalization": {"method": "minmax"},
+                    "comparison": [
+                        {
+                            "model_family": "linear_ridge",
+                            "validation_metrics": {"r2": 0.41, "mae": 0.33},
+                            "test_metrics": {"r2": 0.39, "mae": 0.35},
+                        },
+                        {
+                            "model_family": "lagged_linear",
+                            "validation_metrics": {"r2": 0.93, "mae": 0.07},
+                            "test_metrics": {"r2": 0.91, "mae": 0.08},
+                        },
+                    ],
+                    "selected_metrics": {
+                        "test": {"r2": 0.91, "mae": 0.08},
+                    },
+                    "rows_used": 17,
+                }
+            ],
+        }
+    )
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
+
+    exit_code = main(["run-agent-session", "--agent", "modeler"])
+    assert exit_code == 0
+    assert registry.calls[1][0] == "train_surrogate_candidates"
+    args = registry.calls[1][1]
+    assert args["requested_model_family"] == "lagged_linear"
+    assert args["timestamp_column"] == "time"
+    assert args["missing_data_strategy"] == "fill_constant"
+    assert float(args["fill_constant_value"]) == -1.0
+    assert args["lag_horizon_samples"] == 5
+    output = capsys.readouterr().out
+    assert "Handoff contract:" in output
+    assert "search_order=['lagged_linear', 'tree_ensemble_candidate', 'linear_ridge']" in output
+    assert "Temporal feature plan: lag_horizon_samples=5." in output
+
+
+def test_cli_run_agent_session_modeler_auto_retries_to_next_safe_family(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    data_path = tmp_path / "model_auto_retry.csv"
+    data_path.write_text("time,A,C\n0,1,3\n", encoding="utf-8")
+    inputs = iter(
+        [
+            "build model auto with inputs A and target C",
+            str(data_path),
+            "/exit",
+        ]
+    )
+    registry = _SessionRegistry(
+        scripted_outputs={
+            "prepare_ingestion_step": [
+                {
+                    "status": "ok",
+                    "message": "Ingestion ready.",
+                    "options": [],
+                    "selected_sheet": None,
+                    "available_sheets": [],
+                    "header_row": 0,
+                    "data_start_row": 1,
+                    "header_confidence": 1.0,
+                    "needs_user_confirmation": False,
+                    "row_count": 32,
+                    "column_count": 3,
+                    "signal_columns": ["time", "A", "C"],
+                    "numeric_signal_columns": ["time", "A", "C"],
+                    "timestamp_column_hint": "time",
+                }
+            ],
+            "train_surrogate_candidates": [
+                {
+                    "status": "ok",
+                    "checkpoint_id": "ckpt_auto_retry_1",
+                    "run_dir": "artifacts/run_auto_retry_1",
+                    "selected_model_family": "linear_ridge",
+                    "best_validation_model_family": "lagged_linear",
+                    "lag_horizon_samples": 3,
+                    "split": {"strategy": "blocked_time_order_70_15_15", "train_size": 22, "validation_size": 5, "test_size": 5},
+                    "preprocessing": {
+                        "missing_data_strategy_requested": "fill_median",
+                        "missing_data_strategy_effective": "fill_median_train_only",
+                    },
+                    "normalization": {"method": "minmax"},
+                    "comparison": [
+                        {
+                            "model_family": "linear_ridge",
+                            "validation_metrics": {"r2": 0.40, "mae": 0.30},
+                            "test_metrics": {"r2": 0.38, "mae": 0.33},
+                        },
+                        {
+                            "model_family": "lagged_linear",
+                            "validation_metrics": {"r2": 0.86, "mae": 0.11},
+                            "test_metrics": {"r2": 0.84, "mae": 0.12},
+                        },
+                    ],
+                    "selected_metrics": {
+                        "train": {"mae": 0.28, "r2": 0.42},
+                        "validation": {"mae": 0.30, "r2": 0.40},
+                        "test": {"mae": 0.33, "r2": 0.38},
+                    },
+                    "rows_used": 22,
+                },
+                {
+                    "status": "ok",
+                    "checkpoint_id": "ckpt_auto_retry_2",
+                    "run_dir": "artifacts/run_auto_retry_2",
+                    "selected_model_family": "lagged_linear",
+                    "best_validation_model_family": "lagged_linear",
+                    "lag_horizon_samples": 3,
+                    "split": {"strategy": "blocked_time_order_70_15_15", "train_size": 22, "validation_size": 5, "test_size": 5},
+                    "preprocessing": {
+                        "missing_data_strategy_requested": "fill_median",
+                        "missing_data_strategy_effective": "fill_median_train_only",
+                    },
+                    "normalization": {"method": "minmax"},
+                    "comparison": [
+                        {
+                            "model_family": "linear_ridge",
+                            "validation_metrics": {"r2": 0.40, "mae": 0.30},
+                            "test_metrics": {"r2": 0.38, "mae": 0.33},
+                        },
+                        {
+                            "model_family": "lagged_linear",
+                            "validation_metrics": {"r2": 0.86, "mae": 0.11},
+                            "test_metrics": {"r2": 0.84, "mae": 0.12},
+                        },
+                    ],
+                    "selected_metrics": {
+                        "train": {"mae": 0.08, "r2": 0.90},
+                        "validation": {"mae": 0.11, "r2": 0.86},
+                        "test": {"mae": 0.12, "r2": 0.84},
+                    },
+                    "rows_used": 19,
+                },
+            ],
+            "evaluate_training_iteration": [
+                {
+                    "should_continue": True,
+                    "attempt": 1,
+                    "max_attempts": 2,
+                    "unmet_criteria": ["r2"],
+                    "recommendations": ["Try alternate architecture and tune window/lag features for unmet metrics: r2"],
+                    "summary": "Acceptance criteria not met. Continuing optimization loop.",
+                },
+                {
+                    "should_continue": False,
+                    "attempt": 2,
+                    "max_attempts": 2,
+                    "unmet_criteria": [],
+                    "recommendations": ["Quality criteria met. Proceed to artifact export."],
+                    "summary": "Model meets all acceptance criteria.",
+                },
+            ],
+        }
+    )
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
+
+    exit_code = main(["run-agent-session", "--agent", "modeler"])
+    assert exit_code == 0
+    train_calls = [call for call in registry.calls if call[0] == "train_surrogate_candidates"]
+    assert len(train_calls) == 2
+    assert train_calls[0][1]["requested_model_family"] == "auto"
+    assert train_calls[1][1]["requested_model_family"] == "lagged_linear"
+    output = capsys.readouterr().out
+    assert "Continuing bounded optimization loop with `lagged_linear` as the next retry." in output
+    assert "Acceptance check: Model meets all acceptance criteria." in output
+
+
+def test_cli_run_agent_session_modeler_explicit_model_does_not_auto_switch(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    data_path = tmp_path / "model_locked.csv"
+    data_path.write_text("time,A,C\n0,1,3\n", encoding="utf-8")
+    inputs = iter(
+        [
+            "build model linear_ridge with inputs A and target C",
+            str(data_path),
+            "/exit",
+        ]
+    )
+    registry = _SessionRegistry(
+        scripted_outputs={
+            "prepare_ingestion_step": [
+                {
+                    "status": "ok",
+                    "message": "Ingestion ready.",
+                    "options": [],
+                    "selected_sheet": None,
+                    "available_sheets": [],
+                    "header_row": 0,
+                    "data_start_row": 1,
+                    "header_confidence": 1.0,
+                    "needs_user_confirmation": False,
+                    "row_count": 32,
+                    "column_count": 3,
+                    "signal_columns": ["time", "A", "C"],
+                    "numeric_signal_columns": ["time", "A", "C"],
+                    "timestamp_column_hint": "time",
+                }
+            ],
+            "train_surrogate_candidates": [
+                {
+                    "status": "ok",
+                    "checkpoint_id": "ckpt_locked_1",
+                    "run_dir": "artifacts/run_locked_1",
+                    "selected_model_family": "linear_ridge",
+                    "best_validation_model_family": "lagged_linear",
+                    "lag_horizon_samples": 3,
+                    "split": {"strategy": "blocked_time_order_70_15_15", "train_size": 22, "validation_size": 5, "test_size": 5},
+                    "preprocessing": {
+                        "missing_data_strategy_requested": "fill_median",
+                        "missing_data_strategy_effective": "fill_median_train_only",
+                    },
+                    "normalization": {"method": "minmax"},
+                    "comparison": [
+                        {
+                            "model_family": "linear_ridge",
+                            "validation_metrics": {"r2": 0.40, "mae": 0.30},
+                            "test_metrics": {"r2": 0.38, "mae": 0.33},
+                        },
+                        {
+                            "model_family": "lagged_linear",
+                            "validation_metrics": {"r2": 0.86, "mae": 0.11},
+                            "test_metrics": {"r2": 0.84, "mae": 0.12},
+                        },
+                    ],
+                    "selected_metrics": {
+                        "train": {"mae": 0.28, "r2": 0.42},
+                        "validation": {"mae": 0.30, "r2": 0.40},
+                        "test": {"mae": 0.33, "r2": 0.38},
+                    },
+                    "rows_used": 22,
+                }
+            ],
+            "evaluate_training_iteration": [
+                {
+                    "should_continue": True,
+                    "attempt": 1,
+                    "max_attempts": 2,
+                    "unmet_criteria": ["r2"],
+                    "recommendations": ["Try alternate architecture and tune window/lag features for unmet metrics: r2"],
+                    "summary": "Acceptance criteria not met. Continuing optimization loop.",
+                }
+            ],
+        }
+    )
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
+
+    exit_code = main(["run-agent-session", "--agent", "modeler"])
+    assert exit_code == 0
+    train_calls = [call for call in registry.calls if call[0] == "train_surrogate_candidates"]
+    assert len(train_calls) == 1
+    output = capsys.readouterr().out
+    assert "Architecture auto-switch is disabled because this model family was explicitly chosen by the user." in output
+
+
+def test_cli_run_agent_session_modeler_invalid_handoff_is_safe(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    handoff_path = tmp_path / "bad_handoff.json"
+    handoff_path.write_text(json.dumps({"foo": "bar"}), encoding="utf-8")
+    inputs = iter([f"use handoff {handoff_path}", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
+    exit_code = main(["run-agent-session", "--agent", "modeler"])
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "I could not derive a valid Agent 2 handoff from that report." in output
+
+
+def test_cli_run_agent_session_modeler_lagged_request_on_non_time_series_is_safe(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    data_path = tmp_path / "steady_no_time.csv"
+    data_path.write_text("A,C\n1,3\n", encoding="utf-8")
+    inputs = iter(
+        [
+            "build model lagged_linear with inputs A and target C",
+            str(data_path),
+            "/exit",
+        ]
+    )
+    registry = _RaisingSessionRegistry(
+        scripted_outputs={
+            "prepare_ingestion_step": [
+                {
+                    "status": "ok",
+                    "message": "Ingestion ready.",
+                    "options": [],
+                    "selected_sheet": None,
+                    "available_sheets": [],
+                    "header_row": 0,
+                    "data_start_row": 1,
+                    "header_confidence": 1.0,
+                    "needs_user_confirmation": False,
+                    "row_count": 20,
+                    "column_count": 2,
+                    "signal_columns": ["A", "C"],
+                    "numeric_signal_columns": ["A", "C"],
+                    "timestamp_column_hint": None,
+                }
+            ]
+        },
+        raise_on_tool="train_surrogate_candidates",
+        message="Lagged model families require time-series structure and a usable timestamp column.",
+    )
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
+    exit_code = main(["run-agent-session", "--agent", "modeler"])
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Lagged model families require time-series structure and a usable timestamp column." in output

@@ -57,6 +57,10 @@ Outputs:
   - linear / lagged linear baseline first
   - tree ensembles next when Agent 1 finds interaction or regime evidence
   - sequence models only after simpler lagged/tabular baselines fail
+- Current executable baseline path:
+  - direct modeler mode and Agent 1 structured-report handoff both reach a split-safe trainer
+  - executable families today: `linear_ridge`, `lagged_linear`, `lagged_tree_ensemble`, `bagged_tree_ensemble`
+  - modeler compares available candidates, runs a bounded acceptance check, can retry with the next safe family when policy allows it, persists artifacts, and then lets the LLM interpret the measured result
 - User control:
   - if a handoff exists, user can accept the recommendation or override target, predictors, and architecture
   - explicit user overrides win unless blocked by hard policy / safety constraints
@@ -172,6 +176,10 @@ Add Optuna only after deterministic training is stable.
 
 10. Add advanced temporal models:
 Add GRU / LSTM only after lagged and tree-based baselines are in place.
+
+Current status:
+- steps 1-6 are now partially implemented in the first executable Agent 2 path
+- remaining work is to extend from single-pass training into full acceptance-loop retries, stronger model families, and deeper post-failure experiment guidance
 
 ## 11. Bounded LLM Autonomy
 The LLM should act as an agent, but not as an uncontrolled replacement for deterministic analytics.

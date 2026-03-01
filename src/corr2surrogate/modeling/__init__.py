@@ -13,6 +13,8 @@ from .splitters import DatasetSplit, build_train_validation_test_split
 from .training import (
     BaggedTreeEnsembleSurrogate,
     CandidateMetrics,
+    LaggedLinearSurrogate,
+    LaggedTreeEnsembleSurrogate,
     normalize_candidate_model_family,
     train_surrogate_candidates,
 )
@@ -23,6 +25,8 @@ __all__ = [
     "CandidateMetrics",
     "DatasetSplit",
     "IncrementalLinearSurrogate",
+    "LaggedLinearSurrogate",
+    "LaggedTreeEnsembleSurrogate",
     "MinMaxNormalizer",
     "ModelCheckpoint",
     "ModelCheckpointStore",
