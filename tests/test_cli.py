@@ -341,6 +341,159 @@ def test_cli_run_agent_session_analyst_autopilot_runs_analysis(
     assert "Top 3 correlated predictors:" in output
 
 
+def test_cli_run_agent_session_analyst_can_continue_directly_into_modeler(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    data_path = tmp_path / "analyst_to_modeler.csv"
+    data_path.write_text("A,B,C\n1,2,3\n", encoding="utf-8")
+    handoff_path = tmp_path / "structured_report.json"
+    handoff_path.write_text(
+        json.dumps(
+            {
+                "data_path": str(data_path),
+                "data_mode": "steady_state",
+                "timestamp_column": None,
+                "preprocessing": {
+                    "missing_data_plan": {
+                        "strategy": "fill_median",
+                    }
+                },
+                "model_strategy_recommendations": {
+                    "target_recommendations": [
+                        {
+                            "target_signal": "C",
+                            "probe_predictor_signals": ["A", "B"],
+                            "recommended_model_family": "linear_ridge",
+                            "priority_model_families": ["linear_ridge", "bagged_tree_ensemble"],
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    inputs = iter(
+        [
+            f"Analyze {data_path}",
+            "y",
+            "",
+            "",
+            "",
+            "/exit",
+        ]
+    )
+    registry = _SessionRegistry(
+        scripted_outputs={
+            "prepare_ingestion_step": [
+                {
+                    "status": "ok",
+                    "message": "Ingestion ready.",
+                    "options": [],
+                    "selected_sheet": None,
+                    "available_sheets": [],
+                    "row_count": 100,
+                    "column_count": 3,
+                    "signal_columns": ["A", "B", "C"],
+                    "numeric_signal_columns": ["A", "B", "C"],
+                    "header_row": 0,
+                    "data_start_row": 1,
+                    "header_confidence": 0.99,
+                    "needs_user_confirmation": False,
+                },
+                {
+                    "status": "ok",
+                    "message": "Ingestion ready.",
+                    "options": [],
+                    "selected_sheet": None,
+                    "available_sheets": [],
+                    "row_count": 100,
+                    "column_count": 3,
+                    "signal_columns": ["A", "B", "C"],
+                    "numeric_signal_columns": ["A", "B", "C"],
+                    "header_row": 0,
+                    "data_start_row": 1,
+                    "header_confidence": 0.99,
+                    "needs_user_confirmation": False,
+                },
+            ],
+            "run_agent1_analysis": [
+                {
+                    "status": "ok",
+                    "data_mode": "steady_state",
+                    "target_count": 1,
+                    "candidate_count": 1,
+                    "report_path": "reports/analyst_to_modeler/agent1_20260301_120000.md",
+                    "artifact_paths": {"json_path": str(handoff_path)},
+                }
+            ],
+            "train_surrogate_candidates": [
+                {
+                    "status": "ok",
+                    "checkpoint_id": "ckpt_bridge_1",
+                    "run_dir": "artifacts/run_bridge_1",
+                    "selected_model_family": "linear_ridge",
+                    "best_validation_model_family": "linear_ridge",
+                    "lag_horizon_samples": 0,
+                    "split": {
+                        "strategy": "deterministic_modulo_70_15_15",
+                        "train_size": 70,
+                        "validation_size": 15,
+                        "test_size": 15,
+                    },
+                    "preprocessing": {
+                        "missing_data_strategy_requested": "fill_median",
+                        "missing_data_strategy_effective": "fill_median_train_only",
+                    },
+                    "normalization": {"method": "minmax"},
+                    "comparison": [
+                        {
+                            "model_family": "linear_ridge",
+                            "validation_metrics": {"r2": 0.88, "mae": 0.12},
+                            "test_metrics": {"r2": 0.86, "mae": 0.13},
+                        }
+                    ],
+                    "selected_metrics": {
+                        "train": {"mae": 0.10, "r2": 0.90},
+                        "validation": {"mae": 0.12, "r2": 0.88},
+                        "test": {"mae": 0.13, "r2": 0.86},
+                    },
+                    "rows_used": 70,
+                }
+            ],
+            "evaluate_training_iteration": [
+                {
+                    "should_continue": False,
+                    "attempt": 1,
+                    "max_attempts": 3,
+                    "unmet_criteria": [],
+                    "recommendations": ["Quality criteria met. Proceed to artifact export."],
+                    "summary": "Model meets all acceptance criteria.",
+                }
+            ],
+        }
+    )
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
+
+    exit_code = main(["run-agent-session", "--agent", "analyst"])
+    assert exit_code == 0
+    assert [call[0] for call in registry.calls] == [
+        "prepare_ingestion_step",
+        "run_agent1_analysis",
+        "prepare_ingestion_step",
+        "train_surrogate_candidates",
+        "evaluate_training_iteration",
+    ]
+    output = capsys.readouterr().out
+    assert "Structured handoff saved:" in output
+    assert "Start Agent 2 modeling now from this handoff?" in output
+    assert "Starting Agent 2 handoff-driven modeling." in output
+    assert "Handoff contract:" in output
+    assert "Model build complete:" in output
+
+
 def test_cli_run_agent_session_analyst_autopilot_multi_sheet(monkeypatch, tmp_path: Path) -> None:
     data_path = tmp_path / "multi_sheet.xlsx"
     data_path.write_text("testdata", encoding="utf-8")
@@ -2161,3 +2314,102 @@ def test_cli_run_agent_session_modeler_lagged_request_on_non_time_series_is_safe
     assert exit_code == 0
     output = capsys.readouterr().out
     assert "Lagged model families require time-series structure and a usable timestamp column." in output
+
+
+def test_cli_run_agent_session_modeler_suppresses_runtime_fallback_as_fake_interpretation(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    data_path = tmp_path / "model_interpret_fallback.csv"
+    data_path.write_text("A,B,C\n1,2,3\n", encoding="utf-8")
+    inputs = iter(
+        [
+            "build model linear_ridge with inputs A,B and target C",
+            str(data_path),
+            "/exit",
+        ]
+    )
+    registry = _SessionRegistry(
+        scripted_outputs={
+            "prepare_ingestion_step": [
+                {
+                    "status": "ok",
+                    "message": "Ingestion ready.",
+                    "options": [],
+                    "selected_sheet": None,
+                    "available_sheets": [],
+                    "header_row": 0,
+                    "data_start_row": 1,
+                    "header_confidence": 1.0,
+                    "needs_user_confirmation": False,
+                    "row_count": 20,
+                    "column_count": 3,
+                    "signal_columns": ["A", "B", "C"],
+                    "numeric_signal_columns": ["A", "B", "C"],
+                }
+            ],
+            "train_surrogate_candidates": [
+                {
+                    "status": "ok",
+                    "checkpoint_id": "ckpt_interp_1",
+                    "run_dir": "artifacts/run_interp_1",
+                    "selected_model_family": "linear_ridge",
+                    "best_validation_model_family": "linear_ridge",
+                    "lag_horizon_samples": 0,
+                    "selected_hyperparameters": {
+                        "requested_model_family": "linear_ridge",
+                        "ridge": 1e-8,
+                        "training_rows_used": 14,
+                    },
+                    "split": {
+                        "strategy": "deterministic_modulo_70_15_15",
+                        "train_size": 14,
+                        "validation_size": 3,
+                        "test_size": 3,
+                    },
+                    "preprocessing": {
+                        "missing_data_strategy_requested": "fill_median",
+                        "missing_data_strategy_effective": "fill_median_train_only",
+                    },
+                    "normalization": {"method": "minmax"},
+                    "comparison": [
+                        {
+                            "model_family": "linear_ridge",
+                            "validation_metrics": {"r2": 0.88, "mae": 0.12},
+                            "test_metrics": {"r2": 0.86, "mae": 0.13},
+                        }
+                    ],
+                    "selected_metrics": {
+                        "train": {"mae": 0.10, "r2": 0.90},
+                        "validation": {"mae": 0.12, "r2": 0.88},
+                        "test": {"mae": 0.13, "r2": 0.86},
+                    },
+                    "rows_used": 14,
+                }
+            ],
+            "evaluate_training_iteration": [
+                {
+                    "should_continue": False,
+                    "attempt": 1,
+                    "max_attempts": 2,
+                    "unmet_criteria": [],
+                    "recommendations": ["Quality criteria met. Proceed to artifact export."],
+                    "summary": "Model meets all acceptance criteria.",
+                }
+            ],
+        }
+    )
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr(
+        "corr2surrogate.ui.cli.run_local_agent_once",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    exit_code = main(["run-agent-session", "--agent", "modeler"])
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Selected hyperparameters:" in output
+    assert "LLM interpretation unavailable for this turn. Using the deterministic model summary above." in output
+    assert "agent> LLM interpretation:" not in output
+    assert "I hit an internal runtime error. Please retry." not in output

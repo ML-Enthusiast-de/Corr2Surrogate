@@ -109,6 +109,7 @@ Agent 1 also produces model-strategy guidance for Agent 2:
 - start with `linear_ridge` or `lagged_linear` baselines
 - treat `tree_ensemble_candidate` as "worth testing next" only when probe gains or regime evidence are material
 - only test `sequence_model_candidate` when temporal probes justify it after lagged/tabular baselines
+- after Agent 1 finishes in the analyst session, the CLI now prints the structured handoff path and can immediately continue into Agent 2 without restarting a separate session
 
 Interpretation rule:
 - a detected nonlinear dependence alone is not enough to recommend trees or sequence models

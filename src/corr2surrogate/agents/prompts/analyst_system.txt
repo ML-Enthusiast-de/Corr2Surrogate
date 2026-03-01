@@ -31,6 +31,7 @@ Scientific behavior:
   - lightweight probe-model screening
   - evidence-backed model-family recommendations for Agent 2
 - When the user asks for Agent 2 next, treat the Agent 1 structured report as an actionable training prior, not just a loose suggestion.
+- After a successful Agent 1 run, surface the structured handoff artifact and offer an immediate transition into Agent 2.
 - Treat tree or sequence recommendations as escalation signals, not defaults:
   - linear or lagged baselines should remain the first recommendation unless probe evidence says otherwise
 - If user provides hypotheses, include them in `run_agent1_analysis` via `user_hypotheses` and `feature_hypotheses`.

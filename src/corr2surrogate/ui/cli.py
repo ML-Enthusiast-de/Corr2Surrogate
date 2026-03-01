@@ -605,12 +605,24 @@ def _run_agent_session(
                     print(f"agent> {reply}")
                 print(f"agent> {reminder}")
 
+            def _modeler_chat_reply_internal(detour_user_message: str) -> str:
+                return _llm_chat_detour(
+                    agent="modeler",
+                    user_message=detour_user_message,
+                    session_context=session_context,
+                    session_messages=session_messages,
+                    config_path=config_path,
+                    record_in_history=False,
+                )
+
             try:
                 autopilot = _run_analyst_autopilot_turn(
                     user_message=user_message,
                     registry=registry,
+                    session_context=session_context,
                     chat_detour=_chat_detour_with_reprompt,
                     chat_reply_only=_chat_reply_internal,
+                    modeler_chat_reply_only=_modeler_chat_reply_internal,
                 )
             except Exception as exc:
                 response = _runtime_error_fallback_message(
@@ -641,12 +653,19 @@ def _run_agent_session(
                 session_messages = session_messages[-20:]
                 session_context["last_event"] = _compact_event_for_context(summary_event)
                 if not summary_event.get("error"):
-                    session_context["workflow_stage"] = "analysis_completed"
                     tool_output = summary_event.get("tool_output")
+                    next_stage = "analysis_completed"
                     if isinstance(tool_output, dict):
+                        stage_from_tool = tool_output.get("workflow_stage")
+                        if isinstance(stage_from_tool, str) and stage_from_tool.strip():
+                            next_stage = stage_from_tool
                         report_path = tool_output.get("report_path")
                         if isinstance(report_path, str) and report_path.strip():
                             session_context["last_report_path"] = report_path
+                        handoff_path = tool_output.get("handoff_json_path")
+                        if isinstance(handoff_path, str) and handoff_path.strip():
+                            session_context["last_handoff_path"] = handoff_path
+                    session_context["workflow_stage"] = next_stage
                 turns += 1
                 if max_turns > 0 and turns >= max_turns:
                     print(f"Reached max turns ({max_turns}). Session ended.")
@@ -810,8 +829,10 @@ def _run_analyst_autopilot_turn(
     *,
     user_message: str,
     registry: Any,
+    session_context: dict[str, Any],
     chat_detour: Callable[[str, str], None] | None = None,
     chat_reply_only: Callable[[str], str] | None = None,
+    modeler_chat_reply_only: Callable[[str], str] | None = None,
 ) -> dict[str, Any] | None:
     detected: Path | None = None
     if user_message.strip().lower() == "default":
@@ -1027,6 +1048,10 @@ def _run_analyst_autopilot_turn(
     report_line = f"Report saved: {report_path}"
     print(f"agent> {summary}")
     print(f"agent> {report_line}")
+    artifact_paths = analysis.get("artifact_paths") if isinstance(analysis.get("artifact_paths"), dict) else {}
+    handoff_json_path = str(artifact_paths.get("json_path", "")).strip()
+    if handoff_json_path:
+        print(f"agent> Structured handoff saved: {handoff_json_path}")
     top3_correlations = _extract_top3_correlations_global(analysis)
     if chat_reply_only is not None:
         interpretation = _generate_analysis_interpretation(
@@ -1051,6 +1076,22 @@ def _run_analyst_autopilot_turn(
             )
             print(f"agent> {_format_top3_correlations_line(top3_correlations)}")
 
+    modeler_result: dict[str, Any] | None = None
+    workflow_stage = "analysis_completed"
+    if handoff_json_path:
+        start_modeling = _prompt_start_modeling_after_analysis(chat_detour=chat_detour)
+        if start_modeling:
+            print("agent> Starting Agent 2 handoff-driven modeling.")
+            modeler_result = _start_modeler_from_handoff_path(
+                handoff_path=Path(handoff_json_path),
+                registry=registry,
+                session_context=session_context,
+                chat_reply_only=modeler_chat_reply_only,
+            )
+            modeler_event = modeler_result.get("event") if isinstance(modeler_result, dict) else {}
+            if isinstance(modeler_event, dict) and not modeler_event.get("error"):
+                workflow_stage = "model_training_completed"
+
     response = f"{summary} {report_line}"
     event = {
         "status": "respond",
@@ -1060,9 +1101,126 @@ def _run_analyst_autopilot_turn(
             "target_count": analysis.get("target_count"),
             "candidate_count": analysis.get("candidate_count"),
             "report_path": report_path,
+            "handoff_json_path": handoff_json_path,
+            "workflow_stage": workflow_stage,
+            "modeler_started": bool(modeler_result is not None),
         },
     }
     return {"response": response, "event": event}
+
+
+def _prompt_start_modeling_after_analysis(
+    *,
+    chat_detour: Callable[[str, str], None] | None = None,
+) -> bool:
+    while True:
+        print("agent> Start Agent 2 modeling now from this handoff? [y/N]")
+        answer = input("you> ").strip().lower()
+        if answer in {"", "n", "no"}:
+            return False
+        if answer in {"y", "yes"}:
+            return True
+        if _looks_like_small_talk(answer):
+            if chat_detour is not None:
+                chat_detour(
+                    answer,
+                    "To continue, reply Y to start Agent 2 now, or N to stay in the analyst session.",
+                )
+            else:
+                print("agent> Reply Y to start Agent 2 now, or N to stay in the analyst session.")
+            continue
+        print("agent> Please answer Y or N.")
+
+
+def _start_modeler_from_handoff_path(
+    *,
+    handoff_path: Path,
+    registry: Any,
+    session_context: dict[str, Any],
+    chat_reply_only: Callable[[str], str] | None = None,
+) -> dict[str, Any]:
+    handoff = _load_modeler_handoff_payload(handoff_path)
+    if isinstance(handoff.get("error"), str):
+        response = str(handoff["error"])
+        print(f"agent> {response}")
+        return {
+            "response": response,
+            "event": {"status": "respond", "message": response, "error": "handoff_load_error"},
+        }
+
+    data_path = str(handoff.get("data_path", "")).strip()
+    if not data_path:
+        response = (
+            "The handoff file does not contain a usable `data_path`. "
+            "You can still start the modeler session manually and provide a dataset."
+        )
+        print(f"agent> {response}")
+        return {
+            "response": response,
+            "event": {"status": "respond", "message": response, "error": "handoff_missing_data_path"},
+        }
+
+    dataset_result = _prepare_modeler_dataset_for_session(
+        path=data_path,
+        registry=registry,
+        session_context=session_context,
+    )
+    if dataset_result.get("error"):
+        response = str(dataset_result["error"])
+        return {
+            "response": response,
+            "event": {"status": "respond", "message": response, "error": "modeler_dataset_error"},
+        }
+
+    dataset = _modeler_loaded_dataset(session_context)
+    if dataset is None:
+        response = "Modeler dataset state could not be initialized."
+        print(f"agent> {response}")
+        return {
+            "response": response,
+            "event": {"status": "respond", "message": response, "error": "modeler_state_error"},
+        }
+
+    build_request = _modeler_request_from_handoff(
+        payload=handoff["payload"],
+        handoff=handoff["handoff"],
+        available_signals=list(dataset.get("signal_columns", [])),
+    )
+    if build_request is None:
+        response = (
+            "I could not derive a usable modeling request from that handoff. "
+            "Start the modeler session manually if you want to override everything."
+        )
+        print(f"agent> {response}")
+        return {
+            "response": response,
+            "event": {"status": "respond", "message": response, "error": "handoff_parse_error"},
+        }
+
+    session_context["active_handoff"] = handoff["handoff"]
+    handoff_info = handoff["handoff"]
+    print(
+        "agent> Handoff contract: "
+        f"data_mode=`{handoff_info.get('dataset_profile', {}).get('data_mode', 'n/a')}`, "
+        f"split=`{handoff_info.get('split_strategy', 'n/a')}`, "
+        f"acceptance={handoff_info.get('acceptance_criteria', {})}."
+    )
+    print(
+        "agent> Handoff suggestion: "
+        f"target=`{build_request['target_raw']}`, "
+        f"inputs={build_request['feature_raw']}, "
+        f"recommended_model=`{build_request['requested_model_family']}`."
+    )
+    build_request = _prompt_modeler_overrides(
+        request=build_request,
+        available_signals=list(dataset.get("signal_columns", [])),
+    )
+    return _execute_modeler_build_request(
+        build_request=build_request,
+        registry=registry,
+        session_context=session_context,
+        chat_reply_only=chat_reply_only,
+    )
 
 
 def _run_modeler_autopilot_turn(
@@ -1722,6 +1880,11 @@ def _execute_modeler_build_request(
                 text = line.strip()
                 if text:
                     print(f"agent> {text}")
+        else:
+            print(
+                "agent> LLM interpretation unavailable for this turn. "
+                "Using the deterministic model summary above."
+            )
     session_context["workflow_stage"] = "model_training_completed"
     session_context["last_model_request"] = {
         "target_signal": target,
@@ -1799,6 +1962,11 @@ def _print_modeler_training_summary(*, training: dict[str, Any]) -> None:
     split_info = training.get("split") if isinstance(training.get("split"), dict) else {}
     preprocessing = training.get("preprocessing") if isinstance(training.get("preprocessing"), dict) else {}
     comparison = training.get("comparison") if isinstance(training.get("comparison"), list) else []
+    hyperparameters = (
+        training.get("selected_hyperparameters")
+        if isinstance(training.get("selected_hyperparameters"), dict)
+        else {}
+    )
     print(
         "agent> Split-safe pipeline: "
         f"strategy={split_info.get('strategy', 'n/a')}, "
@@ -1816,6 +1984,11 @@ def _print_modeler_training_summary(*, training: dict[str, Any]) -> None:
         print(
             "agent> Temporal feature plan: "
             f"lag_horizon_samples={int(training.get('lag_horizon_samples') or 0)}."
+        )
+    if hyperparameters:
+        print(
+            "agent> Selected hyperparameters: "
+            f"{dumps_json(hyperparameters, ensure_ascii=False)}."
         )
     for item in comparison:
         if not isinstance(item, dict):
@@ -2233,6 +2406,8 @@ def _compact_modeling_summary(
         "requested_model_family": requested_model_family,
         "selected_model_family": training.get("selected_model_family"),
         "best_validation_model_family": training.get("best_validation_model_family"),
+        "selected_hyperparameters": training.get("selected_hyperparameters"),
+        "model_params_path": training.get("model_params_path"),
         "lag_horizon_samples": training.get("lag_horizon_samples"),
         "split": training.get("split"),
         "preprocessing": training.get("preprocessing"),
@@ -3550,6 +3725,8 @@ def _looks_like_llm_failure_message(message: str) -> bool:
     return (
         "local llm runtime is not reachable" in lowered
         or ("provider connection error" in lowered and "http" in lowered)
+        or "i hit an internal runtime error. please retry." in lowered
+        or "i hit an internal runtime error" in lowered
         or "i hit an internal runtime error in this step" in lowered
         or "session is still active; you can retry" in lowered
     )

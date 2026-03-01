@@ -44,6 +44,8 @@ def test_train_surrogate_candidates_tool_runs_split_safe_linear_and_tree(
         "lagged_linear",
         "bagged_tree_ensemble",
     }
+    assert isinstance(payload["selected_hyperparameters"], dict)
+    assert payload["selected_hyperparameters"]
     assert payload["checkpoint_id"]
     assert Path(payload["run_dir"]).is_dir()
     assert Path(payload["model_params_path"]).is_file()

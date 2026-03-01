@@ -244,17 +244,18 @@ def train_surrogate_candidates(
         run_dir=run_dir,
         model_name=selected_model_name,
     )
+    selected_hyperparameters = _best_params_payload(
+        selected_model_name=selected_model_name,
+        linear_rows_used=linear_rows_used,
+        lagged_model=lagged_model,
+        lagged_tree_model=lagged_tree_model,
+        tree_model=tree_model,
+        requested=requested,
+    )
     params_path = artifact_store.save_model_params(
         run_dir=run_dir,
         model_name=selected_model_name,
-        best_params=_best_params_payload(
-            selected_model_name=selected_model_name,
-            linear_rows_used=linear_rows_used,
-            lagged_model=lagged_model,
-            lagged_tree_model=lagged_tree_model,
-            tree_model=tree_model,
-            requested=requested,
-        ),
+        best_params=selected_hyperparameters,
         metrics=selected_candidate.test_metrics,
         feature_columns=feature_columns,
         target_column=target_column,
@@ -302,6 +303,7 @@ def train_surrogate_candidates(
         "run_dir": str(run_dir),
         "model_state_path": str(model_state_path),
         "model_params_path": str(params_path),
+        "selected_hyperparameters": selected_hyperparameters,
         "lag_horizon_samples": int(lagged_horizon) if lagged_horizon is not None else 0,
         "rows_used": int(rows_used_by_model.get(selected_model_name, prepared_frames["train"].shape[0])),
         "rows_used_by_model": rows_used_by_model,
