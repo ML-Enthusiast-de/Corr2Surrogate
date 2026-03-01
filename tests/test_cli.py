@@ -1441,3 +1441,201 @@ def test_cli_run_agent_session_prints_header_preview_on_confirmation(
     output = capsys.readouterr().out
     assert "Inferred header preview" in output
     assert "sig_a" in output
+
+
+def test_cli_run_agent_session_modeler_direct_request_then_dataset(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    data_path = tmp_path / "model_data.csv"
+    data_path.write_text("A,B,C\n1,2,3\n", encoding="utf-8")
+    inputs = iter(
+        [
+            "build model linear_ridge with inputs A,B and target C",
+            str(data_path),
+            "/exit",
+        ]
+    )
+    registry = _SessionRegistry(
+        scripted_outputs={
+            "prepare_ingestion_step": [
+                {
+                    "status": "ok",
+                    "message": "Ingestion ready.",
+                    "options": [],
+                    "selected_sheet": None,
+                    "available_sheets": [],
+                    "header_row": 0,
+                    "data_start_row": 1,
+                    "header_confidence": 1.0,
+                    "needs_user_confirmation": False,
+                    "row_count": 10,
+                    "column_count": 3,
+                    "signal_columns": ["A", "B", "C"],
+                    "numeric_signal_columns": ["A", "B", "C"],
+                }
+            ],
+            "train_surrogate_candidates": [
+                {
+                    "status": "ok",
+                    "checkpoint_id": "ckpt_linear_1",
+                    "run_dir": "artifacts/run_linear_1",
+                    "selected_model_family": "linear_ridge",
+                    "best_validation_model_family": "bagged_tree_ensemble",
+                    "split": {
+                        "strategy": "blocked_time_order_70_15_15",
+                        "train_size": 7,
+                        "validation_size": 2,
+                        "test_size": 2,
+                    },
+                    "preprocessing": {
+                        "missing_data_strategy_requested": "fill_median",
+                        "missing_data_strategy_effective": "fill_median_train_only",
+                    },
+                    "normalization": {"method": "minmax"},
+                    "comparison": [
+                        {
+                            "model_family": "linear_ridge",
+                            "validation_metrics": {"r2": 0.90, "mae": 0.14},
+                            "test_metrics": {"r2": 0.91, "mae": 0.12},
+                        },
+                        {
+                            "model_family": "bagged_tree_ensemble",
+                            "validation_metrics": {"r2": 0.92, "mae": 0.11},
+                            "test_metrics": {"r2": 0.89, "mae": 0.13},
+                        },
+                    ],
+                    "selected_metrics": {
+                        "test": {"r2": 0.91, "mae": 0.12},
+                    },
+                    "rows_used": 10,
+                }
+            ],
+        }
+    )
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
+
+    exit_code = main(["run-agent-session", "--agent", "modeler"])
+    assert exit_code == 0
+    assert registry.calls[0][0] == "prepare_ingestion_step"
+    assert registry.calls[1][0] == "train_surrogate_candidates"
+    assert registry.calls[1][1]["target_column"] == "C"
+    assert registry.calls[1][1]["feature_columns"] == ["A", "B"]
+    assert registry.calls[1][1]["requested_model_family"] == "linear_ridge"
+    assert Path(registry.calls[1][1]["data_path"]).resolve() == data_path.resolve()
+    output = capsys.readouterr().out
+    assert "I parsed your model request." in output
+    assert "Continuing with your pending model request." in output
+    assert "Split-safe pipeline:" in output
+    assert "Candidate `linear_ridge`" in output
+    assert "Model build complete:" in output
+
+
+def test_cli_run_agent_session_modeler_handoff_allows_override_prompts(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    data_path = tmp_path / "model_data.csv"
+    data_path.write_text("A,B,C\n1,2,3\n", encoding="utf-8")
+    handoff_path = tmp_path / "structured_report.json"
+    handoff_path.write_text(
+        json.dumps(
+            {
+                "data_path": str(data_path),
+                "model_strategy_recommendations": {
+                    "target_recommendations": [
+                        {
+                            "target_signal": "C",
+                            "probe_predictor_signals": ["A", "B"],
+                            "recommended_model_family": "tree_ensemble_candidate",
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    inputs = iter(
+        [
+            f"use handoff {handoff_path}",
+            "",
+            "",
+            "",
+            "/exit",
+        ]
+    )
+    registry = _SessionRegistry(
+        scripted_outputs={
+            "prepare_ingestion_step": [
+                {
+                    "status": "ok",
+                    "message": "Ingestion ready.",
+                    "options": [],
+                    "selected_sheet": None,
+                    "available_sheets": [],
+                    "header_row": 0,
+                    "data_start_row": 1,
+                    "header_confidence": 1.0,
+                    "needs_user_confirmation": False,
+                    "row_count": 10,
+                    "column_count": 3,
+                    "signal_columns": ["A", "B", "C"],
+                    "numeric_signal_columns": ["A", "B", "C"],
+                }
+            ],
+            "train_surrogate_candidates": [
+                {
+                    "status": "ok",
+                    "checkpoint_id": "ckpt_linear_2",
+                    "run_dir": "artifacts/run_linear_2",
+                    "selected_model_family": "bagged_tree_ensemble",
+                    "best_validation_model_family": "bagged_tree_ensemble",
+                    "split": {
+                        "strategy": "deterministic_modulo_70_15_15",
+                        "train_size": 7,
+                        "validation_size": 2,
+                        "test_size": 2,
+                    },
+                    "preprocessing": {
+                        "missing_data_strategy_requested": "fill_median",
+                        "missing_data_strategy_effective": "fill_median_train_only",
+                    },
+                    "normalization": {"method": "minmax"},
+                    "comparison": [
+                        {
+                            "model_family": "linear_ridge",
+                            "validation_metrics": {"r2": 0.82, "mae": 0.20},
+                            "test_metrics": {"r2": 0.80, "mae": 0.21},
+                        },
+                        {
+                            "model_family": "bagged_tree_ensemble",
+                            "validation_metrics": {"r2": 0.90, "mae": 0.15},
+                            "test_metrics": {"r2": 0.88, "mae": 0.16},
+                        },
+                    ],
+                    "selected_metrics": {
+                        "test": {"r2": 0.88, "mae": 0.16},
+                    },
+                    "rows_used": 10,
+                }
+            ],
+        }
+    )
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
+
+    exit_code = main(["run-agent-session", "--agent", "modeler"])
+    assert exit_code == 0
+    assert registry.calls[0][0] == "prepare_ingestion_step"
+    assert registry.calls[1][0] == "train_surrogate_candidates"
+    assert registry.calls[1][1]["target_column"] == "C"
+    assert registry.calls[1][1]["feature_columns"] == ["A", "B"]
+    assert registry.calls[1][1]["requested_model_family"] == "bagged_tree_ensemble"
+    output = capsys.readouterr().out
+    assert "Handoff suggestion:" in output
+    assert "Press Enter to use the recommended model `tree_ensemble_candidate`" in output
+    assert "Candidate `bagged_tree_ensemble`" in output
+    assert "Model build complete:" in output

@@ -4,7 +4,7 @@ Corr2Surrogate is a local-first framework for converting real-world sensor data 
 
 ## What It Does
 - Agent 1 (`Analyst`) ingests CSV/XLS/XLSX data, checks data quality, runs correlation analysis, ranks surrogate candidates, and performs lightweight probe-model screening to recommend which model families Agent 2 should test first.
-- Agent 2 (`Modeler`) is designed to train/evaluate surrogate models with reproducible artifacts and checkpoints. The intended search order is pragmatic: start with linear or lagged baselines, escalate to tree ensembles when interaction or piecewise evidence is real, and only test sequence models when temporal probes justify it. (full implementation still pending)
+- Agent 2 (`Modeler`) now has a first executable training path: split-safe train/validation/test modeling with a linear baseline, a real nonlinear tree baseline, reproducible artifacts, and result interpretation. The intended search order remains pragmatic: start with linear or lagged baselines, escalate to tree ensembles when interaction or piecewise evidence is real, and only test sequence models when temporal probes justify it.
 
 ## Key Capabilities
 - CSV/XLS/XLSX ingestion with sheet selection and header/data-start inference
@@ -17,6 +17,9 @@ Corr2Surrogate is a local-first framework for converting real-world sensor data 
 - Evidence-backed recommendation blocks with probe inputs, quick metrics, and confidence
 - Dependency-aware surrogate ranking
 - Dataset-scoped reports and artifact export
+- Split-safe Agent 2 training (train-only preprocessing, deterministic train/validation/test splits)
+- First nonlinear modeling baseline: local bagged tree ensemble
+- Candidate comparison with LLM-assisted model interpretation in the CLI
 - Local runtime by default; optional API mode via explicit opt-in
 
 ## Privacy Defaults
@@ -165,16 +168,116 @@ corr2surrogate run-agent1-analysis \
 ## Planned Agent 2 Modeling Roadmap
 Agent 1 now emits a model-strategy prior for each target. Agent 2 should treat that as a search-order hint, not a guarantee.
 
+Current executable model families:
+- `linear_ridge`
+- `bagged_tree_ensemble`
+
 Recommended model families to implement next:
-- Steady-state / tabular: `Ridge` or `ElasticNet` baseline first
-- Nonlinear tabular: tree ensembles (`RandomForest`, `ExtraTrees`, `HistGradientBoosting`) after the linear baseline
-- Time-series: lagged linear baseline first
-- Stronger time-series tabular: lag-window tree ensembles after lagged linear
-- Sequence models: `GRU`/`LSTM` only when lagged/tabular probes still leave meaningful residual dynamics
+- steady-state / tabular: add `ElasticNet`
+- time-series: add true lagged linear training (Agent 1 already recommends it)
+- stronger time-series tabular: lag-window tree ensembles after lagged linear
+- sequence models: `GRU`/`LSTM` only when lagged/tabular probes still leave meaningful residual dynamics
 
 Operational rule:
 - do not jump directly to LSTM just because a target is time-based
 - require evidence from lag benefit, autocorrelation, and failed simpler baselines first
+
+## Concrete Implementation Sequence
+This is the planned implementation order to maximize practical value while keeping the system scientifically defensible.
+
+1. Build executable `Agent2Handoff` consumption:
+   - Agent 2 must accept Agent 1 target, predictor, normalization, and constraint payloads directly.
+2. Implement split-safe preprocessing:
+   - split first
+   - fit imputation/normalization on train only
+   - apply unchanged transforms to validation/test
+3. Implement the first true end-to-end baseline trainers:
+   - steady-state: `Ridge` / `ElasticNet`
+   - time-series: `lagged linear`
+4. Add the first nonlinear baseline:
+   - `HistGradientBoostingRegressor` or `ExtraTreesRegressor`
+5. Add model comparison and acceptance logic:
+   - compare baseline vs higher-capacity models on validation/test
+   - promote only when the more complex model shows meaningful validated gain
+6. Persist reproducible artifacts:
+   - model weights/parameters
+   - feature list / lag schema
+   - split metadata
+   - normalization state
+   - metrics and lineage
+7. Add post-model failure analysis:
+   - identify operating regions with high error
+   - recommend concrete new lab/testbench trajectories
+8. Add bounded optimization loops:
+   - Optuna only after the deterministic training pipeline is correct
+
+Current state:
+- steps 2-4 are now implemented in the first modeler path
+- the next highest-value gap is richer handoff execution plus lagged/time-aware training
+
+## Modeling Entry Modes
+Two user entry paths are part of the intended product behavior:
+
+1. Handoff-driven mode:
+   - run Agent 1 analysis first
+   - pass Agent 1 recommendations into Agent 2 as a prior
+2. Direct modeler mode (skip Agent 1):
+   - user may immediately ask Agent 2 to build a model with explicit inputs and target
+   - current executable implementation supports `auto`, `linear_ridge`, and `bagged_tree_ensemble`
+   - example intent: "build model `linear_ridge` with inputs `A,B,C` and target `D`"
+   - this fast path should not require a prior Agent 1 handoff
+
+Session entry examples:
+```powershell
+& .\.venv\Scripts\corr2surrogate.exe run-agent-session --agent modeler
+```
+
+Example direct modeler request:
+- `build model linear_ridge with inputs A,B,C and target D`
+- `build model tree with inputs torque,temp,flow and target pressure`
+
+Current implementation note:
+- the direct modeler session currently executes `auto`, `linear_ridge` / `ridge` / `linear`, and `bagged_tree_ensemble` / `tree`
+- the modeler CLI now runs a split-safe comparison between the linear baseline and the tree baseline, prints staged progress updates, then uses the LLM to interpret the result after training
+
+## User Override Rules For Agent 2
+Even when a valid Agent 1 handoff exists, the user must remain in control of the modeling scope.
+
+Agent 2 should offer these choices:
+- use Agent 1 recommended target/predictors/model family
+- choose a specific target manually
+- choose specific predictor inputs manually (with `list` / filtered list support)
+- choose a specific model architecture manually
+
+Priority rule:
+- explicit user choices override Agent 1 recommendations unless they violate a hard policy or missing-data / split-safety constraint
+
+Example override intents after handoff:
+- `use the recommended target but only inputs A,C,F`
+- `show signal list`
+- `train a tree ensemble for target D using inputs A,B,C`
+
+## LLM Role And Boundaries
+The LLM should be used as an agent, but only inside a bounded control loop.
+
+Use the LLM for:
+- conversational steering and clarification
+- choosing the next safe tool call among registered tools
+- explaining analysis and modeling results in plain scientific language
+- proposing next experiments, architecture changes, or feature hypotheses
+
+Keep deterministic tools as the source of truth for:
+- data loading and schema inference
+- correlation metrics and probe-model scores
+- split creation, preprocessing, training, and persisted artifacts
+- acceptance decisions based on measured validation/test metrics
+
+Prompting guidance to improve agent quality:
+- always include the current `workflow_stage`
+- include the last 5 user prompts plus the latest compact tool result
+- include hard constraints (critical signals, non-virtualizable signals, accepted overrides)
+- explicitly remind the model that correlation is not causality and time-series does not imply LSTM by default
+- require the assistant to answer naturally, then steer back to the pending required input or next tool decision
 
 ## Behavior and Prompt Control
 - Runtime defaults: `configs/default.yaml`

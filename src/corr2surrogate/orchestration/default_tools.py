@@ -33,6 +33,7 @@ from corr2surrogate.ingestion import load_tabular_data
 from corr2surrogate.modeling.baselines import IncrementalLinearSurrogate
 from corr2surrogate.modeling.checkpoints import ModelCheckpointStore
 from corr2surrogate.modeling.performance_feedback import analyze_model_performance
+from corr2surrogate.modeling.training import train_surrogate_candidates
 from corr2surrogate.persistence.artifact_store import ArtifactStore
 from corr2surrogate.persistence.run_store import RunStore
 
@@ -196,6 +197,38 @@ def build_default_registry() -> ToolRegistry:
             "additionalProperties": False,
         },
         handler=_tool_train_incremental_linear_surrogate,
+        risk_level="low",
+    )
+
+    registry.register_function(
+        name="train_surrogate_candidates",
+        description=(
+            "Run split-safe train/validation/test training for the linear baseline and "
+            "the first nonlinear baseline, compare them, and persist the selected model."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "data_path": {"type": "string"},
+                "target_column": {"type": "string"},
+                "feature_columns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "requested_model_family": {"type": "string"},
+                "sheet_name": {"type": "string"},
+                "timestamp_column": {"type": "string"},
+                "run_id": {"type": "string"},
+                "checkpoint_tag": {"type": "string"},
+                "normalize": {"type": "boolean"},
+                "missing_data_strategy": {"type": "string"},
+                "fill_constant_value": {"type": "number"},
+                "compare_against_baseline": {"type": "boolean"},
+            },
+            "required": ["data_path", "target_column", "feature_columns", "requested_model_family"],
+            "additionalProperties": False,
+        },
+        handler=_tool_train_surrogate_candidates,
         risk_level="low",
     )
 
@@ -685,6 +718,39 @@ def _tool_train_incremental_linear_surrogate(
         "metrics": metrics,
         "rows_used": rows_used,
     }
+
+
+def _tool_train_surrogate_candidates(
+    *,
+    data_path: str,
+    target_column: str,
+    feature_columns: list[str],
+    requested_model_family: str,
+    sheet_name: str | None = None,
+    timestamp_column: str | None = None,
+    run_id: str | None = None,
+    checkpoint_tag: str | None = None,
+    normalize: bool = True,
+    missing_data_strategy: str = "fill_median",
+    fill_constant_value: float | None = None,
+    compare_against_baseline: bool = True,
+) -> dict[str, Any]:
+    frame = _load_frame(data_path=data_path, sheet_name=sheet_name)
+    result = train_surrogate_candidates(
+        frame=frame,
+        target_column=target_column,
+        feature_columns=feature_columns,
+        requested_model_family=requested_model_family,
+        timestamp_column=timestamp_column,
+        normalize=normalize,
+        missing_data_strategy=missing_data_strategy,
+        fill_constant_value=fill_constant_value,
+        compare_against_baseline=compare_against_baseline,
+        run_id=run_id,
+        checkpoint_tag=checkpoint_tag,
+        data_references=[data_path],
+    )
+    return result
 
 
 def _tool_resume_incremental_linear_surrogate(

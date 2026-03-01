@@ -9,9 +9,19 @@ from .performance_feedback import (
     TrajectorySuggestion,
     analyze_model_performance,
 )
+from .splitters import DatasetSplit, build_train_validation_test_split
+from .training import (
+    BaggedTreeEnsembleSurrogate,
+    CandidateMetrics,
+    normalize_candidate_model_family,
+    train_surrogate_candidates,
+)
 
 __all__ = [
     "BadRegion",
+    "BaggedTreeEnsembleSurrogate",
+    "CandidateMetrics",
+    "DatasetSplit",
     "IncrementalLinearSurrogate",
     "MinMaxNormalizer",
     "ModelCheckpoint",
@@ -20,4 +30,7 @@ __all__ = [
     "RetrainPlan",
     "TrajectorySuggestion",
     "analyze_model_performance",
+    "build_train_validation_test_split",
+    "normalize_candidate_model_family",
+    "train_surrogate_candidates",
 ]

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from corr2surrogate.core.json_utils import dumps_json
+from corr2surrogate.modeling import normalize_candidate_model_family
 from corr2surrogate.orchestration.default_tools import build_default_registry
 from corr2surrogate.orchestration.harness_runner import run_local_agent_once
 from corr2surrogate.orchestration.local_llm_setup import setup_local_llm
@@ -411,7 +412,10 @@ def _run_agent_session(
     print(f"agent> Welcome to Corr2Surrogate ({agent} session).")
     if agent == "analyst":
         default_dataset_path = _resolve_default_public_dataset_path()
-        print("agent> I can chat, inspect CSV/XLSX data, run Agent 1 analysis, and save reports.")
+        print(
+            "agent> I can chat, inspect CSV/XLSX data, run Agent 1 analysis, "
+            "save reports, and interpret the results."
+        )
         print(
             "agent> Runtime mode: local LLM by default. Optional API mode: set "
             "C2S_PROVIDER=openai, C2S_API_CALLS_ALLOWED=true, "
@@ -438,12 +442,50 @@ def _run_agent_session(
                 "(`default` is unavailable because no public test dataset was found.)"
             )
     else:
-        print("agent> I can chat and run local modeler workflows through tool calls.")
-        print("agent> Useful commands: /help, /context, /reset, /exit.")
+        default_dataset_path = _resolve_default_public_dataset_path()
+        print(
+            "agent> I can chat, load CSV/XLSX data, run direct modeler workflows, "
+            "and explain the training outcome."
+        )
+        print(
+            "agent> Useful commands: /help, /context, /reset, /exit. "
+            "Use `list` after loading data to inspect available signals."
+        )
+        print(
+            "agent> Direct build syntax: "
+            "`build model linear_ridge with inputs A,B,C and target D`."
+        )
+        print(
+            "agent> Current executable models: `auto`, `linear_ridge`, "
+            "`bagged_tree_ensemble` "
+            "(aliases include `ridge`, `linear`, `tree`, `tree_ensemble`, "
+            "`extra_trees`, `hist_gradient_boosting`)."
+        )
+        print(
+            "agent> During training I will print staged progress, compare candidates on "
+            "validation/test, and then give an LLM interpretation grounded in those metrics."
+        )
+        print(
+            "agent> Handoff syntax: "
+            "`use handoff path\\\\to\\\\structured_report.json` "
+            "to load an Agent 1 structured report and then confirm/override target, inputs, and model."
+        )
+        if default_dataset_path is not None:
+            print(
+                "agent> Dataset choice: paste a CSV/XLSX path, type `default`, "
+                "or give a direct build request first and then provide the dataset."
+            )
+        else:
+            print(
+                "agent> Dataset choice: paste a CSV/XLSX path, "
+                "or give a direct build request first and then provide the dataset."
+            )
     session_messages: list[dict[str, str]] = []
     session_context = dict(base_context)
     if agent == "analyst":
         session_context.setdefault("workflow_stage", "awaiting_dataset_path")
+    else:
+        session_context.setdefault("workflow_stage", "awaiting_modeler_request_or_dataset")
     registry = build_default_registry()
     turns = 0
 
@@ -496,7 +538,28 @@ def _run_agent_session(
                         "agent> Type `default` to analyze the built-in public test dataset."
                     )
             else:
-                print("agent> Commands: /help, /context, /reset, /exit")
+                default_dataset_path = _resolve_default_public_dataset_path()
+                print("agent> Commands: /help, /context, /reset, /exit.")
+                print(
+                    "agent> Load a dataset by pasting a CSV/XLSX path, "
+                    "or type `default` to use the built-in public test dataset."
+                    if default_dataset_path is not None
+                    else "agent> Load a dataset by pasting a CSV/XLSX path."
+                )
+                print(
+                    "agent> Direct build syntax: "
+                    "`build model linear_ridge with inputs A,B,C and target D`."
+                )
+                print(
+                    "agent> Current executable models: `auto`, `linear_ridge`, "
+                    "`bagged_tree_ensemble` "
+                    "(aliases include `ridge`, `linear`, `tree`, `tree_ensemble`, "
+                    "`extra_trees`, `hist_gradient_boosting`)."
+                )
+                print(
+                    "agent> You can also load an Agent 1 handoff via: "
+                    "`use handoff path\\\\to\\\\structured_report.json`."
+                )
             continue
         if command == "/context":
             snapshot = dict(session_context)
@@ -585,6 +648,55 @@ def _run_agent_session(
                     return 0
                 continue
 
+        if agent == "modeler":
+            def _modeler_chat_reply_internal(detour_user_message: str) -> str:
+                return _llm_chat_detour(
+                    agent=agent,
+                    user_message=detour_user_message,
+                    session_context=session_context,
+                    session_messages=session_messages,
+                    config_path=config_path,
+                    record_in_history=False,
+                )
+
+            try:
+                autopilot = _run_modeler_autopilot_turn(
+                    user_message=user_message,
+                    registry=registry,
+                    session_context=session_context,
+                    chat_reply_only=_modeler_chat_reply_internal,
+                )
+            except Exception as exc:
+                response = _runtime_error_fallback_message(
+                    agent=agent,
+                    user_message=user_message,
+                    error=exc,
+                )
+                print(f"agent> {response}")
+                session_messages.append({"role": "user", "content": user_message})
+                session_messages.append({"role": "assistant", "content": response})
+                session_messages = session_messages[-20:]
+                session_context["last_event"] = _compact_event_for_context(
+                    {"status": "respond", "message": response, "error": "runtime_error"}
+                )
+                turns += 1
+                if max_turns > 0 and turns >= max_turns:
+                    print(f"Reached max turns ({max_turns}). Session ended.")
+                    return 0
+                continue
+            if autopilot is not None:
+                response = autopilot["response"]
+                summary_event = autopilot["event"]
+                session_messages.append({"role": "user", "content": user_message})
+                session_messages.append({"role": "assistant", "content": response})
+                session_messages = session_messages[-20:]
+                session_context["last_event"] = _compact_event_for_context(summary_event)
+                turns += 1
+                if max_turns > 0 and turns >= max_turns:
+                    print(f"Reached max turns ({max_turns}). Session ended.")
+                    return 0
+                continue
+
         turn_context = dict(session_context)
         turn_context["session_messages"] = list(session_messages)
         turn_context["recent_user_prompts"] = _recent_user_prompts(
@@ -658,20 +770,35 @@ def _analyst_stage_reprompt_message(
     session_context: dict[str, Any],
     user_message: str,
 ) -> str:
-    if agent != "analyst":
-        return ""
     stage = str(session_context.get("workflow_stage", "")).strip().lower()
-    if stage != "awaiting_dataset_path":
-        return ""
     lowered = user_message.strip().lower()
-    if lowered == "default":
-        return ""
-    if _extract_first_data_path(user_message) is not None:
-        return ""
-    return (
-        "To continue, paste a CSV/XLSX path or type `default` "
-        "to run the built-in test dataset."
-    )
+    if agent == "analyst":
+        if stage != "awaiting_dataset_path":
+            return ""
+        if lowered == "default":
+            return ""
+        if _extract_first_data_path(user_message) is not None:
+            return ""
+        return (
+            "To continue, paste a CSV/XLSX path or type `default` "
+            "to run the built-in test dataset."
+        )
+    if agent == "modeler":
+        if stage == "awaiting_modeler_dataset_path":
+            if lowered == "default":
+                return ""
+            if _extract_first_data_path(user_message) is not None:
+                return ""
+            return (
+                "To continue, paste a CSV/XLSX path or type `default` "
+                "so I can load data for the pending model request."
+            )
+        if stage == "modeler_dataset_ready":
+            return (
+                "To continue, type `list` to inspect signals or "
+                "`build model linear_ridge with inputs A,B and target C`."
+            )
+    return ""
 
 
 def _run_analyst_autopilot_turn(
@@ -933,6 +1060,802 @@ def _run_analyst_autopilot_turn(
     return {"response": response, "event": event}
 
 
+def _run_modeler_autopilot_turn(
+    *,
+    user_message: str,
+    registry: Any,
+    session_context: dict[str, Any],
+    chat_reply_only: Callable[[str], str] | None = None,
+) -> dict[str, Any] | None:
+    stripped = user_message.strip()
+    lowered = stripped.lower()
+
+    if lowered.startswith(("use handoff", "load handoff")):
+        handoff_path = _extract_first_json_path(user_message)
+        if handoff_path is None:
+            response = (
+                "I did not detect a handoff JSON path. "
+                "Use: `use handoff path\\to\\structured_report.json`."
+            )
+            print(f"agent> {response}")
+            return {
+                "response": response,
+                "event": {"status": "respond", "message": response, "error": "handoff_path_missing"},
+            }
+        handoff = _load_modeler_handoff_payload(handoff_path)
+        if isinstance(handoff.get("error"), str):
+            response = str(handoff["error"])
+            print(f"agent> {response}")
+            return {
+                "response": response,
+                "event": {"status": "respond", "message": response, "error": "handoff_load_error"},
+            }
+
+        data_path = str(handoff.get("data_path", "")).strip()
+        if not data_path:
+            response = (
+                "The handoff file does not contain a usable `data_path`. "
+                "Provide a dataset path directly or generate a newer Agent 1 structured report."
+            )
+            print(f"agent> {response}")
+            return {
+                "response": response,
+                "event": {"status": "respond", "message": response, "error": "handoff_missing_data_path"},
+            }
+
+        dataset_result = _prepare_modeler_dataset_for_session(
+            path=data_path,
+            registry=registry,
+            session_context=session_context,
+        )
+        if dataset_result.get("error"):
+            response = str(dataset_result["error"])
+            return {
+                "response": response,
+                "event": {"status": "respond", "message": response, "error": "modeler_dataset_error"},
+            }
+
+        dataset = _modeler_loaded_dataset(session_context)
+        if dataset is None:
+            response = "Modeler dataset state could not be initialized."
+            print(f"agent> {response}")
+            return {
+                "response": response,
+                "event": {"status": "respond", "message": response, "error": "modeler_state_error"},
+            }
+
+        build_request = _modeler_request_from_handoff(
+            payload=handoff["payload"],
+            available_signals=list(dataset.get("signal_columns", [])),
+        )
+        if build_request is None:
+            response = (
+                "I could not derive a usable modeling request from that handoff. "
+                "Please specify target, inputs, and model directly."
+            )
+            print(f"agent> {response}")
+            return {
+                "response": response,
+                "event": {"status": "respond", "message": response, "error": "handoff_parse_error"},
+            }
+
+        print(
+            "agent> Handoff suggestion: "
+            f"target=`{build_request['target_raw']}`, "
+            f"inputs={build_request['feature_raw']}, "
+            f"recommended_model=`{build_request['requested_model_family']}`."
+        )
+        build_request = _prompt_modeler_overrides(
+            request=build_request,
+            available_signals=list(dataset.get("signal_columns", [])),
+        )
+        return _execute_modeler_build_request(
+            build_request=build_request,
+            registry=registry,
+            session_context=session_context,
+            chat_reply_only=chat_reply_only,
+        )
+
+    parsed_request = _parse_modeler_build_request(user_message)
+    if parsed_request is not None:
+        requested_data_path = str(parsed_request.get("data_path", "")).strip()
+        if requested_data_path:
+            dataset_result = _prepare_modeler_dataset_for_session(
+                path=requested_data_path,
+                registry=registry,
+                session_context=session_context,
+            )
+            if dataset_result.get("error"):
+                response = str(dataset_result["error"])
+                return {
+                    "response": response,
+                    "event": {
+                        "status": "respond",
+                        "message": response,
+                        "error": "modeler_dataset_error",
+                    },
+                }
+
+        if _modeler_loaded_dataset(session_context) is None:
+            session_context["pending_model_request"] = parsed_request
+            session_context["workflow_stage"] = "awaiting_modeler_dataset_path"
+            response = (
+                "I parsed your model request. To continue, paste a CSV/XLSX path "
+                "or type `default` so I can load the training dataset first."
+            )
+            print(f"agent> {response}")
+            return {
+                "response": response,
+                "event": {"status": "respond", "message": response},
+            }
+        return _execute_modeler_build_request(
+            build_request=parsed_request,
+            registry=registry,
+            session_context=session_context,
+            chat_reply_only=chat_reply_only,
+        )
+
+    if lowered.startswith("list"):
+        dataset = _modeler_loaded_dataset(session_context)
+        if dataset is None:
+            response = (
+                "Load a dataset first, then I can show available signal names. "
+                "Paste a CSV/XLSX path or type `default`."
+            )
+            print(f"agent> {response}")
+            return {
+                "response": response,
+                "event": {"status": "respond", "message": response},
+            }
+        query = stripped[4:].strip()
+        _print_signal_names(list(dataset.get("signal_columns", [])), query=query)
+        response = "Signal list displayed."
+        return {
+            "response": response,
+            "event": {"status": "respond", "message": response},
+        }
+
+    detected: Path | None = None
+    if lowered == "default":
+        detected = _resolve_default_public_dataset_path()
+        if detected is None:
+            response = (
+                "Default dataset is not available. "
+                "Please paste a CSV/XLSX path from your machine."
+            )
+            print(f"agent> {response}")
+            return {
+                "response": response,
+                "event": {"status": "respond", "message": response, "error": "default_dataset_missing"},
+            }
+    else:
+        detected = _extract_first_data_path(user_message)
+
+    if detected is None:
+        return None
+
+    dataset_result = _prepare_modeler_dataset_for_session(
+        path=str(detected),
+        registry=registry,
+        session_context=session_context,
+    )
+    if dataset_result.get("error"):
+        response = str(dataset_result["error"])
+        return {
+            "response": response,
+            "event": {"status": "respond", "message": response, "error": "modeler_dataset_error"},
+        }
+
+    pending_request = session_context.pop("pending_model_request", None)
+    if isinstance(pending_request, dict):
+        print("agent> Continuing with your pending model request.")
+        return _execute_modeler_build_request(
+            build_request=pending_request,
+            registry=registry,
+            session_context=session_context,
+            chat_reply_only=chat_reply_only,
+        )
+
+    response = (
+        "Dataset ready. Type `list` to inspect signals, "
+        "or `build model linear_ridge with inputs A,B and target C` to train."
+    )
+    print(f"agent> {response}")
+    return {
+        "response": response,
+        "event": {
+            "status": "respond",
+            "message": response,
+            "tool_output": {
+                "data_path": str((detected if lowered != 'default' else _resolve_default_public_dataset_path()) or detected),
+                "signal_count": len((_modeler_loaded_dataset(session_context) or {}).get("signal_columns", [])),
+            },
+        },
+    }
+
+
+def _prepare_modeler_dataset_for_session(
+    *,
+    path: str,
+    registry: Any,
+    session_context: dict[str, Any],
+) -> dict[str, Any]:
+    data_path = str(Path(path).expanduser())
+    detected = Path(data_path)
+    if not detected.exists():
+        response = f"Detected data path but file does not exist: {data_path}"
+        print(f"agent> {response}")
+        return {"error": response}
+
+    print(f"agent> Detected data file: {_path_for_display(detected)}")
+    preflight_args: dict[str, Any] = {"path": data_path}
+    preflight = _execute_registry_tool(registry, "prepare_ingestion_step", preflight_args)
+    print(f"agent> Ingestion check: {preflight.get('message', '')}")
+
+    if preflight.get("status") == "needs_user_input":
+        options = preflight.get("options") or preflight.get("available_sheets") or []
+        selected_sheet = _prompt_sheet_selection(options)
+        if selected_sheet is None:
+            return {"error": "Sheet selection aborted. Please provide a valid sheet."}
+        preflight_args["sheet_name"] = selected_sheet
+        preflight = _execute_registry_tool(registry, "prepare_ingestion_step", preflight_args)
+        print(f"agent> Ingestion check: {preflight.get('message', '')}")
+
+    if preflight.get("status") != "ok":
+        return {"error": preflight.get("message") or "Ingestion failed."}
+
+    selected_sheet = preflight.get("selected_sheet")
+    header_row = preflight.get("header_row")
+    data_start_row = preflight.get("data_start_row")
+    inferred_header_row = preflight.get("header_row")
+    wide_table = int(preflight.get("column_count") or 0) >= 50
+    force_header_check = isinstance(inferred_header_row, int) and inferred_header_row > 0 and wide_table
+    if bool(preflight.get("needs_user_confirmation")) or force_header_check:
+        if bool(preflight.get("needs_user_confirmation")):
+            print(
+                "agent> Header detection confidence is low "
+                f"({preflight.get('header_confidence', 'n/a')})."
+            )
+        if force_header_check and not bool(preflight.get("needs_user_confirmation")):
+            print(
+                "agent> Wide table with non-zero header row detected; "
+                "please confirm inferred rows before modeling."
+            )
+        _print_header_preview(preflight)
+        resolved_header_row = int(header_row) if isinstance(header_row, int) else 0
+        resolved_data_start = (
+            int(data_start_row)
+            if isinstance(data_start_row, int)
+            else max(resolved_header_row + 1, 1)
+        )
+        header_row, data_start_row = _prompt_header_confirmation(
+            header_row=resolved_header_row,
+            data_start_row=resolved_data_start,
+        )
+        preflight_args["header_row"] = int(header_row)
+        preflight_args["data_start_row"] = int(data_start_row)
+        preflight = _execute_registry_tool(registry, "prepare_ingestion_step", preflight_args)
+        print(f"agent> Ingestion check: {preflight.get('message', '')}")
+        _print_header_preview(preflight)
+        if preflight.get("status") != "ok":
+            return {"error": preflight.get("message") or "Ingestion confirmation failed."}
+
+    dataset = {
+        "data_path": data_path,
+        "sheet_name": selected_sheet,
+        "header_row": header_row,
+        "data_start_row": data_start_row,
+        "timestamp_column_hint": str(preflight.get("timestamp_column_hint") or "").strip() or None,
+        "signal_columns": [str(item) for item in (preflight.get("signal_columns") or [])],
+        "numeric_signal_columns": [
+            str(item) for item in (preflight.get("numeric_signal_columns") or [])
+        ],
+        "row_count": int(preflight.get("row_count") or 0),
+    }
+    session_context["modeler_dataset"] = dataset
+    session_context["workflow_stage"] = "modeler_dataset_ready"
+    print(
+        "agent> Dataset ready: "
+        f"rows={dataset['row_count']}, "
+        f"signals={len(dataset['signal_columns'])}, "
+        f"numeric_signals={len(dataset['numeric_signal_columns'])}."
+    )
+    return {"dataset": dataset}
+
+
+def _modeler_loaded_dataset(session_context: dict[str, Any]) -> dict[str, Any] | None:
+    dataset = session_context.get("modeler_dataset")
+    return dataset if isinstance(dataset, dict) else None
+
+
+def _parse_modeler_build_request(user_message: str) -> dict[str, Any] | None:
+    text = user_message.strip()
+    pattern = re.compile(
+        r"^\s*(?:build|train)(?:\s+me)?\s+model\s+(?P<model>[A-Za-z0-9_\-]+)\s+"
+        r"with\s+(?:inputs|inouts|features|predictors)\s+(?P<inputs>.+?)\s+"
+        r"and\s+target\s+(?P<target>.+?)"
+        r"(?:\s+(?:using|from|on)(?:\s+data)?\s+.+)?\s*$",
+        flags=re.IGNORECASE,
+    )
+    match = pattern.match(text)
+    if not match:
+        return None
+    inputs_raw = match.group("inputs").strip()
+    target_raw = _strip_wrapping_quotes(match.group("target").strip())
+    feature_raw = _split_modeler_input_tokens(inputs_raw)
+    if not feature_raw or not target_raw:
+        return None
+    data_path = _extract_first_data_path(user_message)
+    return {
+        "requested_model_family": match.group("model").strip(),
+        "feature_raw": feature_raw,
+        "target_raw": target_raw,
+        "data_path": str(data_path) if data_path is not None else "",
+        "source": "direct",
+    }
+
+
+def _split_modeler_input_tokens(raw: str) -> list[str]:
+    text = raw.strip()
+    if not text:
+        return []
+    if "," in text or "|" in text:
+        parts = [item.strip() for item in re.split(r"[,|]", text) if item.strip()]
+    else:
+        parts = [item.strip() for item in text.split() if item.strip()]
+    return [_strip_wrapping_quotes(item) for item in parts if _strip_wrapping_quotes(item)]
+
+
+def _strip_wrapping_quotes(value: str) -> str:
+    text = value.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        return text[1:-1].strip()
+    return text
+
+
+def _execute_modeler_build_request(
+    *,
+    build_request: dict[str, Any],
+    registry: Any,
+    session_context: dict[str, Any],
+    chat_reply_only: Callable[[str], str] | None = None,
+) -> dict[str, Any]:
+    dataset = _modeler_loaded_dataset(session_context)
+    if dataset is None:
+        response = "No dataset is loaded. Paste a CSV/XLSX path or type `default` first."
+        print(f"agent> {response}")
+        session_context["workflow_stage"] = "awaiting_modeler_dataset_path"
+        return {
+            "response": response,
+            "event": {"status": "respond", "message": response, "error": "dataset_missing"},
+        }
+
+    numeric_signals = list(dataset.get("numeric_signal_columns", []))
+    if not numeric_signals:
+        response = (
+            "The loaded dataset does not expose usable numeric signals for training. "
+            "Please load another dataset or adjust the header selection."
+        )
+        print(f"agent> {response}")
+        return {
+            "response": response,
+            "event": {"status": "respond", "message": response, "error": "no_numeric_signals"},
+        }
+
+    target = _resolve_signal_name(str(build_request.get("target_raw", "")).strip(), numeric_signals)
+    if target is None:
+        response = (
+            "I could not resolve the requested target signal in the loaded dataset. "
+            "Type `list` to inspect signal names and retry."
+        )
+        print(f"agent> {response}")
+        return {
+            "response": response,
+            "event": {"status": "respond", "message": response, "error": "target_unresolved"},
+        }
+
+    raw_features = [str(item).strip() for item in build_request.get("feature_raw", [])]
+    features: list[str] = []
+    unknown_features: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_features:
+        resolved = _resolve_signal_name(raw, numeric_signals)
+        if resolved is None:
+            unknown_features.append(raw)
+            continue
+        if resolved == target or resolved in seen:
+            continue
+        features.append(resolved)
+        seen.add(resolved)
+    if unknown_features:
+        print(f"agent> Ignoring unknown input signals: {unknown_features}")
+    if not features:
+        response = (
+            "I did not resolve any usable numeric input signals after validation. "
+            "Type `list` to inspect signal names and retry."
+        )
+        print(f"agent> {response}")
+        return {
+            "response": response,
+            "event": {"status": "respond", "message": response, "error": "features_unresolved"},
+        }
+
+    requested_model = str(build_request.get("requested_model_family", "")).strip() or "linear_ridge"
+    resolved_model = _normalize_modeler_model_family(requested_model)
+    if resolved_model is None:
+        response = (
+            f"Requested model `{requested_model}` is not implemented yet. "
+            "Currently available: `auto`, `linear_ridge` "
+            "(aliases: `ridge`, `linear`, `incremental_linear_surrogate`), and "
+            "`bagged_tree_ensemble` (aliases: `tree`, `tree_ensemble`, `extra_trees`, `hist_gradient_boosting`)."
+        )
+        print(f"agent> {response}")
+        session_context["workflow_stage"] = "modeler_dataset_ready"
+        return {
+            "response": response,
+            "event": {"status": "respond", "message": response, "error": "model_not_implemented"},
+        }
+
+    print(
+        "agent> Training request: "
+        f"model=`{resolved_model}`, target=`{target}`, inputs={features}."
+    )
+    print("agent> Step 1/3: building split-safe train/validation/test partitions.")
+    print("agent> Step 2/3: fitting train-only preprocessing (missing-data handling and optional normalization).")
+    print("agent> Step 3/3: training the linear baseline and nonlinear comparator, then selecting the requested/best candidate.")
+    tool_args: dict[str, Any] = {
+        "data_path": str(dataset.get("data_path", "")),
+        "target_column": target,
+        "feature_columns": features,
+        "requested_model_family": resolved_model,
+        "sheet_name": dataset.get("sheet_name"),
+        "timestamp_column": dataset.get("timestamp_column_hint"),
+        "checkpoint_tag": "modeler_session",
+        "normalize": True,
+        "missing_data_strategy": "fill_median",
+        "compare_against_baseline": True,
+    }
+    training = _execute_registry_tool(registry, "train_surrogate_candidates", tool_args)
+    if str(training.get("status", "")).lower() != "ok":
+        response = str(training.get("message") or "Model training failed.")
+        print(f"agent> {response}")
+        return {
+            "response": response,
+            "event": {"status": "respond", "message": response, "error": "training_failed"},
+        }
+
+    split_info = training.get("split") if isinstance(training.get("split"), dict) else {}
+    preprocessing = training.get("preprocessing") if isinstance(training.get("preprocessing"), dict) else {}
+    selected_metrics_bundle = (
+        training.get("selected_metrics") if isinstance(training.get("selected_metrics"), dict) else {}
+    )
+    test_metrics = (
+        selected_metrics_bundle.get("test")
+        if isinstance(selected_metrics_bundle.get("test"), dict)
+        else {}
+    )
+    comparison = training.get("comparison") if isinstance(training.get("comparison"), list) else []
+    print(
+        "agent> Split-safe pipeline: "
+        f"strategy={split_info.get('strategy', 'n/a')}, "
+        f"train={split_info.get('train_size', 'n/a')}, "
+        f"val={split_info.get('validation_size', 'n/a')}, "
+        f"test={split_info.get('test_size', 'n/a')}."
+    )
+    print(
+        "agent> Preprocessing policy: "
+        f"requested={preprocessing.get('missing_data_strategy_requested', 'n/a')}, "
+        f"effective={preprocessing.get('missing_data_strategy_effective', 'n/a')}, "
+        f"normalization={((training.get('normalization') or {}).get('method', 'none'))}."
+    )
+    if comparison:
+        for item in comparison:
+            if not isinstance(item, dict):
+                continue
+            val_metrics = item.get("validation_metrics") if isinstance(item.get("validation_metrics"), dict) else {}
+            test_metrics_item = item.get("test_metrics") if isinstance(item.get("test_metrics"), dict) else {}
+            print(
+                "agent> Candidate "
+                f"`{item.get('model_family', 'n/a')}`: "
+                f"val_r2={_fmt_metric(val_metrics.get('r2'))}, "
+                f"val_mae={_fmt_metric(val_metrics.get('mae'))}, "
+                f"test_r2={_fmt_metric(test_metrics_item.get('r2'))}, "
+                f"test_mae={_fmt_metric(test_metrics_item.get('mae'))}."
+            )
+
+    summary = (
+        "Model build complete: "
+        f"requested_model={resolved_model}, "
+        f"selected_model={training.get('selected_model_family', 'n/a')}, "
+        f"best_validation_model={training.get('best_validation_model_family', 'n/a')}, "
+        f"target={target}, "
+        f"inputs={len(features)}, "
+        f"rows_used={training.get('rows_used', 'n/a')}, "
+        f"test_r2={_fmt_metric(test_metrics.get('r2'))}, "
+        f"test_mae={_fmt_metric(test_metrics.get('mae'))}."
+    )
+    checkpoint_line = f"Checkpoint saved: {training.get('checkpoint_id', 'n/a')}"
+    run_dir_line = f"Artifacts: {training.get('run_dir', 'n/a')}"
+    print(f"agent> {summary}")
+    print(f"agent> {checkpoint_line}")
+    print(f"agent> {run_dir_line}")
+    if chat_reply_only is not None:
+        interpretation = _generate_modeling_interpretation(
+            training=training,
+            target_signal=target,
+            requested_model_family=resolved_model,
+            chat_reply_only=chat_reply_only,
+        )
+        if interpretation:
+            print("agent> LLM interpretation:")
+            for line in interpretation.splitlines():
+                text = line.strip()
+                if text:
+                    print(f"agent> {text}")
+    session_context["workflow_stage"] = "model_training_completed"
+    session_context["last_model_request"] = {
+        "target_signal": target,
+        "feature_signals": features,
+        "requested_model_family": requested_model,
+        "resolved_model_family": training.get("selected_model_family", resolved_model),
+        "checkpoint_id": training.get("checkpoint_id"),
+        "run_dir": training.get("run_dir"),
+    }
+    response = f"{summary} {checkpoint_line}"
+    return {
+        "response": response,
+        "event": {
+            "status": "respond",
+            "message": response,
+            "tool_output": {
+                "target_signal": target,
+                "feature_signals": features,
+                "resolved_model_family": training.get("selected_model_family", resolved_model),
+                "checkpoint_id": training.get("checkpoint_id"),
+                "run_dir": training.get("run_dir"),
+                "metrics": test_metrics,
+                "comparison": comparison,
+            },
+        },
+    }
+
+
+def _normalize_modeler_model_family(requested_model: str) -> str | None:
+    return normalize_candidate_model_family(requested_model)
+
+
+def _fmt_metric(value: Any) -> str:
+    parsed = _float_value_or_none(value)
+    if parsed is None:
+        return "n/a"
+    return f"{parsed:.4f}"
+
+
+def _extract_first_json_path(user_message: str) -> Path | None:
+    quoted = re.findall(r"[\"']([^\"']+\.json)[\"']", user_message, flags=re.IGNORECASE)
+    candidates: list[str] = list(quoted)
+    absolute_windows = re.findall(
+        r"([A-Za-z]:\\[^\n]+?\.json)",
+        user_message,
+        flags=re.IGNORECASE,
+    )
+    candidates.extend(absolute_windows)
+    plain = re.findall(r"([^\s\"']+\.json)", user_message, flags=re.IGNORECASE)
+    candidates.extend(plain)
+    for raw in candidates:
+        cleaned = raw.strip().rstrip(".,;:)")
+        if not cleaned:
+            continue
+        path = Path(cleaned).expanduser()
+        if path.exists():
+            return path
+    for raw in candidates:
+        cleaned = raw.strip().rstrip(".,;:)")
+        if cleaned:
+            return Path(cleaned).expanduser()
+    return None
+
+
+def _load_modeler_handoff_payload(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"error": f"Handoff file does not exist: {path}"}
+    except json.JSONDecodeError as exc:
+        return {"error": f"Handoff file is not valid JSON: {exc}"}
+    if not isinstance(payload, dict):
+        return {"error": "Handoff JSON must be an object."}
+    return {"payload": payload, "data_path": payload.get("data_path", "")}
+
+
+def _modeler_request_from_handoff(
+    *,
+    payload: dict[str, Any],
+    available_signals: list[str],
+) -> dict[str, Any] | None:
+    model_strategy = payload.get("model_strategy_recommendations")
+    target_recommendations = []
+    if isinstance(model_strategy, dict):
+        maybe = model_strategy.get("target_recommendations")
+        if isinstance(maybe, list):
+            target_recommendations = [item for item in maybe if isinstance(item, dict)]
+
+    primary = target_recommendations[0] if target_recommendations else None
+    target_raw = ""
+    feature_raw: list[str] = []
+    requested_model_family = "linear_ridge"
+    if primary is not None:
+        target_raw = str(primary.get("target_signal", "")).strip()
+        feature_raw = [
+            str(item).strip()
+            for item in primary.get("probe_predictor_signals", [])
+            if str(item).strip()
+        ]
+        requested_model_family = str(primary.get("recommended_model_family", "linear_ridge")).strip()
+
+    if not target_raw:
+        correlations = payload.get("correlations")
+        target_analyses = []
+        if isinstance(correlations, dict):
+            maybe = correlations.get("target_analyses")
+            if isinstance(maybe, list):
+                target_analyses = [item for item in maybe if isinstance(item, dict)]
+        if target_analyses:
+            first_target = target_analyses[0]
+            target_raw = str(first_target.get("target_signal", "")).strip()
+            predictor_rows = first_target.get("predictor_results")
+            if isinstance(predictor_rows, list):
+                for row in predictor_rows[:4]:
+                    if not isinstance(row, dict):
+                        continue
+                    predictor = str(row.get("predictor_signal", "")).strip()
+                    if predictor:
+                        feature_raw.append(predictor)
+
+    if not target_raw:
+        ranking = payload.get("ranking")
+        if isinstance(ranking, list):
+            for row in ranking:
+                if not isinstance(row, dict):
+                    continue
+                target_raw = str(row.get("target_signal", "")).strip()
+                if target_raw:
+                    break
+
+    if not target_raw:
+        return None
+
+    if not feature_raw and available_signals:
+        fallback = [name for name in available_signals if name != target_raw]
+        feature_raw = fallback[: min(3, len(fallback))]
+
+    if not feature_raw:
+        return None
+
+    return {
+        "requested_model_family": requested_model_family or "linear_ridge",
+        "feature_raw": feature_raw,
+        "target_raw": target_raw,
+        "data_path": str(payload.get("data_path", "")).strip(),
+        "source": "handoff",
+    }
+
+
+def _prompt_modeler_overrides(
+    *,
+    request: dict[str, Any],
+    available_signals: list[str],
+) -> dict[str, Any]:
+    target_raw = _prompt_modeler_target_override(
+        default_target=str(request.get("target_raw", "")).strip(),
+        available_signals=available_signals,
+    )
+    feature_raw = _prompt_modeler_feature_override(
+        default_features=[str(item) for item in request.get("feature_raw", [])],
+        target_signal=target_raw,
+        available_signals=available_signals,
+    )
+    requested_model_family = _prompt_modeler_model_override(
+        default_model=str(request.get("requested_model_family", "linear_ridge")).strip(),
+    )
+    return {
+        **request,
+        "target_raw": target_raw,
+        "feature_raw": feature_raw,
+        "requested_model_family": requested_model_family,
+    }
+
+
+def _prompt_modeler_target_override(
+    *,
+    default_target: str,
+    available_signals: list[str],
+) -> str:
+    while True:
+        print(
+            "agent> Press Enter to use the recommended target "
+            f"`{default_target}`, type `list` to show signals, or enter a target name/index."
+        )
+        answer = input("you> ").strip()
+        lowered = answer.lower()
+        if not answer:
+            return default_target
+        if lowered.startswith("list"):
+            _print_signal_names(available_signals, query=answer[4:].strip())
+            continue
+        resolved = _resolve_signal_name(answer, available_signals)
+        if resolved is not None:
+            return resolved
+        print("agent> I did not resolve that target. Type `list` to inspect signal names.")
+
+
+def _prompt_modeler_feature_override(
+    *,
+    default_features: list[str],
+    target_signal: str,
+    available_signals: list[str],
+) -> list[str]:
+    default_display = ",".join(default_features)
+    while True:
+        print(
+            "agent> Press Enter to use the recommended inputs "
+            f"`{default_display}`, type `list` to show signals, or enter comma-separated inputs."
+        )
+        answer = input("you> ").strip()
+        lowered = answer.lower()
+        if not answer:
+            return [item for item in default_features if item != target_signal]
+        if lowered.startswith("list"):
+            _print_signal_names(available_signals, query=answer[4:].strip())
+            continue
+        requested = _split_modeler_input_tokens(answer)
+        resolved: list[str] = []
+        unknown: list[str] = []
+        seen: set[str] = set()
+        for raw in requested:
+            match = _resolve_signal_name(raw, available_signals)
+            if match is None:
+                unknown.append(raw)
+                continue
+            if match == target_signal or match in seen:
+                continue
+            resolved.append(match)
+            seen.add(match)
+        if unknown:
+            print(f"agent> Ignoring unknown inputs: {unknown}")
+        if resolved:
+            return resolved
+        print("agent> I did not resolve any usable inputs. Type `list` to inspect signal names.")
+
+
+def _prompt_modeler_model_override(*, default_model: str) -> str:
+    available = (
+        "auto, linear_ridge (aliases: ridge, linear, incremental_linear_surrogate), "
+        "bagged_tree_ensemble (aliases: tree, tree_ensemble, extra_trees, hist_gradient_boosting)"
+    )
+    recommended_supported = _normalize_modeler_model_family(default_model)
+    while True:
+        default_text = default_model or "linear_ridge"
+        if recommended_supported is None:
+            print(
+                "agent> The recommended model "
+                f"`{default_text}` is not implemented yet. "
+                "Press Enter to use `auto`, or type an available model."
+            )
+        else:
+            print(
+                "agent> Press Enter to use the recommended model "
+                f"`{default_text}`, or type an available model."
+            )
+        print(f"agent> Currently implemented: {available}.")
+        answer = input("you> ").strip()
+        if not answer:
+            return recommended_supported or "auto"
+        if _normalize_modeler_model_family(answer) is not None:
+            return answer
+        print("agent> That model is not implemented yet. Please choose an available model.")
+
+
 def _generate_analysis_interpretation(
     *,
     analysis: dict[str, Any],
@@ -948,6 +1871,81 @@ def _generate_analysis_interpretation(
     if compact and not _looks_like_llm_failure_message(compact):
         return compact
     return ""
+
+
+def _generate_modeling_interpretation(
+    *,
+    training: dict[str, Any],
+    target_signal: str,
+    requested_model_family: str,
+    chat_reply_only: Callable[[str], str],
+) -> str:
+    prompt = _build_modeling_interpretation_prompt(
+        training=training,
+        target_signal=target_signal,
+        requested_model_family=requested_model_family,
+    )
+    primary = chat_reply_only(prompt).strip()
+    if primary and not _looks_like_llm_failure_message(primary):
+        return primary
+    compact = (
+        "Interpret this model training result in 4 concise bullets: "
+        "1) whether the selected model is scientifically credible, "
+        "2) whether the requested model agreed with the best validation result, "
+        "3) main risks, "
+        "4) what to try next.\n"
+        f"SUMMARY={dumps_json(_compact_modeling_summary(training, target_signal, requested_model_family), ensure_ascii=False)}"
+    )
+    secondary = chat_reply_only(compact).strip()
+    if secondary and not _looks_like_llm_failure_message(secondary):
+        return secondary
+    return ""
+
+
+def _build_modeling_interpretation_prompt(
+    *,
+    training: dict[str, Any],
+    target_signal: str,
+    requested_model_family: str,
+) -> str:
+    return (
+        "Interpret this Agent 2 model training result for a lab engineer. "
+        "Use 5-7 concise bullets. Cover: "
+        "overall result quality, whether the requested model matched the best validation model, "
+        "what the train/validation/test split implies, main risks, and immediate next actions. "
+        "Do not invent values.\n"
+        f"RESULTS_JSON={dumps_json(_compact_modeling_summary(training, target_signal, requested_model_family), ensure_ascii=False)}"
+    )
+
+
+def _compact_modeling_summary(
+    training: dict[str, Any],
+    target_signal: str,
+    requested_model_family: str,
+) -> dict[str, Any]:
+    comparison_out: list[dict[str, Any]] = []
+    comparison = training.get("comparison") if isinstance(training.get("comparison"), list) else []
+    for item in comparison[:4]:
+        if not isinstance(item, dict):
+            continue
+        comparison_out.append(
+            {
+                "model_family": item.get("model_family"),
+                "validation_metrics": item.get("validation_metrics"),
+                "test_metrics": item.get("test_metrics"),
+            }
+        )
+    return {
+        "target_signal": target_signal,
+        "requested_model_family": requested_model_family,
+        "selected_model_family": training.get("selected_model_family"),
+        "best_validation_model_family": training.get("best_validation_model_family"),
+        "split": training.get("split"),
+        "preprocessing": training.get("preprocessing"),
+        "normalization": training.get("normalization"),
+        "selected_metrics": training.get("selected_metrics"),
+        "comparison": comparison_out,
+    }
 
 
 def _build_analysis_interpretation_prompt(analysis: dict[str, Any]) -> str:
