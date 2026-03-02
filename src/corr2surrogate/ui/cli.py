@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
+from corr2surrogate.analytics import SUPPORTED_TASK_TYPES, normalize_task_type_hint
 from corr2surrogate.core.json_utils import dumps_json
 from corr2surrogate.modeling import normalize_candidate_model_family
 from corr2surrogate.orchestration.default_tools import build_default_registry
@@ -161,6 +162,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional data start row.",
     )
     run_agent1.add_argument("--timestamp-column", default=None, help="Timestamp column name.")
+    run_agent1.add_argument(
+        "--task-type",
+        default=None,
+        help=(
+            "Optional task override: regression, binary_classification, "
+            "multiclass_classification, fraud_detection, anomaly_detection."
+        ),
+    )
     run_agent1.add_argument(
         "--target-signals",
         nargs="*",
@@ -351,6 +360,8 @@ def main(argv: list[str] | None = None) -> int:
             tool_args["data_start_row"] = int(args.data_start_row)
         if args.timestamp_column:
             tool_args["timestamp_column"] = args.timestamp_column
+        if args.task_type:
+            tool_args["task_type_hint"] = args.task_type
         if args.target_signals:
             tool_args["target_signals"] = args.target_signals
         if args.run_id:
@@ -394,6 +405,13 @@ def _parse_json_array(raw: str, *, arg_name: str) -> list[Any]:
     return parsed
 
 
+def _parse_task_override_command(user_message: str) -> str | None:
+    stripped = user_message.strip()
+    if not stripped.lower().startswith("task "):
+        return None
+    return stripped[5:].strip()
+
+
 def _drop_none_fields(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if value is not None}
 
@@ -427,6 +445,10 @@ def _run_agent_session(
             "At target selection use: list, list <filter>, all, or comma-separated names."
         )
         print(
+            "agent> Task override: use `task regression`, `task binary_classification`, "
+            "`task fraud_detection`, or `task auto` to clear it."
+        )
+        print(
             "agent> Hypothesis syntax: "
             "`hypothesis corr target:pred1,pred2; target2:pred3` and "
             "`hypothesis feature target:signal->rate_change; signal2->square`."
@@ -451,6 +473,10 @@ def _run_agent_session(
         print(
             "agent> Useful commands: /help, /context, /reset, /exit. "
             "Use `list` after loading data to inspect available signals."
+        )
+        print(
+            "agent> Task override: use `task regression`, `task binary_classification`, "
+            "`task fraud_detection`, or `task auto` to clear it."
         )
         print(
             "agent> Direct build syntax: "
@@ -522,6 +548,10 @@ def _run_agent_session(
                     "all, numeric index, or comma-separated signal names."
                 )
                 print(
+                    "agent> Task override: `task regression`, `task binary_classification`, "
+                    "`task fraud_detection`, or `task auto`."
+                )
+                print(
                     "agent> You can also add hypotheses: "
                     "`hypothesis corr target:pred1,pred2` or "
                     "`hypothesis feature target:signal->rate_change`."
@@ -565,6 +595,10 @@ def _run_agent_session(
                     "agent> You can also load an Agent 1 handoff via: "
                     "`use handoff path\\\\to\\\\structured_report.json`."
                 )
+                print(
+                    "agent> Task override: `task regression`, `task binary_classification`, "
+                    "`task fraud_detection`, or `task auto`."
+                )
             continue
         if command == "/context":
             snapshot = dict(session_context)
@@ -575,8 +609,32 @@ def _run_agent_session(
             session_context = dict(base_context)
             if agent == "analyst":
                 session_context["workflow_stage"] = "awaiting_dataset_path"
+            else:
+                session_context["workflow_stage"] = "awaiting_modeler_request_or_dataset"
             session_messages = []
             print("Session state reset.")
+            continue
+        task_override_command = _parse_task_override_command(user_message)
+        if task_override_command is not None:
+            normalized_task = normalize_task_type_hint(task_override_command)
+            if normalized_task is None:
+                supported = ", ".join(
+                    item for item in sorted(SUPPORTED_TASK_TYPES) if item != "auto"
+                )
+                print(
+                    "agent> Unsupported task override. "
+                    f"Use one of: {supported}, or `task auto`."
+                )
+                continue
+            if normalized_task == "auto":
+                session_context.pop("task_type_override", None)
+                print("agent> Task override cleared. I will auto-detect the task again.")
+                continue
+            session_context["task_type_override"] = normalized_task
+            print(
+                f"agent> Task override set to `{normalized_task}`. "
+                "I will use that for the next analysis/modeling step."
+            )
             continue
 
         if agent == "analyst":
@@ -953,6 +1011,10 @@ def _run_analyst_autopilot_turn(
         "bootstrap_rounds": 40,
         "stability_windows": 4,
     }
+    task_type_override = str(session_context.get("task_type_override", "")).strip() or None
+    if task_type_override:
+        analysis_args["task_type_hint"] = task_type_override
+        print(f"agent> Task override: forcing task profile `{task_type_override}` during analysis.")
     hypothesis_state: dict[str, list[dict[str, Any]]] = {
         "user_hypotheses": [],
         "feature_hypotheses": [],
@@ -1048,6 +1110,7 @@ def _run_analyst_autopilot_turn(
     report_line = f"Report saved: {report_path}"
     print(f"agent> {summary}")
     print(f"agent> {report_line}")
+    _print_task_profile_summary(analysis.get("task_profiles"), context_label="analysis")
     artifact_paths = analysis.get("artifact_paths") if isinstance(analysis.get("artifact_paths"), dict) else {}
     handoff_json_path = str(artifact_paths.get("json_path", "")).strip()
     if handoff_json_path:
@@ -1100,6 +1163,7 @@ def _run_analyst_autopilot_turn(
             "data_mode": analysis.get("data_mode"),
             "target_count": analysis.get("target_count"),
             "candidate_count": analysis.get("candidate_count"),
+            "task_profiles": analysis.get("task_profiles"),
             "report_path": report_path,
             "handoff_json_path": handoff_json_path,
             "workflow_stage": workflow_stage,
@@ -1202,6 +1266,7 @@ def _start_modeler_from_handoff_path(
     print(
         "agent> Handoff contract: "
         f"data_mode=`{handoff_info.get('dataset_profile', {}).get('data_mode', 'n/a')}`, "
+        f"task=`{handoff_info.get('task_type', 'n/a')}`, "
         f"split=`{handoff_info.get('split_strategy', 'n/a')}`, "
         f"acceptance={handoff_info.get('acceptance_criteria', {})}."
     )
@@ -1308,6 +1373,7 @@ def _run_modeler_autopilot_turn(
         print(
             "agent> Handoff contract: "
             f"data_mode=`{handoff_info.get('dataset_profile', {}).get('data_mode', 'n/a')}`, "
+            f"task=`{handoff_info.get('task_type', 'n/a')}`, "
             f"split=`{handoff_info.get('split_strategy', 'n/a')}`, "
             f"acceptance={handoff_info.get('acceptance_criteria', {})}."
         )
@@ -1684,6 +1750,11 @@ def _execute_modeler_build_request(
     fill_constant_value = build_request.get("fill_constant_value")
     compare_against_baseline = bool(build_request.get("compare_against_baseline", True))
     lag_horizon_samples = build_request.get("lag_horizon_samples")
+    task_type_hint = str(
+        build_request.get("task_type_hint")
+        or session_context.get("task_type_override")
+        or ""
+    ).strip() or None
     timestamp_column = str(
         build_request.get("timestamp_column")
         or dataset.get("timestamp_column_hint")
@@ -1704,6 +1775,8 @@ def _execute_modeler_build_request(
             f"search_order={raw_search_order}, normalize={requested_normalize}, "
             f"missing_data={missing_data_strategy}."
         )
+    if task_type_hint:
+        print(f"agent> Task override: forcing task profile `{task_type_hint}` before training.")
     if timestamp_column:
         print(f"agent> Timestamp context: using `{timestamp_column}` for data-mode-aware splitting.")
 
@@ -1738,6 +1811,7 @@ def _execute_modeler_build_request(
             fill_constant_value=fill_constant_value,
             compare_against_baseline=compare_against_baseline,
             lag_horizon_samples=lag_horizon_samples,
+            task_type_hint=task_type_hint,
             checkpoint_tag=f"modeler_session_attempt_{attempt}",
         )
         try:
@@ -1892,6 +1966,7 @@ def _execute_modeler_build_request(
         "requested_model_family": requested_model,
         "final_attempt_model_family": current_requested_model,
         "resolved_model_family": training.get("selected_model_family", current_requested_model),
+        "task_profile": training.get("task_profile"),
         "checkpoint_id": training.get("checkpoint_id"),
         "run_dir": training.get("run_dir"),
         "lag_horizon_samples": int(training.get("lag_horizon_samples") or 0),
@@ -1911,6 +1986,7 @@ def _execute_modeler_build_request(
                 "run_dir": training.get("run_dir"),
                 "metrics": test_metrics,
                 "comparison": comparison,
+                "task_profile": training.get("task_profile"),
                 "acceptance_check": last_loop_eval or {},
             },
         },
@@ -1928,6 +2004,29 @@ def _fmt_metric(value: Any) -> str:
     return f"{parsed:.4f}"
 
 
+def _print_task_profile_summary(raw_task_profiles: Any, *, context_label: str) -> None:
+    if not isinstance(raw_task_profiles, list):
+        return
+    printed = 0
+    for item in raw_task_profiles:
+        if not isinstance(item, dict):
+            continue
+        target_signal = str(item.get("target_signal", "")).strip() or "unknown"
+        task_type = str(item.get("task_type", "")).strip() or "n/a"
+        split_strategy = str(item.get("recommended_split_strategy", "")).strip() or "n/a"
+        rationale = str(item.get("rationale", "")).strip()
+        line = (
+            f"agent> Detected task profile ({context_label}): "
+            f"target=`{target_signal}`, task_type=`{task_type}`, recommended_split=`{split_strategy}`."
+        )
+        print(line)
+        if rationale:
+            print(f"agent> Task rationale: {rationale}")
+        printed += 1
+        if printed >= 3:
+            break
+
+
 def _modeler_training_tool_args(
     *,
     dataset: dict[str, Any],
@@ -1940,6 +2039,7 @@ def _modeler_training_tool_args(
     fill_constant_value: Any,
     compare_against_baseline: bool,
     lag_horizon_samples: Any,
+    task_type_hint: str | None,
     checkpoint_tag: str,
 ) -> dict[str, Any]:
     return {
@@ -1955,6 +2055,7 @@ def _modeler_training_tool_args(
         "fill_constant_value": fill_constant_value,
         "compare_against_baseline": compare_against_baseline,
         "lag_horizon_samples": lag_horizon_samples,
+        "task_type_hint": task_type_hint,
     }
 
 
@@ -1962,11 +2063,24 @@ def _print_modeler_training_summary(*, training: dict[str, Any]) -> None:
     split_info = training.get("split") if isinstance(training.get("split"), dict) else {}
     preprocessing = training.get("preprocessing") if isinstance(training.get("preprocessing"), dict) else {}
     comparison = training.get("comparison") if isinstance(training.get("comparison"), list) else []
+    task_profile = training.get("task_profile") if isinstance(training.get("task_profile"), dict) else {}
     hyperparameters = (
         training.get("selected_hyperparameters")
         if isinstance(training.get("selected_hyperparameters"), dict)
         else {}
     )
+    if task_profile:
+        minority = _safe_float_or_none(task_profile.get("minority_class_fraction"))
+        task_line = (
+            "agent> Task profile: "
+            f"type={task_profile.get('task_type', 'n/a')}, "
+            f"family={task_profile.get('task_family', 'n/a')}, "
+            f"recommended_split={task_profile.get('recommended_split_strategy', 'n/a')}"
+        )
+        if minority is not None:
+            task_line += f", minority_fraction={minority:.3%}"
+        task_line += "."
+        print(task_line)
     print(
         "agent> Split-safe pipeline: "
         f"strategy={split_info.get('strategy', 'n/a')}, "
@@ -2179,6 +2293,7 @@ def _modeler_request_from_handoff(
         "target_raw": target_raw,
         "data_path": str(payload.get("data_path", "")).strip(),
         "timestamp_column": str(handoff.get("dataset_profile", {}).get("timestamp_column", "")).strip() or None,
+        "task_type_hint": str(handoff.get("task_type", "")).strip() or None,
         "normalize": bool(handoff.get("normalization", {}).get("enabled", True)),
         "missing_data_strategy": str(missing_plan.get("strategy", "keep")).strip() or "keep",
         "fill_constant_value": missing_plan.get("fill_constant_value"),

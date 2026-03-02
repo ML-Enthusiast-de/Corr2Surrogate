@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from corr2surrogate.analytics.task_detection import assess_task_profile, is_classification_task
 from corr2surrogate.core.json_utils import write_json
 from corr2surrogate.persistence.artifact_store import ArtifactStore
 from .baselines import IncrementalLinearSurrogate
@@ -83,6 +84,7 @@ def train_surrogate_candidates(
     fill_constant_value: float | None = None,
     compare_against_baseline: bool = True,
     lag_horizon_samples: int | None = None,
+    task_type: str | None = None,
     run_id: str | None = None,
     checkpoint_tag: str | None = None,
     data_references: list[str] | None = None,
@@ -93,7 +95,26 @@ def train_surrogate_candidates(
     _require_columns(frame, list(feature_columns) + [target_column])
 
     data_mode = _infer_data_mode(frame=frame, timestamp_column=timestamp_column)
-    split = build_train_validation_test_split(n_rows=len(frame), data_mode=data_mode)
+    task_profile = assess_task_profile(
+        frame=frame,
+        target_column=target_column,
+        data_mode=data_mode,
+        task_type_hint=task_type,
+    )
+    split = build_train_validation_test_split(
+        n_rows=len(frame),
+        data_mode=data_mode,
+        task_type=task_profile.task_type,
+        stratify_labels=frame[target_column] if is_classification_task(task_profile.task_type) else None,
+    )
+    if is_classification_task(task_profile.task_type):
+        raise ValueError(
+            "Detected task type "
+            f"`{task_profile.task_type}` for target `{target_column}`. "
+            "Current Agent 2 trainers are regression-only. "
+            f"The split policy is still prepared as `{split.strategy}` for future classifiers, "
+            "but executable classification training is not implemented yet."
+        )
     split_frames = {
         "train": frame.iloc[split.train_indices].reset_index(drop=True),
         "validation": frame.iloc[split.validation_indices].reset_index(drop=True),
@@ -288,6 +309,7 @@ def train_surrogate_candidates(
     return {
         "status": "ok",
         "data_mode": data_mode,
+        "task_profile": task_profile.to_dict(),
         "requested_model_family": requested,
         "selected_model_family": selected_candidate.model_family,
         "best_validation_model_family": best_by_validation.model_family,

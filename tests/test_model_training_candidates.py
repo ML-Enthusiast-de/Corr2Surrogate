@@ -1,6 +1,9 @@
 from pathlib import Path
 
+import pytest
+
 from corr2surrogate.orchestration.default_tools import build_default_registry
+from corr2surrogate.orchestration.tool_registry import ToolExecutionError
 
 
 def test_train_surrogate_candidates_tool_runs_split_safe_linear_and_tree(
@@ -191,3 +194,30 @@ def test_train_surrogate_candidates_tool_supports_lagged_tree_ensemble(
     assert payload["requested_model_family"] == "lagged_tree_ensemble"
     assert payload["selected_model_family"] == "lagged_tree_ensemble"
     assert payload["selected_metrics"]["test"]["r2"] > 0.75
+
+
+def test_train_surrogate_candidates_rejects_classification_targets_with_clear_error(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    csv_path = tmp_path / "classification.csv"
+    rows = ["feature_a,feature_b,class_label"]
+    for idx in range(80):
+        a = idx / 79.0
+        b = 1 if idx % 3 == 0 else 0
+        label = 1 if (a > 0.55 or b == 1) else 0
+        rows.append(f"{a:.5f},{b},{label}")
+    csv_path.write_text("\n".join(rows), encoding="utf-8")
+
+    registry = build_default_registry()
+    with pytest.raises(ToolExecutionError, match="regression-only"):
+        registry.execute(
+            "train_surrogate_candidates",
+            {
+                "data_path": str(csv_path),
+                "target_column": "class_label",
+                "feature_columns": ["feature_a", "feature_b"],
+                "requested_model_family": "auto",
+                "run_id": "classification_reject",
+            },
+        )

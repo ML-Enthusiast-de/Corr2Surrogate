@@ -8,6 +8,7 @@ Inputs:
 - `.csv`, `.xlsx`, `.xls`
 - Time-series and steady-state datasets
 - Optional user system knowledge (critical/non-virtualizable signals)
+- Optional user task override (`regression`, `binary_classification`, `fraud_detection`, etc.)
 
 Outputs:
 - Scientist-facing analysis report
@@ -21,6 +22,7 @@ Outputs:
 - Sheet selection handling for multi-sheet Excel
 - Header/data-start inference with confidence checks
 - Data quality checks and correlation/dependency analysis
+- Detects whether each target behaves like regression, classification, or fraud/anomaly screening
 - Lightweight probe-model screening on shortlisted predictors:
   - linear ridge baseline
   - interaction-aware ridge
@@ -42,7 +44,10 @@ Outputs:
   - predictor inputs
   - model family / architecture
 - Builds baseline and advanced models (including temporal models)
-- Applies split strategy with leakage safeguards
+- Applies split strategy with leakage safeguards:
+  - time-series -> ordered blocked split
+  - steady-state classification/fraud -> stratified deterministic split
+  - steady-state regression -> deterministic modulo split
 - Runs Optuna optimization
 - Saves:
   - tuned model params
@@ -60,6 +65,7 @@ Outputs:
 - Current executable baseline path:
   - direct modeler mode and Agent 1 structured-report handoff both reach a split-safe trainer
   - executable families today: `linear_ridge`, `lagged_linear`, `lagged_tree_ensemble`, `bagged_tree_ensemble`
+  - classification / fraud targets are detected and surfaced, but current executable trainers remain regression-only and should stop cleanly
   - modeler compares available candidates, runs a bounded acceptance check, can retry with the next safe family when policy allows it, persists artifacts, and then lets the LLM interpret the measured result
 - User control:
   - if a handoff exists, user can accept the recommendation or override target, predictors, and architecture
@@ -79,6 +85,7 @@ Outputs:
 
 ## 5. Handoff Contract Essentials
 `Agent2Handoff` includes:
+- `task_type`
 - `target_signal`, `feature_signals`
 - `forced_modeling_requests`
 - `dependency_map`

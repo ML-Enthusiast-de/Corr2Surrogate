@@ -39,6 +39,15 @@ from .reporting import (
     save_agent1_markdown_report,
 )
 from .stationarity import StationaritySignalResult, StationaritySummary, assess_stationarity
+from .task_detection import (
+    CLASSIFICATION_TASK_TYPES,
+    SUPPORTED_TASK_TYPES,
+    TaskProfile,
+    assess_task_profile,
+    assess_task_profiles,
+    is_classification_task,
+    normalize_task_type_hint,
+)
 
 __all__ = [
     "CandidateSignal",
@@ -70,5 +79,12 @@ __all__ = [
     "save_agent1_artifacts",
     "save_agent1_markdown_report",
     "TargetModelRecommendation",
+    "TaskProfile",
     "recommend_model_strategies",
+    "SUPPORTED_TASK_TYPES",
+    "CLASSIFICATION_TASK_TYPES",
+    "assess_task_profile",
+    "assess_task_profiles",
+    "is_classification_task",
+    "normalize_task_type_hint",
 ]

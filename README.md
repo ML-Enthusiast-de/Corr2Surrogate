@@ -17,7 +17,9 @@ Corr2Surrogate is a local-first framework for converting real-world sensor data 
 - Evidence-backed recommendation blocks with probe inputs, quick metrics, and confidence
 - Dependency-aware surrogate ranking
 - Dataset-scoped reports and artifact export
-- Split-safe Agent 2 training (train-only preprocessing, deterministic train/validation/test splits)
+- Task-type detection for regression, balanced classification, and fraud/anomaly-style labels
+- User task override command: `task regression`, `task binary_classification`, `task fraud_detection`, `task auto`
+- Split-safe Agent 2 training (train-only preprocessing, time-ordered splits for time series, stratified steady-state splits for classification labels)
 - First nonlinear modeling baseline: local bagged tree ensemble
 - Candidate comparison with LLM-assisted model interpretation in the CLI
 - Local runtime by default; optional API mode via explicit opt-in
@@ -87,12 +89,19 @@ At startup you can:
 
 Default dataset note:
 - `data/public/public_testbench_dataset_20k_minmax.csv` is sanitized and intentionally includes ~5% missing values in three representative signals (`B`, `D`, `F`), while all other signals and `time` remain complete. This lets users test missing-data handling and leakage warnings without collapsing row count when trying `drop_rows`.
+- Additional synthetic public datasets are available for task detection checks:
+  - `data/public/public_binary_classification_dataset.csv`
+  - `data/public/public_fraud_screening_dataset.csv`
 
 Useful commands:
 - `/help`
 - `/context`
 - `/reset`
 - `/exit`
+- `task regression`
+- `task binary_classification`
+- `task fraud_detection`
+- `task auto`
 
 Target selection shortcuts:
 - `list`
@@ -114,6 +123,7 @@ Agent 1 also produces model-strategy guidance for Agent 2:
 Interpretation rule:
 - a detected nonlinear dependence alone is not enough to recommend trees or sequence models
 - Agent 1 uses cheap validation probes to decide whether those heavier families are likely to outperform the linear baseline
+- Agent 1 also infers whether a target behaves like regression, classification, or fraud/anomaly screening and records the recommended split policy for Agent 2
 
 ## Optional API Mode (Explicit Opt-In)
 Default policy is local-only. API mode must be explicitly enabled.
@@ -174,6 +184,10 @@ Current executable model families:
 - `lagged_linear`
 - `lagged_tree_ensemble`
 - `bagged_tree_ensemble`
+
+Current classification note:
+- Agent 2 now detects classification / fraud-like targets and prepares the correct split policy (stratified for steady-state labels, ordered for time-based labels).
+- Executable classifier training is not implemented yet, so the modeler stops cleanly and tells the user that the task was detected but is not supported by the current trainers.
 
 Recommended model families to implement next:
 - steady-state / tabular: add `ElasticNet`
@@ -242,6 +256,7 @@ Example direct modeler request:
 Current implementation note:
 - the direct modeler session currently executes `auto`, `linear_ridge` / `ridge` / `linear`, `lagged_linear` / `lagged` / `temporal_linear` / `arx`, `lagged_tree_ensemble` / `lagged_tree` / `lag_window_tree` / `temporal_tree`, and `bagged_tree_ensemble` / `tree`
 - the modeler CLI now runs a split-safe comparison between the linear baseline and the available temporal/nonlinear comparators, performs a bounded acceptance check, optionally retries with the next safe family when policy allows it, and uses the LLM to interpret the final measured result
+- if the selected target looks like classification or fraud detection, the modeler reports that explicitly, applies the correct split policy, and exits safely because the current executable trainers are regression-only
 
 ## User Override Rules For Agent 2
 Even when a valid Agent 1 handoff exists, the user must remain in control of the modeling scope.

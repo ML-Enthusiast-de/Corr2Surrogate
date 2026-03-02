@@ -58,6 +58,8 @@ def test_run_agent1_analysis_tool_end_to_end(monkeypatch, tmp_path: Path) -> Non
     assert payload["forced_requests"]
     assert payload["user_hypotheses"]
     assert payload["feature_hypotheses"]
+    assert payload["task_profiles"]
+    assert payload["task_profiles"][0]["task_type"] == "regression"
     assert payload["model_strategy_recommendations"]["target_recommendations"]
     model_rec = payload["model_strategy_recommendations"]["target_recommendations"][0]
     assert model_rec["probe_predictor_signals"]
@@ -74,6 +76,7 @@ def test_run_agent1_analysis_tool_end_to_end(monkeypatch, tmp_path: Path) -> Non
     markdown = payload["report_markdown"]
     assert "Preprocessing Decisions" in markdown
     assert "User Hypotheses" in markdown
+    assert "Task Assessment" in markdown
     assert "Agentic Planning" in markdown
     assert "Sensor Diagnostics" in markdown
     assert "Experiment Recommendations" in markdown

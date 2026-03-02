@@ -2413,3 +2413,54 @@ def test_cli_run_agent_session_modeler_suppresses_runtime_fallback_as_fake_inter
     assert "LLM interpretation unavailable for this turn. Using the deterministic model summary above." in output
     assert "agent> LLM interpretation:" not in output
     assert "I hit an internal runtime error. Please retry." not in output
+
+
+def test_cli_run_agent_session_task_override_is_persisted(monkeypatch) -> None:
+    calls = []
+    inputs = iter(["task fraud_detection", "hello", "/exit"])
+
+    def fake_run_local_agent_once(*, agent, user_message, context, config_path):
+        calls.append(
+            {
+                "agent": agent,
+                "user_message": user_message,
+                "context": context,
+                "config_path": config_path,
+            }
+        )
+        return {"event": {"message": "reply"}}
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", fake_run_local_agent_once)
+    exit_code = main(["run-agent-session", "--agent", "analyst", "--max-turns", "4"])
+    assert exit_code == 0
+    assert len(calls) == 1
+    assert calls[0]["context"]["task_type_override"] == "fraud_detection"
+
+
+def test_cli_modeler_handles_classification_dataset_without_crashing(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    csv_path = tmp_path / "classification.csv"
+    rows = ["feature_a,feature_b,class_label"]
+    for idx in range(60):
+        a = idx / 59.0
+        b = 1 if idx % 4 == 0 else 0
+        label = 1 if (a > 0.6 or b == 1) else 0
+        rows.append(f"{a:.5f},{b},{label}")
+    csv_path.write_text("\n".join(rows), encoding="utf-8")
+
+    inputs = iter(
+        [
+            str(csv_path),
+            "build model auto with inputs feature_a,feature_b and target class_label",
+            "/exit",
+        ]
+    )
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+
+    exit_code = main(["run-agent-session", "--agent", "modeler", "--max-turns", "5"])
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "regression-only" in output

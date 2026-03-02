@@ -56,6 +56,7 @@ class Agent2Handoff:
     """Machine-readable payload for model training and iteration control."""
 
     dataset_profile: dict[str, Any]
+    task_type: str
     target_signal: str
     feature_signals: list[str]
     split_strategy: str
@@ -98,6 +99,7 @@ def build_agent2_handoff_from_report_payload(payload: dict[str, Any]) -> Agent2H
 
     data_mode = str(payload.get("data_mode", "steady_state")).strip() or "steady_state"
     timestamp_column = str(payload.get("timestamp_column", "")).strip() or None
+    task_type = _task_type_for_target(payload, target_signal=target_signal)
     recommended_model = str(
         (target_rec or {}).get("recommended_model_family", "linear_ridge")
     ).strip() or "linear_ridge"
@@ -116,13 +118,18 @@ def build_agent2_handoff_from_report_payload(payload: dict[str, Any]) -> Agent2H
         "data_path": str(payload.get("data_path", "")).strip(),
         "data_mode": data_mode,
         "timestamp_column": timestamp_column,
+        "task_type": task_type,
         "missing_data_strategy": missing_strategy,
         "fill_constant_value": fill_constant_value,
     }
     split_strategy = (
         "blocked_time_order_70_15_15"
         if data_mode == "time_series"
-        else "deterministic_modulo_70_15_15"
+        else (
+            "stratified_deterministic_modulo_70_15_15"
+            if task_type in {"binary_classification", "multiclass_classification", "fraud_detection", "anomaly_detection"}
+            else "deterministic_modulo_70_15_15"
+        )
     )
     normalization = NormalizationPlan(
         enabled=True,
@@ -137,6 +144,7 @@ def build_agent2_handoff_from_report_payload(payload: dict[str, Any]) -> Agent2H
     )
     return Agent2Handoff(
         dataset_profile=dataset_profile,
+        task_type=task_type,
         target_signal=target_signal,
         feature_signals=feature_signals,
         split_strategy=split_strategy,
@@ -242,3 +250,15 @@ def _derive_lag_horizon_samples(target_rec: dict[str, Any]) -> int:
         if match:
             return max(1, int(match.group(1)))
     return 3
+
+
+def _task_type_for_target(payload: dict[str, Any], *, target_signal: str) -> str:
+    for item in payload.get("task_profiles", []):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("target_signal", "")).strip() != target_signal:
+            continue
+        task_type = str(item.get("task_type", "")).strip()
+        if task_type:
+            return task_type
+    return "regression"

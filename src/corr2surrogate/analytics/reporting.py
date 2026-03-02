@@ -27,6 +27,7 @@ def build_agent1_report_payload(
     preprocessing: dict[str, Any] | None = None,
     sensor_diagnostics: dict[str, Any] | None = None,
     model_strategy_recommendations: dict[str, Any] | None = None,
+    task_profiles: list[dict[str, Any]] | None = None,
     experiment_recommendations: list[dict[str, Any]] | None = None,
     planner_trace: list[dict[str, Any]] | None = None,
     critic_decision: dict[str, Any] | None = None,
@@ -50,6 +51,7 @@ def build_agent1_report_payload(
         "preprocessing": preprocessing or {},
         "sensor_diagnostics": sensor_diagnostics or {},
         "model_strategy_recommendations": model_strategy_recommendations or {},
+        "task_profiles": task_profiles or [],
         "experiment_recommendations": experiment_recommendations or [],
         "planner_trace": planner_trace or [],
         "critic_decision": critic_decision or {},
@@ -106,6 +108,10 @@ def save_agent1_artifacts(
     hypothesis_feature_rows: list[dict[str, Any]] = []
     model_strategy_rows: list[dict[str, Any]] = []
     model_probe_rows: list[dict[str, Any]] = []
+    task_profile_rows: list[dict[str, Any]] = [
+        dict(item) for item in list(structured.get("task_profiles", []))
+        if isinstance(item, dict)
+    ]
     for target in structured.get("correlations", {}).get("target_analyses", []):
         target_signal = str(target.get("target_signal", "unknown"))
         for rank, row in enumerate(list(target.get("predictor_results", []))[:10], start=1):
@@ -189,6 +195,10 @@ def save_agent1_artifacts(
         artifact_dir / "model_strategy_probes.csv",
         model_probe_rows,
     )
+    csv_paths["task_profiles"] = _write_rows_csv(
+        artifact_dir / "task_profiles.csv",
+        task_profile_rows,
+    )
 
     json_path = write_json(artifact_dir / "structured_report.json", structured, indent=2)
 
@@ -239,6 +249,7 @@ def _build_markdown(structured: dict[str, Any]) -> str:
     artifact_paths = structured.get("artifact_paths") or {}
     user_hypotheses = structured.get("user_hypotheses") or {}
     model_strategy = structured.get("model_strategy_recommendations") or {}
+    task_profiles = structured.get("task_profiles") or []
 
     lines: list[str] = [
         "# Agent 1 Analysis Report",
@@ -253,6 +264,8 @@ def _build_markdown(structured: dict[str, Any]) -> str:
     lines.extend(_render_preprocessing_section(preprocessing))
     lines.extend(["", "## User Hypotheses"])
     lines.extend(_render_user_hypotheses_section(user_hypotheses))
+    lines.extend(["", "## Task Assessment"])
+    lines.extend(_render_task_profiles_section(task_profiles))
     lines.extend(
         [
             "",
@@ -561,6 +574,36 @@ def _render_user_hypotheses_section(payload: dict[str, Any]) -> list[str]:
                 f"  - target=`{target}` expression=`{transformation}({base_signal})` ({reason})"
             )
     return lines
+
+
+def _render_task_profiles_section(task_profiles: list[dict[str, Any]]) -> list[str]:
+    if not task_profiles:
+        return ["- No explicit task assessment was generated."]
+    lines: list[str] = []
+    for item in task_profiles:
+        if not isinstance(item, dict):
+            continue
+        target_signal = str(item.get("target_signal", "unknown"))
+        lines.append(
+            f"- `{target_signal}`: task_type=`{item.get('task_type', 'n/a')}`, "
+            f"family=`{item.get('task_family', 'n/a')}`, "
+            f"recommended_split=`{item.get('recommended_split_strategy', 'n/a')}`, "
+            f"override_applied={bool(item.get('override_applied', False))}."
+        )
+        class_count = _fmt_int(item.get("class_count"))
+        minority = _safe_float(item.get("minority_class_fraction"))
+        if class_count != "n/a":
+            line = f"  - label_states={class_count}"
+            if math.isfinite(minority):
+                line += f", minority_fraction={minority:.3%}"
+            positive = str(item.get("positive_class_label", "")).strip()
+            if positive:
+                line += f", minority_label=`{positive}`"
+            lines.append(line)
+        rationale = str(item.get("rationale", "")).strip()
+        if rationale:
+            lines.append(f"  - rationale: {rationale}")
+    return lines or ["- No explicit task assessment was generated."]
 
 
 def _render_sensor_diagnostics(payload: dict[str, Any]) -> list[str]:

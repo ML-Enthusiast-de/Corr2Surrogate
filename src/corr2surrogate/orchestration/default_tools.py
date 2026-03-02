@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from corr2surrogate.analytics import (
+    assess_task_profiles,
     assess_stationarity,
     build_agent1_report_payload,
     build_candidate_signals_from_correlations,
@@ -110,6 +111,7 @@ def build_default_registry() -> ToolRegistry:
                 "confidence_top_k": {"type": "integer"},
                 "bootstrap_rounds": {"type": "integer"},
                 "stability_windows": {"type": "integer"},
+                "task_type_hint": {"type": "string"},
                 "max_samples": {"type": "integer"},
                 "sample_selection": {"type": "string"},
                 "missing_data_strategy": {"type": "string"},
@@ -226,6 +228,7 @@ def build_default_registry() -> ToolRegistry:
                 "fill_constant_value": {"type": "number"},
                 "compare_against_baseline": {"type": "boolean"},
                 "lag_horizon_samples": {"type": "integer"},
+                "task_type_hint": {"type": "string"},
             },
             "required": ["data_path", "target_column", "feature_columns", "requested_model_family"],
             "additionalProperties": False,
@@ -421,6 +424,7 @@ def _tool_run_agent1_analysis(
     confidence_top_k: int = 10,
     bootstrap_rounds: int = 40,
     stability_windows: int = 4,
+    task_type_hint: str | None = None,
     max_samples: int | None = None,
     sample_selection: str = "uniform",
     missing_data_strategy: str = "keep",
@@ -526,6 +530,12 @@ def _tool_run_agent1_analysis(
     )
     stationarity_columns = [item.target_signal for item in correlations.target_analyses]
     stationarity = assess_stationarity(frame, signal_columns=stationarity_columns)
+    task_profiles = assess_task_profiles(
+        frame=frame,
+        target_columns=stationarity_columns,
+        data_mode=correlations.data_mode,
+        task_type_hint=task_type_hint,
+    )
     model_strategy = recommend_model_strategies(
         frame=frame,
         correlations=correlations,
@@ -567,6 +577,7 @@ def _tool_run_agent1_analysis(
             "confidence_top_k": confidence_top_k,
             "bootstrap_rounds": bootstrap_rounds,
             "stability_windows": stability_windows,
+            "task_type_hint": task_type_hint,
             "enable_strategy_search": enable_strategy_search,
             "strategy_search_candidates": strategy_search_candidates,
         },
@@ -585,6 +596,7 @@ def _tool_run_agent1_analysis(
         preprocessing=preprocessing,
         sensor_diagnostics=diagnostics.to_dict(),
         model_strategy_recommendations=model_strategy.to_dict(),
+        task_profiles=[item.to_dict() for item in task_profiles],
         experiment_recommendations=recommendations_to_dict(recommendations),
         planner_trace=planner_trace,
         critic_decision=critic_decision,
@@ -613,6 +625,7 @@ def _tool_run_agent1_analysis(
         preprocessing=preprocessing,
         sensor_diagnostics=diagnostics.to_dict(),
         model_strategy_recommendations=model_strategy.to_dict(),
+        task_profiles=[item.to_dict() for item in task_profiles],
         experiment_recommendations=recommendations_to_dict(recommendations),
         planner_trace=planner_trace,
         critic_decision=critic_decision,
@@ -646,6 +659,7 @@ def _tool_run_agent1_analysis(
         "correlations": correlations.to_dict(),
         "sensor_diagnostics": diagnostics.to_dict(),
         "model_strategy_recommendations": model_strategy.to_dict(),
+        "task_profiles": [item.to_dict() for item in task_profiles],
         "experiment_recommendations": recommendations_to_dict(recommendations),
         "planner_trace": planner_trace,
         "critic_decision": critic_decision,
@@ -737,6 +751,7 @@ def _tool_train_surrogate_candidates(
     fill_constant_value: float | None = None,
     compare_against_baseline: bool = True,
     lag_horizon_samples: int | None = None,
+    task_type_hint: str | None = None,
 ) -> dict[str, Any]:
     frame = _load_frame(data_path=data_path, sheet_name=sheet_name)
     result = train_surrogate_candidates(
@@ -750,6 +765,7 @@ def _tool_train_surrogate_candidates(
         fill_constant_value=fill_constant_value,
         compare_against_baseline=compare_against_baseline,
         lag_horizon_samples=lag_horizon_samples,
+        task_type=task_type_hint,
         run_id=run_id,
         checkpoint_tag=checkpoint_tag,
         data_references=[data_path],

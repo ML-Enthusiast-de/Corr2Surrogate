@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -31,6 +32,8 @@ def build_train_validation_test_split(
     *,
     n_rows: int,
     data_mode: str,
+    task_type: str = "regression",
+    stratify_labels: Sequence[Any] | np.ndarray | None = None,
 ) -> DatasetSplit:
     """Build deterministic split indices for tabular or time-series data."""
     if n_rows < 12:
@@ -38,6 +41,18 @@ def build_train_validation_test_split(
     mode = data_mode.strip().lower()
     if mode == "time_series":
         return _build_time_series_split(n_rows=n_rows)
+    if str(task_type).strip() in {
+        "binary_classification",
+        "multiclass_classification",
+        "fraud_detection",
+        "anomaly_detection",
+    }:
+        stratified = _build_steady_state_stratified_split(
+            n_rows=n_rows,
+            stratify_labels=stratify_labels,
+        )
+        if stratified is not None:
+            return stratified
     return _build_steady_state_split(n_rows=n_rows)
 
 
@@ -88,5 +103,53 @@ def _build_steady_state_split(*, n_rows: int) -> DatasetSplit:
         validation_indices=idx[val_mask],
         test_indices=idx[test_mask],
         strategy="deterministic_modulo_70_15_15",
+        data_mode="steady_state",
+    )
+
+
+def _build_steady_state_stratified_split(
+    *,
+    n_rows: int,
+    stratify_labels: Sequence[Any] | np.ndarray | None,
+) -> DatasetSplit | None:
+    if stratify_labels is None:
+        return None
+    labels = np.asarray(list(stratify_labels), dtype=object)
+    if labels.shape[0] != n_rows:
+        raise ValueError("stratify_labels length must match n_rows.")
+    idx = np.arange(n_rows, dtype=int)
+    pattern = np.arange(20, dtype=int)
+    train_mask = np.zeros(n_rows, dtype=bool)
+    val_mask = np.zeros(n_rows, dtype=bool)
+    test_mask = np.zeros(n_rows, dtype=bool)
+
+    seen_labels: list[Any] = []
+    seen_tokens: set[str] = set()
+    for value in labels.tolist():
+        token = str(value)
+        if token in seen_tokens:
+            continue
+        seen_tokens.add(token)
+        seen_labels.append(value)
+
+    for label in seen_labels:
+        class_indices = idx[labels == label]
+        if class_indices.size == 0:
+            continue
+        local_pattern = pattern[np.arange(class_indices.size) % pattern.size]
+        test_local = local_pattern < 3
+        val_local = (local_pattern >= 3) & (local_pattern < 6)
+        train_local = ~(test_local | val_local)
+        test_mask[class_indices[test_local]] = True
+        val_mask[class_indices[val_local]] = True
+        train_mask[class_indices[train_local]] = True
+
+    if int(np.sum(test_mask)) < 2 or int(np.sum(val_mask)) < 2 or int(np.sum(train_mask)) < 6:
+        return None
+    return DatasetSplit(
+        train_indices=idx[train_mask],
+        validation_indices=idx[val_mask],
+        test_indices=idx[test_mask],
+        strategy="stratified_deterministic_modulo_70_15_15",
         data_mode="steady_state",
     )
