@@ -49,9 +49,9 @@ Outputs:
   - steady-state classification/fraud -> stratified deterministic split
   - steady-state regression -> deterministic modulo split
 - Tunes binary classifier decision thresholds on the validation split for classification/fraud tasks before final test reporting
-- Runs Optuna optimization
+- Planned next step: run Optuna optimization after the deterministic baseline path is stable
 - Saves:
-  - tuned model params
+  - selected model params (and later tuned params)
   - scaler/normalization state
   - metrics and metadata
 - Runs agentic loops if criteria not met

@@ -12,12 +12,12 @@ Integrate LLM agents now at the orchestration layer, not inside analytics/modeli
   - explain outcomes to user.
 
 ## 2. Runtime and Local-Only Policy
-Mandatory runtime constraints:
-- Provider: local only (`ollama` or `llama.cpp`).
-- API usage: disabled.
+Default runtime constraints:
+- Provider: local by default (`ollama` or `llama.cpp`).
+- API usage: disabled by default; remote API mode is optional explicit opt-in.
 - Telemetry/upload: disabled.
 - Network calls: blocked by default for agent runtime.
-- Model files: local GGUF only.
+- Model files: local GGUF only when running in local model mode.
 
 CPU-first model profiles:
 - `small_cpu`: 3B-4B quantized (Q4/K_M), no GPU required.

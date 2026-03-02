@@ -197,8 +197,8 @@ Current classification note:
 
 Recommended model families to implement next:
 - steady-state / tabular: add `ElasticNet`
-- time-series: add true lagged linear training (Agent 1 already recommends it)
-- stronger time-series tabular: lag-window tree ensembles after lagged linear
+- stronger tabular baseline: add boosted-tree alternatives beyond the current bagged tree path
+- time-series classification: add lagged classifier baselines (`lagged_logistic`, lag-window tree classifier)
 - sequence models: `GRU`/`LSTM` only when lagged/tabular probes still leave meaningful residual dynamics
 
 Operational rule:
