@@ -100,14 +100,19 @@ def build_agent2_handoff_from_report_payload(payload: dict[str, Any]) -> Agent2H
     data_mode = str(payload.get("data_mode", "steady_state")).strip() or "steady_state"
     timestamp_column = str(payload.get("timestamp_column", "")).strip() or None
     task_type = _task_type_for_target(payload, target_signal=target_signal)
-    recommended_model = str(
+    raw_recommended_model = str(
         (target_rec or {}).get("recommended_model_family", "linear_ridge")
     ).strip() or "linear_ridge"
+    recommended_model = _recommended_model_for_task(
+        recommended_model=raw_recommended_model,
+        task_type=task_type,
+    )
     search_order = [
         str(item).strip()
         for item in ((target_rec or {}).get("priority_model_families") or [])
         if str(item).strip()
     ]
+    search_order = _search_order_for_task(search_order=search_order, task_type=task_type)
     lag_horizon = _derive_lag_horizon_samples(target_rec or {})
     preprocessing = payload.get("preprocessing") if isinstance(payload.get("preprocessing"), dict) else {}
     missing_plan = preprocessing.get("missing_data_plan") if isinstance(preprocessing.get("missing_data_plan"), dict) else {}
@@ -148,7 +153,7 @@ def build_agent2_handoff_from_report_payload(payload: dict[str, Any]) -> Agent2H
         target_signal=target_signal,
         feature_signals=feature_signals,
         split_strategy=split_strategy,
-        acceptance_criteria={"r2": 0.70},
+        acceptance_criteria=_default_acceptance_criteria_for_task(task_type),
         normalization=normalization,
         recommended_model_family=recommended_model,
         model_search_order=search_order,
@@ -250,6 +255,50 @@ def _derive_lag_horizon_samples(target_rec: dict[str, Any]) -> int:
         if match:
             return max(1, int(match.group(1)))
     return 3
+
+
+def _recommended_model_for_task(*, recommended_model: str, task_type: str) -> str:
+    normalized = str(recommended_model).strip() or "linear_ridge"
+    if task_type not in {
+        "binary_classification",
+        "multiclass_classification",
+        "fraud_detection",
+        "anomaly_detection",
+    }:
+        return normalized
+    if normalized in {"logistic_regression", "bagged_tree_classifier"}:
+        return normalized
+    if normalized in {"bagged_tree_ensemble", "lagged_tree_ensemble", "tree_ensemble_candidate"}:
+        return "bagged_tree_classifier"
+    return "logistic_regression"
+
+
+def _search_order_for_task(*, search_order: list[str], task_type: str) -> list[str]:
+    if task_type not in {
+        "binary_classification",
+        "multiclass_classification",
+        "fraud_detection",
+        "anomaly_detection",
+    }:
+        return search_order
+    mapped: list[str] = []
+    for item in search_order:
+        normalized = _recommended_model_for_task(recommended_model=item, task_type=task_type)
+        if normalized not in mapped:
+            mapped.append(normalized)
+    for fallback in ("logistic_regression", "bagged_tree_classifier"):
+        if fallback not in mapped:
+            mapped.append(fallback)
+    return mapped
+
+
+def _default_acceptance_criteria_for_task(task_type: str) -> dict[str, float]:
+    normalized = str(task_type).strip()
+    if normalized in {"fraud_detection", "anomaly_detection"}:
+        return {"recall": 0.70, "pr_auc": 0.35}
+    if normalized in {"binary_classification", "multiclass_classification"}:
+        return {"f1": 0.75, "accuracy": 0.75}
+    return {"r2": 0.70}
 
 
 def _task_type_for_target(payload: dict[str, Any], *, target_signal: str) -> str:

@@ -205,9 +205,9 @@ def build_default_registry() -> ToolRegistry:
     registry.register_function(
         name="train_surrogate_candidates",
         description=(
-            "Run split-safe train/validation/test training for the linear baseline, "
-            "the lagged temporal baselines when applicable, and the first "
-            "nonlinear baselines, compare them, and persist the selected model."
+            "Run split-safe train/validation/test training for regression or classification: "
+            "linear/logistic baselines, lagged temporal baselines when applicable, and the first "
+            "nonlinear tree baselines, compare them, and persist the selected model."
         ),
         input_schema={
             "type": "object",

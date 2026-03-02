@@ -4,7 +4,7 @@ Corr2Surrogate is a local-first framework for converting real-world sensor data 
 
 ## What It Does
 - Agent 1 (`Analyst`) ingests CSV/XLS/XLSX data, checks data quality, runs correlation analysis, ranks surrogate candidates, and performs lightweight probe-model screening to recommend which model families Agent 2 should test first.
-- Agent 2 (`Modeler`) now has a first executable training path: split-safe train/validation/test modeling with a linear baseline, a real nonlinear tree baseline, reproducible artifacts, and result interpretation. The intended search order remains pragmatic: start with linear or lagged baselines, escalate to tree ensembles when interaction or piecewise evidence is real, and only test sequence models when temporal probes justify it.
+- Agent 2 (`Modeler`) now has a first executable training path: split-safe train/validation/test modeling for both regression and classification, with local linear/logistic baselines, local tree baselines, reproducible artifacts, and result interpretation. The intended search order remains pragmatic: start with linear or lagged baselines, escalate to tree ensembles when interaction or piecewise evidence is real, and only test sequence models when temporal probes justify it.
 
 ## Key Capabilities
 - CSV/XLS/XLSX ingestion with sheet selection and header/data-start inference
@@ -20,7 +20,9 @@ Corr2Surrogate is a local-first framework for converting real-world sensor data 
 - Task-type detection for regression, balanced classification, and fraud/anomaly-style labels
 - User task override command: `task regression`, `task binary_classification`, `task fraud_detection`, `task auto`
 - Split-safe Agent 2 training (train-only preprocessing, time-ordered splits for time series, stratified steady-state splits for classification labels)
-- First nonlinear modeling baseline: local bagged tree ensemble
+- Executable classifier baselines: `logistic_regression` and `bagged_tree_classifier`
+- Validation-tuned decision thresholds for binary classification and fraud screening
+- First nonlinear modeling baseline: local bagged tree ensemble / tree classifier
 - Candidate comparison with LLM-assisted model interpretation in the CLI
 - Local runtime by default; optional API mode via explicit opt-in
 
@@ -181,13 +183,17 @@ Agent 1 now emits a model-strategy prior for each target. Agent 2 should treat t
 
 Current executable model families:
 - `linear_ridge`
+- `logistic_regression`
+- `bagged_tree_classifier`
 - `lagged_linear`
 - `lagged_tree_ensemble`
 - `bagged_tree_ensemble`
 
 Current classification note:
-- Agent 2 now detects classification / fraud-like targets and prepares the correct split policy (stratified for steady-state labels, ordered for time-based labels).
-- Executable classifier training is not implemented yet, so the modeler stops cleanly and tells the user that the task was detected but is not supported by the current trainers.
+- Agent 2 now detects classification / fraud-like targets, applies the correct split policy (stratified for steady-state labels, ordered for time-based labels), and trains the local classifier baselines instead of falling back to regression.
+- Default acceptance checks are task-aware:
+  - balanced classification defaults to `f1` + `accuracy`
+  - fraud / anomaly screening defaults to `recall` + `pr_auc`
 
 Recommended model families to implement next:
 - steady-state / tabular: add `ElasticNet`
@@ -240,7 +246,7 @@ Two user entry paths are part of the intended product behavior:
    - pass Agent 1 recommendations into Agent 2 as a prior
 2. Direct modeler mode (skip Agent 1):
    - user may immediately ask Agent 2 to build a model with explicit inputs and target
-   - current executable implementation supports `auto`, `linear_ridge`, `lagged_linear`, `lagged_tree_ensemble`, and `bagged_tree_ensemble`
+   - current executable implementation supports `auto`, `linear_ridge`, `logistic_regression`, `bagged_tree_classifier`, `lagged_linear`, `lagged_tree_ensemble`, and `bagged_tree_ensemble`
    - example intent: "build model `linear_ridge` with inputs `A,B,C` and target `D`"
    - this fast path should not require a prior Agent 1 handoff
 
@@ -254,9 +260,9 @@ Example direct modeler request:
 - `build model tree with inputs torque,temp,flow and target pressure`
 
 Current implementation note:
-- the direct modeler session currently executes `auto`, `linear_ridge` / `ridge` / `linear`, `lagged_linear` / `lagged` / `temporal_linear` / `arx`, `lagged_tree_ensemble` / `lagged_tree` / `lag_window_tree` / `temporal_tree`, and `bagged_tree_ensemble` / `tree`
+- the direct modeler session currently executes `auto`, `linear_ridge` / `ridge` / `linear`, `logistic_regression` / `logistic` / `logit` / `linear_classifier`, `bagged_tree_classifier` / `tree_classifier`, `lagged_linear` / `lagged` / `temporal_linear` / `arx`, `lagged_tree_ensemble` / `lagged_tree` / `lag_window_tree` / `temporal_tree`, and `bagged_tree_ensemble` / `tree`
 - the modeler CLI now runs a split-safe comparison between the linear baseline and the available temporal/nonlinear comparators, performs a bounded acceptance check, optionally retries with the next safe family when policy allows it, and uses the LLM to interpret the final measured result
-- if the selected target looks like classification or fraud detection, the modeler reports that explicitly, applies the correct split policy, and exits safely because the current executable trainers are regression-only
+- if the selected target looks like classification or fraud detection, the modeler reports that explicitly, applies the correct split policy, trains the local classifier candidates, and evaluates them with classification-aware metrics
 
 ## User Override Rules For Agent 2
 Even when a valid Agent 1 handoff exists, the user must remain in control of the modeling scope.

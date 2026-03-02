@@ -48,6 +48,7 @@ Outputs:
   - time-series -> ordered blocked split
   - steady-state classification/fraud -> stratified deterministic split
   - steady-state regression -> deterministic modulo split
+- Tunes binary classifier decision thresholds on the validation split for classification/fraud tasks before final test reporting
 - Runs Optuna optimization
 - Saves:
   - tuned model params
@@ -64,8 +65,8 @@ Outputs:
   - sequence models only after simpler lagged/tabular baselines fail
 - Current executable baseline path:
   - direct modeler mode and Agent 1 structured-report handoff both reach a split-safe trainer
-  - executable families today: `linear_ridge`, `lagged_linear`, `lagged_tree_ensemble`, `bagged_tree_ensemble`
-  - classification / fraud targets are detected and surfaced, but current executable trainers remain regression-only and should stop cleanly
+  - executable families today: `linear_ridge`, `logistic_regression`, `bagged_tree_classifier`, `lagged_linear`, `lagged_tree_ensemble`, `bagged_tree_ensemble`
+  - classification / fraud targets now train local classifier baselines with task-aware acceptance checks instead of stopping at detection
   - modeler compares available candidates, runs a bounded acceptance check, can retry with the next safe family when policy allows it, persists artifacts, and then lets the LLM interpret the measured result
 - User control:
   - if a handoff exists, user can accept the recommendation or override target, predictors, and architecture

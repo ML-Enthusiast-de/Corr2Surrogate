@@ -481,13 +481,15 @@ def _run_agent_session(
         print(
             "agent> Direct build syntax: "
             "`build model linear_ridge with inputs A,B,C and target D` "
-            "or `build model lagged_linear with inputs A,B and target C`."
+            "or `build model logistic_regression with inputs A,B and target class_label`."
         )
         print(
             "agent> Current executable models: `auto`, `linear_ridge`, "
-            "`lagged_linear`, `lagged_tree_ensemble`, `bagged_tree_ensemble` "
-            "(aliases include `ridge`, `linear`, `lagged`, `temporal_linear`, `arx`, "
-            "`lagged_tree`, `lag_window_tree`, `temporal_tree`, `tree`, `tree_ensemble`, "
+            "`logistic_regression`, `bagged_tree_classifier`, `lagged_linear`, "
+            "`lagged_tree_ensemble`, `bagged_tree_ensemble` "
+            "(aliases include `ridge`, `linear`, `logistic`, `logit`, `classifier`, "
+            "`tree_classifier`, `lagged`, `temporal_linear`, `arx`, `lagged_tree`, "
+            "`lag_window_tree`, `temporal_tree`, `tree`, `tree_ensemble`, "
             "`extra_trees`, `hist_gradient_boosting`)."
         )
         print(
@@ -582,13 +584,15 @@ def _run_agent_session(
                 print(
                     "agent> Direct build syntax: "
                     "`build model linear_ridge with inputs A,B,C and target D` "
-                    "or `build model lagged_linear with inputs A,B and target C`."
+                    "or `build model logistic_regression with inputs A,B and target class_label`."
                 )
                 print(
                     "agent> Current executable models: `auto`, `linear_ridge`, "
-                    "`lagged_linear`, `lagged_tree_ensemble`, `bagged_tree_ensemble` "
-                    "(aliases include `ridge`, `linear`, `lagged`, `temporal_linear`, `arx`, "
-                    "`lagged_tree`, `lag_window_tree`, `temporal_tree`, `tree`, `tree_ensemble`, "
+                    "`logistic_regression`, `bagged_tree_classifier`, `lagged_linear`, "
+                    "`lagged_tree_ensemble`, `bagged_tree_ensemble` "
+                    "(aliases include `ridge`, `linear`, `logistic`, `logit`, `classifier`, "
+                    "`tree_classifier`, `lagged`, `temporal_linear`, `arx`, `lagged_tree`, "
+                    "`lag_window_tree`, `temporal_tree`, `tree`, `tree_ensemble`, "
                     "`extra_trees`, `hist_gradient_boosting`)."
                 )
                 print(
@@ -996,7 +1000,11 @@ def _run_analyst_autopilot_turn(
                 },
             }
 
-    print("agent> Running Agent 1 analysis...")
+    _print_analysis_dataset_overview(preflight=preflight)
+    print(
+        "agent> Preparing Agent 1 analysis. "
+        "I will ask about target scope, sample budget, data cleaning, and lag assumptions."
+    )
     analysis_args: dict[str, Any] = {
         "data_path": data_path,
         "save_report": True,
@@ -1020,39 +1028,83 @@ def _run_analyst_autopilot_turn(
         "feature_hypotheses": [],
     }
     row_count = int(preflight.get("row_count") or 0)
+    signal_inventory_available = (
+        "numeric_signal_columns" in preflight or "signal_columns" in preflight
+    )
+    numeric_signals_raw = preflight.get("numeric_signal_columns")
+    if isinstance(numeric_signals_raw, list) and numeric_signals_raw:
+        numeric_signals = [str(item) for item in numeric_signals_raw]
+    else:
+        fallback_signals = preflight.get("signal_columns")
+        numeric_signals = [str(item) for item in fallback_signals] if isinstance(fallback_signals, list) else []
+
+    if not numeric_signals and signal_inventory_available:
+        response = "No numeric signals were detected after ingestion. Please load a dataset with usable numeric columns."
+        return {
+            "response": response,
+            "event": {"status": "respond", "message": response, "error": "no_numeric_signals"},
+        }
+    if numeric_signals:
+        suggested_targets = _suggest_default_analysis_targets(
+            available_signals=numeric_signals,
+            default_count=5,
+        )
+        if len(numeric_signals) == 1:
+            only_target = numeric_signals[0]
+            analysis_args["target_signals"] = [only_target]
+            print(
+                "agent> Only one numeric signal is available, "
+                f"so I will analyze `{only_target}` as the target."
+            )
+        else:
+            print(
+                "agent> Dataset scope: "
+                f"{len(numeric_signals)} numeric signals are available for target selection."
+            )
+            if len(numeric_signals) > 40:
+                print(
+                    "agent> Full all-signal correlation can take a long time on this dataset."
+                )
+            if suggested_targets:
+                print(
+                    "agent> Suggested target set: "
+                    + ", ".join(f"`{item}`" for item in suggested_targets[:5])
+                    + "."
+                )
+            print(_target_selection_prompt_text(default_targets=suggested_targets))
+            selected_targets = _prompt_target_selection(
+                available_signals=numeric_signals,
+                default_count=5,
+                default_targets=suggested_targets,
+                hypothesis_state=hypothesis_state,
+                chat_detour=chat_detour,
+            )
+            if selected_targets is not None:
+                analysis_args["target_signals"] = selected_targets
+                print(f"agent> Using focused targets: {selected_targets}")
+                print(
+                    "agent> Focused target mode enabled with full analysis "
+                    "(multi-technique correlations + feature engineering)."
+                )
+            else:
+                print("agent> Running full all-signal analysis as requested.")
+    else:
+        print(
+            "agent> Signal inventory was not exposed by ingestion preflight, "
+            "so I will proceed with the tool defaults for target discovery."
+        )
+
     sample_plan = _prompt_sample_budget(row_count=row_count, chat_detour=chat_detour)
     analysis_args.update(sample_plan)
 
     data_issue_plan = _prompt_data_issue_handling(preflight=preflight, chat_detour=chat_detour)
     analysis_args.update(data_issue_plan)
 
-    numeric_signals = [str(item) for item in (preflight.get("numeric_signal_columns") or [])]
-    if len(numeric_signals) > 40:
+    if len(numeric_signals) > 40 and analysis_args.get("target_signals") is None:
         print(
-            "agent> Detected "
-            f"{len(numeric_signals)} numeric signals. Full all-signal correlation can take a long time."
+            "agent> High-dimensional full run confirmed. "
+            "This can take longer, but all numeric targets will be evaluated."
         )
-        print(
-            "agent> Enter comma-separated target signals to focus, "
-            "'all' for full run, 'list' to show signal names, "
-            "or `hypothesis ...` to add correlation/feature hypotheses; "
-            "or press Enter to use a quick default subset."
-        )
-        selected_targets = _prompt_target_selection(
-            available_signals=numeric_signals,
-            default_count=5,
-            hypothesis_state=hypothesis_state,
-            chat_detour=chat_detour,
-        )
-        if selected_targets is not None:
-            analysis_args["target_signals"] = selected_targets
-            print(f"agent> Using focused targets: {selected_targets}")
-            print(
-                "agent> Focused target mode enabled with full analysis "
-                "(multi-technique correlations + feature engineering)."
-            )
-        else:
-            print("agent> Running full all-signal analysis as requested.")
 
     inline_hypotheses = _parse_inline_hypothesis_command(
         user_message=user_message,
@@ -1099,6 +1151,7 @@ def _run_analyst_autopilot_turn(
     if data_start_row is not None:
         analysis_args["data_start_row"] = int(data_start_row)
 
+    print("agent> Running Agent 1 analysis now.")
     analysis = _execute_registry_tool(registry, "run_agent1_analysis", analysis_args)
     summary = (
         "Analysis complete: "
@@ -1631,7 +1684,7 @@ def _parse_modeler_build_request(user_message: str) -> dict[str, Any] | None:
         "feature_raw": feature_raw,
         "target_raw": target_raw,
         "data_path": str(data_path) if data_path is not None else "",
-        "acceptance_criteria": {"r2": 0.70},
+        "acceptance_criteria": {},
         "loop_policy": {
             "enabled": True,
             "max_attempts": 2,
@@ -1734,9 +1787,11 @@ def _execute_modeler_build_request(
             f"Requested model `{requested_model}` is not implemented yet. "
             "Currently available: `auto`, `linear_ridge` "
             "(aliases: `ridge`, `linear`, `incremental_linear_surrogate`), "
+            "`logistic_regression` (aliases: `logistic`, `logit`, `linear_classifier`, `classifier`), "
             "`lagged_linear` (aliases: `lagged`, `temporal_linear`, `arx`), "
             "`lagged_tree_ensemble` (aliases: `lagged_tree`, `lag_window_tree`, `temporal_tree`), and "
-            "`bagged_tree_ensemble` (aliases: `tree`, `tree_ensemble`, `extra_trees`, `hist_gradient_boosting`)."
+            "`bagged_tree_ensemble` (aliases: `tree`, `tree_ensemble`, `extra_trees`, `hist_gradient_boosting`), "
+            "and `bagged_tree_classifier` (aliases: `tree_classifier`, `classifier_tree`, `fraud_tree`)."
         )
         print(f"agent> {response}")
         session_context["workflow_stage"] = "modeler_dataset_ready"
@@ -1760,7 +1815,11 @@ def _execute_modeler_build_request(
         or dataset.get("timestamp_column_hint")
         or ""
     ).strip() or None
-    acceptance_criteria = _safe_acceptance_criteria(build_request.get("acceptance_criteria"))
+    raw_acceptance_criteria = build_request.get("acceptance_criteria")
+    acceptance_criteria = _safe_acceptance_criteria(
+        raw_acceptance_criteria,
+        task_type_hint=task_type_hint,
+    )
     loop_policy = _safe_loop_policy(build_request.get("loop_policy"))
     user_locked_model_family = bool(build_request.get("user_locked_model_family", False))
     raw_search_order = [str(item).strip() for item in build_request.get("model_search_order", []) if str(item).strip()]
@@ -1787,6 +1846,7 @@ def _execute_modeler_build_request(
     current_requested_model = resolved_model
     tried_models: set[str] = set()
     last_training: dict[str, Any] | None = None
+    best_training: dict[str, Any] | None = None
     last_loop_eval: dict[str, Any] | None = None
 
     while True:
@@ -1797,7 +1857,7 @@ def _execute_modeler_build_request(
         print("agent> Step 1/3: building split-safe train/validation/test partitions.")
         print("agent> Step 2/3: fitting train-only preprocessing (missing-data handling and optional normalization).")
         print(
-            "agent> Step 3/3: training the linear baseline and available temporal/nonlinear comparators, "
+            "agent> Step 3/3: training the task-appropriate baseline and available comparators, "
             "then selecting the requested/best candidate."
         )
         tool_args = _modeler_training_tool_args(
@@ -1836,7 +1896,21 @@ def _execute_modeler_build_request(
             }
 
         last_training = training
+        best_training = _select_better_training_result(
+            incumbent=best_training,
+            candidate=training,
+        )
         _print_modeler_training_summary(training=training)
+        training_task_profile = (
+            training.get("task_profile") if isinstance(training.get("task_profile"), dict) else {}
+        )
+        effective_task_type = str(
+            training_task_profile.get("task_type") or task_type_hint or ""
+        ).strip() or None
+        acceptance_criteria = _safe_acceptance_criteria(
+            raw_acceptance_criteria,
+            task_type_hint=effective_task_type,
+        )
         metrics_payload = _build_model_loop_metrics(training)
         try:
             loop_eval = _execute_registry_tool(
@@ -1914,7 +1988,7 @@ def _execute_modeler_build_request(
             "event": {"status": "respond", "message": response, "error": "training_unavailable"},
         }
 
-    training = last_training
+    training = best_training or last_training
     selected_metrics_bundle = (
         training.get("selected_metrics") if isinstance(training.get("selected_metrics"), dict) else {}
     )
@@ -1933,8 +2007,7 @@ def _execute_modeler_build_request(
         f"target={target}, "
         f"inputs={len(features)}, "
         f"rows_used={training.get('rows_used', 'n/a')}, "
-        f"test_r2={_fmt_metric(test_metrics.get('r2'))}, "
-        f"test_mae={_fmt_metric(test_metrics.get('mae'))}."
+        f"{_format_model_outcome_summary(test_metrics, training.get('task_profile'))}."
     )
     checkpoint_line = f"Checkpoint saved: {training.get('checkpoint_id', 'n/a')}"
     run_dir_line = f"Artifacts: {training.get('run_dir', 'n/a')}"
@@ -2112,16 +2185,131 @@ def _print_modeler_training_summary(*, training: dict[str, Any]) -> None:
         print(
             "agent> Candidate "
             f"`{item.get('model_family', 'n/a')}`: "
-            f"val_r2={_fmt_metric(val_metrics.get('r2'))}, "
-            f"val_mae={_fmt_metric(val_metrics.get('mae'))}, "
-            f"test_r2={_fmt_metric(test_metrics.get('r2'))}, "
-            f"test_mae={_fmt_metric(test_metrics.get('mae'))}."
+            f"{_format_candidate_metric_summary(val_metrics, test_metrics)}."
         )
 
 
-def _safe_acceptance_criteria(raw: Any) -> dict[str, float]:
+def _default_acceptance_criteria(*, task_type_hint: str | None = None) -> dict[str, float]:
+    normalized = normalize_task_type_hint(task_type_hint) or str(task_type_hint or "").strip()
+    if normalized in {"fraud_detection", "anomaly_detection"}:
+        return {"recall": 0.70, "pr_auc": 0.35}
+    if normalized in {"binary_classification", "multiclass_classification"}:
+        return {"f1": 0.75, "accuracy": 0.75}
+    return {"r2": 0.70}
+
+
+def _task_is_classification(task_type_hint: str | None) -> bool:
+    normalized = normalize_task_type_hint(task_type_hint) or str(task_type_hint or "").strip()
+    return normalized in {
+        "binary_classification",
+        "multiclass_classification",
+        "fraud_detection",
+        "anomaly_detection",
+    }
+
+
+def _format_model_outcome_summary(test_metrics: dict[str, Any], task_profile: Any) -> str:
+    task_type = ""
+    if isinstance(task_profile, dict):
+        task_type = str(task_profile.get("task_type", "")).strip()
+    if _task_is_classification(task_type):
+        parts = [
+            f"test_f1={_fmt_metric(test_metrics.get('f1'))}",
+            f"test_accuracy={_fmt_metric(test_metrics.get('accuracy'))}",
+            f"test_precision={_fmt_metric(test_metrics.get('precision'))}",
+            f"test_recall={_fmt_metric(test_metrics.get('recall'))}",
+        ]
+        if "pr_auc" in test_metrics:
+            parts.append(f"test_pr_auc={_fmt_metric(test_metrics.get('pr_auc'))}")
+        elif "log_loss" in test_metrics:
+            parts.append(f"test_log_loss={_fmt_metric(test_metrics.get('log_loss'))}")
+        if "roc_auc" in test_metrics:
+            parts.append(f"test_roc_auc={_fmt_metric(test_metrics.get('roc_auc'))}")
+        return ", ".join(parts)
+    return (
+        f"test_r2={_fmt_metric(test_metrics.get('r2'))}, "
+        f"test_mae={_fmt_metric(test_metrics.get('mae'))}"
+    )
+
+
+def _format_candidate_metric_summary(
+    validation_metrics: dict[str, Any],
+    test_metrics: dict[str, Any],
+) -> str:
+    classification_like = any(
+        key in validation_metrics or key in test_metrics
+        for key in ("accuracy", "precision", "recall", "f1", "pr_auc", "roc_auc", "log_loss")
+    )
+    if classification_like:
+        parts = [
+            f"val_f1={_fmt_metric(validation_metrics.get('f1'))}",
+            f"val_accuracy={_fmt_metric(validation_metrics.get('accuracy'))}",
+            f"test_f1={_fmt_metric(test_metrics.get('f1'))}",
+            f"test_accuracy={_fmt_metric(test_metrics.get('accuracy'))}",
+        ]
+        if "pr_auc" in validation_metrics or "pr_auc" in test_metrics:
+            parts.append(f"val_pr_auc={_fmt_metric(validation_metrics.get('pr_auc'))}")
+            parts.append(f"test_pr_auc={_fmt_metric(test_metrics.get('pr_auc'))}")
+        elif "log_loss" in validation_metrics or "log_loss" in test_metrics:
+            parts.append(f"val_log_loss={_fmt_metric(validation_metrics.get('log_loss'))}")
+            parts.append(f"test_log_loss={_fmt_metric(test_metrics.get('log_loss'))}")
+        if "recall" in validation_metrics or "recall" in test_metrics:
+            parts.append(f"val_recall={_fmt_metric(validation_metrics.get('recall'))}")
+            parts.append(f"test_recall={_fmt_metric(test_metrics.get('recall'))}")
+        return ", ".join(parts)
+    return (
+        f"val_r2={_fmt_metric(validation_metrics.get('r2'))}, "
+        f"val_mae={_fmt_metric(validation_metrics.get('mae'))}, "
+        f"test_r2={_fmt_metric(test_metrics.get('r2'))}, "
+        f"test_mae={_fmt_metric(test_metrics.get('mae'))}"
+    )
+
+
+def _select_better_training_result(
+    *,
+    incumbent: dict[str, Any] | None,
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    if incumbent is None:
+        return candidate
+    incumbent_rank = _training_result_rank(incumbent)
+    candidate_rank = _training_result_rank(candidate)
+    return candidate if candidate_rank < incumbent_rank else incumbent
+
+
+def _training_result_rank(training: dict[str, Any]) -> tuple[float, ...]:
+    task_profile = training.get("task_profile") if isinstance(training.get("task_profile"), dict) else {}
+    task_type = str(task_profile.get("task_type", "")).strip()
+    selected = training.get("selected_metrics") if isinstance(training.get("selected_metrics"), dict) else {}
+    validation = selected.get("validation") if isinstance(selected.get("validation"), dict) else {}
+    if not validation:
+        validation = selected.get("test") if isinstance(selected.get("test"), dict) else {}
+    if _task_is_classification(task_type):
+        if task_type in {"fraud_detection", "anomaly_detection"}:
+            return (
+                -float(validation.get("pr_auc", 0.0)),
+                -float(validation.get("recall", 0.0)),
+                -float(validation.get("f1", 0.0)),
+                float(validation.get("log_loss", float("inf"))),
+            )
+        return (
+            -float(validation.get("f1", 0.0)),
+            -float(validation.get("accuracy", 0.0)),
+            -float(validation.get("precision", 0.0)),
+            -float(validation.get("recall", 0.0)),
+            float(validation.get("log_loss", float("inf"))),
+        )
+    return (
+        -float(validation.get("r2", float("-inf"))),
+        float(validation.get("mae", float("inf"))),
+        float(validation.get("rmse", float("inf"))),
+    )
+
+
+def _safe_acceptance_criteria(raw: Any, *, task_type_hint: str | None = None) -> dict[str, float]:
+    default = _default_acceptance_criteria(task_type_hint=task_type_hint)
     if not isinstance(raw, dict):
-        return {"r2": 0.70}
+        return default
     criteria: dict[str, float] = {}
     for key, value in raw.items():
         name = str(key).strip()
@@ -2131,7 +2319,13 @@ def _safe_acceptance_criteria(raw: Any) -> dict[str, float]:
             criteria[name] = float(value)
         except (TypeError, ValueError):
             continue
-    return criteria or {"r2": 0.70}
+    if not criteria:
+        return default
+    if _task_is_classification(task_type_hint) and not any(
+        key in criteria for key in ("accuracy", "precision", "recall", "f1", "roc_auc", "pr_auc")
+    ):
+        return default
+    return criteria
 
 
 def _safe_loop_policy(raw: Any) -> dict[str, Any]:
@@ -2302,7 +2496,9 @@ def _modeler_request_from_handoff(
         "acceptance_criteria": (
             dict(handoff.get("acceptance_criteria"))
             if isinstance(handoff.get("acceptance_criteria"), dict)
-            else {"r2": 0.70}
+            else _default_acceptance_criteria(
+                task_type_hint=str(handoff.get("task_type", "")).strip() or None
+            )
         ),
         "loop_policy": (
             dict(handoff.get("loop_policy"))
@@ -2410,9 +2606,11 @@ def _prompt_modeler_feature_override(
 def _prompt_modeler_model_override(*, default_model: str) -> tuple[str, bool]:
     available = (
         "auto, linear_ridge (aliases: ridge, linear, incremental_linear_surrogate), "
+        "logistic_regression (aliases: logistic, logit, linear_classifier, classifier), "
         "lagged_linear (aliases: lagged, temporal_linear, arx), "
         "lagged_tree_ensemble (aliases: lagged_tree, lag_window_tree, temporal_tree), "
-        "bagged_tree_ensemble (aliases: tree, tree_ensemble, extra_trees, hist_gradient_boosting)"
+        "bagged_tree_ensemble (aliases: tree, tree_ensemble, extra_trees, hist_gradient_boosting), "
+        "bagged_tree_classifier (aliases: tree_classifier, classifier_tree, fraud_tree)"
     )
     recommended_supported = _normalize_modeler_model_family(default_model)
     while True:
@@ -2915,16 +3113,82 @@ def _parse_target_selection(
     return list(available_signals[:default_count])
 
 
+def _suggest_default_analysis_targets(
+    *,
+    available_signals: list[str],
+    default_count: int,
+) -> list[str]:
+    if not available_signals:
+        return []
+    label_keywords = (
+        "target",
+        "label",
+        "class",
+        "fraud",
+        "anomaly",
+        "flag",
+        "outcome",
+        "status",
+        "result",
+    )
+    hinted = [
+        signal
+        for signal in available_signals
+        if any(token in signal.lower() for token in label_keywords)
+    ]
+    if hinted:
+        return hinted[: min(3, len(hinted))]
+    if len(available_signals) <= 8:
+        return list(available_signals)
+    return list(available_signals[: max(1, min(default_count, len(available_signals)))])
+
+
+def _target_selection_prompt_text(*, default_targets: list[str]) -> str:
+    preview = ", ".join(f"`{item}`" for item in default_targets[:5])
+    if not preview:
+        preview = "`n/a`"
+    return (
+        "agent> Enter comma-separated target signals to focus, "
+        "'all' for full run, 'list' to show signal names, "
+        "or `hypothesis ...` to add hypotheses; "
+        f"or press Enter to use the suggested target set ({preview})."
+    )
+
+
+def _print_analysis_dataset_overview(*, preflight: dict[str, Any]) -> None:
+    row_count = int(preflight.get("row_count") or 0)
+    column_count = int(preflight.get("column_count") or 0)
+    numeric_signals = [str(item) for item in (preflight.get("numeric_signal_columns") or [])]
+    timestamp_hint = str(preflight.get("timestamp_column_hint") or "").strip()
+    line = (
+        "agent> Dataset overview: "
+        f"rows={row_count}, columns={column_count}, numeric_signals={len(numeric_signals)}"
+    )
+    if timestamp_hint:
+        line += f", timestamp_hint=`{timestamp_hint}`"
+    line += "."
+    print(line)
+
+
 def _prompt_target_selection(
     *,
     available_signals: list[str],
     default_count: int,
+    default_targets: list[str] | None = None,
     hypothesis_state: dict[str, list[dict[str, Any]]] | None = None,
     chat_detour: Callable[[str, str], None] | None = None,
 ) -> list[str] | None:
+    resolved_defaults = [
+        item for item in (default_targets or []) if item in available_signals
+    ] or _suggest_default_analysis_targets(
+        available_signals=available_signals,
+        default_count=default_count,
+    )
     while True:
         answer = input("you> ").strip()
         lowered = answer.lower()
+        if lowered in {"y", "yes", "default"}:
+            return list(resolved_defaults)
         if lowered == "all":
             return None
         if lowered.startswith("hypothesis"):
@@ -2941,11 +3205,7 @@ def _prompt_target_selection(
                     f"feature={len(parsed['feature_hypotheses'])}. "
                     "Now continue with target selection."
                 )
-                print(
-                    "agent> Enter comma-separated target signals, "
-                    "'all' for full run, `hypothesis ...` to add more, "
-                    "or press Enter for quick default subset."
-                )
+                print(_target_selection_prompt_text(default_targets=resolved_defaults))
                 continue
             print(
                 "agent> Hypothesis format not recognized. "
@@ -2956,16 +3216,12 @@ def _prompt_target_selection(
         if lowered.startswith("list"):
             query = answer[4:].strip()
             _print_signal_names(available_signals, query=query)
-            print(
-                "agent> Enter comma-separated target signals, "
-                "'all' for full run, `hypothesis ...` to add hypotheses, "
-                "or press Enter for quick default subset."
-            )
+            print(_target_selection_prompt_text(default_targets=resolved_defaults))
             continue
         selected, unknown = _parse_target_selection_with_unknowns(
             target_answer=answer,
             available_signals=available_signals,
-            default_count=default_count,
+            default_targets=resolved_defaults,
         )
         if unknown and not selected:
             if _looks_like_small_talk(answer):
@@ -2980,7 +3236,7 @@ def _prompt_target_selection(
                         "We are currently selecting target signals. "
                         "If useful, add hypotheses via `hypothesis ...`. "
                         "Type 'list' to show names, 'all' for full run, "
-                        "or press Enter for a quick subset."
+                        "or press Enter for the suggested targets."
                     )
                 continue
             print(
@@ -2997,10 +3253,10 @@ def _parse_target_selection_with_unknowns(
     *,
     target_answer: str,
     available_signals: list[str],
-    default_count: int,
+    default_targets: list[str],
 ) -> tuple[list[str], list[str]]:
     if not target_answer.strip():
-        return list(available_signals[:default_count]), []
+        return list(default_targets), []
 
     requested = [item.strip() for item in target_answer.split(",") if item.strip()]
     available_lookup = {name.lower(): name for name in available_signals}

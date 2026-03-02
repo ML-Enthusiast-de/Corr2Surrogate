@@ -189,26 +189,65 @@ def _build_recommendations(
     previous_best_score: float | None,
 ) -> list[str]:
     recommendations: list[str] = []
-    train_mae = metrics.get("train_mae")
-    val_mae = metrics.get("val_mae")
     sample_count = metrics.get("n_samples")
 
     if sample_count is not None and sample_count < 500:
         recommendations.append(
             "Dataset appears small for robust surrogate quality. Collect more representative data."
         )
-    if train_mae is not None and val_mae is not None and val_mae > train_mae * 1.25:
-        recommendations.append(
-            "Validation gap suggests overfitting. Increase regularization or simplify architecture."
-        )
-    if previous_best_score is not None and previous_best_score > 0:
-        current_score = metrics.get("val_mae")
-        if current_score is not None:
-            relative_gain = (previous_best_score - current_score) / previous_best_score
-            if relative_gain < min_relative_improvement:
+    classification_like = any(
+        token in name.lower()
+        for name in metrics.keys()
+        for token in ("accuracy", "precision", "recall", "f1", "auc", "log_loss")
+    )
+    if classification_like:
+        train_f1 = metrics.get("train_f1")
+        val_f1 = metrics.get("val_f1")
+        train_log_loss = metrics.get("train_log_loss")
+        val_log_loss = metrics.get("val_log_loss")
+        val_recall = metrics.get("val_recall")
+        val_pr_auc = metrics.get("val_pr_auc")
+
+        if train_f1 is not None and val_f1 is not None and train_f1 > max(val_f1 + 0.10, val_f1 * 1.10):
+            recommendations.append(
+                "Validation F1 trails training F1 materially. Reduce model complexity or add regularization."
+            )
+        if train_log_loss is not None and val_log_loss is not None and val_log_loss > train_log_loss * 1.20:
+            recommendations.append(
+                "Validation log-loss is materially worse than training, which suggests overfitting or unstable probabilities."
+            )
+        if any(name in unmet_criteria for name in ("recall", "pr_auc")):
+            if val_recall is not None and val_recall < 0.70:
                 recommendations.append(
-                    "Recent gains are marginal. Try alternate architectures or feature engineering."
+                    "Recall is still weak on the minority class. Collect more positive-class examples or try a stronger tree classifier."
                 )
+            elif val_pr_auc is not None and val_pr_auc < 0.40:
+                recommendations.append(
+                    "Precision-recall separation is weak. Add discriminative features or gather harder negative examples."
+                )
+        if previous_best_score is not None and previous_best_score > 0:
+            current_score = metrics.get("val_f1")
+            if current_score is not None:
+                relative_gain = (current_score - previous_best_score) / previous_best_score
+                if relative_gain < min_relative_improvement:
+                    recommendations.append(
+                        "Recent classification gains are marginal. Try alternate architectures, threshold tuning, or better class coverage."
+                    )
+    else:
+        train_mae = metrics.get("train_mae")
+        val_mae = metrics.get("val_mae")
+        if train_mae is not None and val_mae is not None and val_mae > train_mae * 1.25:
+            recommendations.append(
+                "Validation gap suggests overfitting. Increase regularization or simplify architecture."
+            )
+        if previous_best_score is not None and previous_best_score > 0:
+            current_score = metrics.get("val_mae")
+            if current_score is not None:
+                relative_gain = (previous_best_score - current_score) / previous_best_score
+                if relative_gain < min_relative_improvement:
+                    recommendations.append(
+                        "Recent gains are marginal. Try alternate architectures or feature engineering."
+                    )
 
     if not recommendations:
         recommendations.append(

@@ -7,6 +7,7 @@ from corr2surrogate.ui.cli import (
     _extract_top3_correlations_global,
     _format_top3_correlations_line,
     _interpretation_mentions_top3,
+    _suggest_default_analysis_targets,
     main,
 )
 
@@ -113,6 +114,14 @@ def test_cli_run_agent1_analysis_prints_strict_json_for_nonfinite_values(
     assert payload["score_pos_inf"] is None
     assert payload["score_neg_inf"] is None
     assert payload["nested"]["value"] is None
+
+
+def test_suggest_default_analysis_targets_prefers_label_like_columns() -> None:
+    suggested = _suggest_default_analysis_targets(
+        available_signals=["amount_norm", "device_risk", "fraud_flag"],
+        default_count=5,
+    )
+    assert suggested == ["fraud_flag"]
 
 
 def test_cli_setup_local_llm_invokes_setup(monkeypatch) -> None:
@@ -375,6 +384,7 @@ def test_cli_run_agent_session_analyst_can_continue_directly_into_modeler(
     inputs = iter(
         [
             f"Analyze {data_path}",
+            "y",
             "y",
             "",
             "",
@@ -1308,7 +1318,7 @@ def test_cli_run_agent_session_analyst_autopilot_drops_none_optional_args(
     data_path = tmp_path / "autopilot_drop_none.csv"
     data_path.write_text("testdata", encoding="utf-8")
     signals = ["time"] + [f"S{i}" for i in range(1, 72)]
-    inputs = iter([f"Analyze {data_path}", "y", "66", "n", "/exit"])
+    inputs = iter([f"Analyze {data_path}", "66", "y", "n", "/exit"])
     registry = _SessionRegistry(
         scripted_outputs={
             "prepare_ingestion_step": [
@@ -1367,7 +1377,7 @@ def test_cli_run_agent_session_analyst_autopilot_drops_none_optional_args(
 def test_cli_run_agent_session_analyst_lag_prompt_sets_max_lag(monkeypatch, tmp_path: Path) -> None:
     data_path = tmp_path / "lag_flow.xlsx"
     data_path.write_text("testdata", encoding="utf-8")
-    inputs = iter([f"Analyze {data_path}", "y", "samples", "12", "/exit"])
+    inputs = iter([f"Analyze {data_path}", "y", "y", "samples", "12", "/exit"])
     registry = _SessionRegistry(
         scripted_outputs={
             "prepare_ingestion_step": [
@@ -1416,7 +1426,7 @@ def test_cli_run_agent_session_analyst_prompts_missing_and_length_handling(
 ) -> None:
     data_path = tmp_path / "nan_len_flow.xlsx"
     data_path.write_text("testdata", encoding="utf-8")
-    inputs = iter([f"Analyze {data_path}", "fill_median", "trim_dense_window", "0.85", "/exit"])
+    inputs = iter([f"Analyze {data_path}", "y", "fill_median", "trim_dense_window", "0.85", "/exit"])
     registry = _SessionRegistry(
         scripted_outputs={
             "prepare_ingestion_step": [
@@ -1475,7 +1485,7 @@ def test_cli_run_agent_session_analyst_default_dataset_runs_autopilot(
 ) -> None:
     default_path = tmp_path / "public_testbench_dataset_20k_minmax.csv"
     default_path.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
-    inputs = iter(["default", "/exit"])
+    inputs = iter(["default", "y", "/exit"])
     registry = _SessionRegistry(
         scripted_outputs={
             "prepare_ingestion_step": [
@@ -1553,7 +1563,7 @@ def test_cli_run_agent_session_prints_header_preview_on_confirmation(
 ) -> None:
     data_path = tmp_path / "header_preview.xlsx"
     data_path.write_text("testdata", encoding="utf-8")
-    inputs = iter([f"Analyze {data_path}", "Y", "/exit"])
+    inputs = iter([f"Analyze {data_path}", "Y", "y", "/exit"])
     registry = _SessionRegistry(
         scripted_outputs={
             "prepare_ingestion_step": [
@@ -2257,6 +2267,176 @@ def test_cli_run_agent_session_modeler_explicit_model_does_not_auto_switch(
     assert "Architecture auto-switch is disabled because this model family was explicitly chosen by the user." in output
 
 
+def test_cli_run_agent_session_modeler_keeps_best_attempt_when_retry_is_worse(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    data_path = tmp_path / "model_retry_best.csv"
+    data_path.write_text("A,B,C\n1,2,3\n", encoding="utf-8")
+    inputs = iter(
+        [
+            "build model auto with inputs A,B and target C",
+            str(data_path),
+            "/exit",
+        ]
+    )
+    registry = _SessionRegistry(
+        scripted_outputs={
+            "prepare_ingestion_step": [
+                {
+                    "status": "ok",
+                    "message": "Ingestion ready.",
+                    "options": [],
+                    "selected_sheet": None,
+                    "available_sheets": [],
+                    "header_row": 0,
+                    "data_start_row": 1,
+                    "header_confidence": 1.0,
+                    "needs_user_confirmation": False,
+                    "row_count": 120,
+                    "column_count": 3,
+                    "signal_columns": ["A", "B", "C"],
+                    "numeric_signal_columns": ["A", "B", "C"],
+                }
+            ],
+                "train_surrogate_candidates": [
+                    {
+                        "status": "ok",
+                        "checkpoint_id": "ckpt_best_first",
+                    "run_dir": "artifacts/run_best_first",
+                    "selected_model_family": "bagged_tree_classifier",
+                    "best_validation_model_family": "bagged_tree_classifier",
+                    "split": {"strategy": "stratified_deterministic_modulo_70_15_15", "train_size": 84, "validation_size": 18, "test_size": 18},
+                    "task_profile": {"task_type": "fraud_detection", "task_family": "classification", "recommended_split_strategy": "stratified_deterministic_modulo_70_15_15", "minority_class_fraction": 0.08},
+                    "preprocessing": {
+                        "missing_data_strategy_requested": "fill_median",
+                        "missing_data_strategy_effective": "fill_median_train_only",
+                    },
+                    "normalization": {"method": "minmax"},
+                    "comparison": [
+                        {
+                            "model_family": "bagged_tree_classifier",
+                            "validation_metrics": {"f1": 0.78, "accuracy": 0.95, "precision": 0.88, "recall": 0.72, "pr_auc": 0.49, "log_loss": 0.20},
+                            "test_metrics": {"f1": 0.76, "accuracy": 0.94, "precision": 0.86, "recall": 0.70, "pr_auc": 0.46, "log_loss": 0.21},
+                        },
+                        {
+                            "model_family": "logistic_regression",
+                            "validation_metrics": {"f1": 0.44, "accuracy": 0.90, "precision": 0.60, "recall": 0.35, "pr_auc": 0.25, "log_loss": 0.41},
+                            "test_metrics": {"f1": 0.40, "accuracy": 0.89, "precision": 0.55, "recall": 0.32, "pr_auc": 0.22, "log_loss": 0.43},
+                        },
+                    ],
+                    "selected_metrics": {
+                        "train": {"f1": 0.82, "accuracy": 0.96, "precision": 0.90, "recall": 0.76, "pr_auc": 0.52, "log_loss": 0.18},
+                        "validation": {"f1": 0.78, "accuracy": 0.95, "precision": 0.88, "recall": 0.72, "pr_auc": 0.49, "log_loss": 0.20},
+                        "test": {"f1": 0.76, "accuracy": 0.94, "precision": 0.86, "recall": 0.70, "pr_auc": 0.46, "log_loss": 0.21},
+                    },
+                    "rows_used": 84,
+                },
+                    {
+                        "status": "ok",
+                        "checkpoint_id": "ckpt_best_second",
+                        "run_dir": "artifacts/run_best_second",
+                        "selected_model_family": "bagged_tree_classifier",
+                        "best_validation_model_family": "bagged_tree_classifier",
+                        "split": {"strategy": "stratified_deterministic_modulo_70_15_15", "train_size": 84, "validation_size": 18, "test_size": 18},
+                        "task_profile": {"task_type": "fraud_detection", "task_family": "classification", "recommended_split_strategy": "stratified_deterministic_modulo_70_15_15", "minority_class_fraction": 0.08},
+                    "preprocessing": {
+                        "missing_data_strategy_requested": "fill_median",
+                        "missing_data_strategy_effective": "fill_median_train_only",
+                    },
+                    "normalization": {"method": "minmax"},
+                    "comparison": [
+                        {
+                            "model_family": "bagged_tree_classifier",
+                            "validation_metrics": {"f1": 0.78, "accuracy": 0.95, "precision": 0.88, "recall": 0.72, "pr_auc": 0.49, "log_loss": 0.20},
+                            "test_metrics": {"f1": 0.76, "accuracy": 0.94, "precision": 0.86, "recall": 0.70, "pr_auc": 0.46, "log_loss": 0.21},
+                        },
+                        {
+                            "model_family": "logistic_regression",
+                            "validation_metrics": {"f1": 0.44, "accuracy": 0.90, "precision": 0.60, "recall": 0.35, "pr_auc": 0.25, "log_loss": 0.41},
+                            "test_metrics": {"f1": 0.40, "accuracy": 0.89, "precision": 0.55, "recall": 0.32, "pr_auc": 0.22, "log_loss": 0.43},
+                            },
+                        ],
+                        "selected_metrics": {
+                            "train": {"f1": 0.82, "accuracy": 0.96, "precision": 0.90, "recall": 0.76, "pr_auc": 0.52, "log_loss": 0.18},
+                            "validation": {"f1": 0.78, "accuracy": 0.95, "precision": 0.88, "recall": 0.72, "pr_auc": 0.49, "log_loss": 0.20},
+                            "test": {"f1": 0.76, "accuracy": 0.94, "precision": 0.86, "recall": 0.70, "pr_auc": 0.46, "log_loss": 0.21},
+                        },
+                        "rows_used": 84,
+                    },
+                    {
+                        "status": "ok",
+                        "checkpoint_id": "ckpt_retry_worse",
+                        "run_dir": "artifacts/run_retry_worse",
+                        "selected_model_family": "logistic_regression",
+                        "best_validation_model_family": "bagged_tree_classifier",
+                        "split": {"strategy": "stratified_deterministic_modulo_70_15_15", "train_size": 84, "validation_size": 18, "test_size": 18},
+                        "task_profile": {"task_type": "fraud_detection", "task_family": "classification", "recommended_split_strategy": "stratified_deterministic_modulo_70_15_15", "minority_class_fraction": 0.08},
+                        "preprocessing": {
+                            "missing_data_strategy_requested": "fill_median",
+                            "missing_data_strategy_effective": "fill_median_train_only",
+                        },
+                        "normalization": {"method": "minmax"},
+                        "comparison": [
+                            {
+                                "model_family": "bagged_tree_classifier",
+                                "validation_metrics": {"f1": 0.78, "accuracy": 0.95, "precision": 0.88, "recall": 0.72, "pr_auc": 0.49, "log_loss": 0.20},
+                                "test_metrics": {"f1": 0.76, "accuracy": 0.94, "precision": 0.86, "recall": 0.70, "pr_auc": 0.46, "log_loss": 0.21},
+                            },
+                            {
+                                "model_family": "logistic_regression",
+                                "validation_metrics": {"f1": 0.44, "accuracy": 0.90, "precision": 0.60, "recall": 0.35, "pr_auc": 0.25, "log_loss": 0.41},
+                                "test_metrics": {"f1": 0.40, "accuracy": 0.89, "precision": 0.55, "recall": 0.32, "pr_auc": 0.22, "log_loss": 0.43},
+                            },
+                        ],
+                        "selected_metrics": {
+                            "train": {"f1": 0.50, "accuracy": 0.91, "precision": 0.63, "recall": 0.41, "pr_auc": 0.28, "log_loss": 0.39},
+                            "validation": {"f1": 0.44, "accuracy": 0.90, "precision": 0.60, "recall": 0.35, "pr_auc": 0.25, "log_loss": 0.41},
+                            "test": {"f1": 0.40, "accuracy": 0.89, "precision": 0.55, "recall": 0.32, "pr_auc": 0.22, "log_loss": 0.43},
+                        },
+                        "rows_used": 84,
+                    },
+                ],
+                "evaluate_training_iteration": [
+                    {
+                        "should_continue": True,
+                        "attempt": 1,
+                        "max_attempts": 3,
+                        "unmet_criteria": ["recall", "pr_auc"],
+                        "recommendations": ["Try alternate architecture and tune window/lag features for unmet metrics: recall, pr_auc"],
+                        "summary": "Acceptance criteria not met. Continuing optimization loop.",
+                    },
+                    {
+                        "should_continue": True,
+                        "attempt": 2,
+                        "max_attempts": 3,
+                        "unmet_criteria": ["recall", "pr_auc"],
+                        "recommendations": ["Try alternate architecture and tune window/lag features for unmet metrics: recall, pr_auc"],
+                        "summary": "Acceptance criteria not met. Continuing optimization loop.",
+                    },
+                    {
+                        "should_continue": False,
+                        "attempt": 3,
+                        "max_attempts": 3,
+                        "unmet_criteria": ["recall", "pr_auc"],
+                        "recommendations": ["Acceptance criteria not met and max attempts reached."],
+                        "summary": "Acceptance criteria not met and max attempts reached.",
+                    },
+            ],
+        }
+    )
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
+
+    exit_code = main(["run-agent-session", "--agent", "modeler"])
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "selected_model=bagged_tree_classifier" in output
+    assert "Checkpoint saved: ckpt_best_first" in output
+    assert "Artifacts: artifacts/run_best_first" in output
+    assert "ckpt_retry_worse" not in output
+
+
 def test_cli_run_agent_session_modeler_invalid_handoff_is_safe(
     monkeypatch, capsys, tmp_path: Path
 ) -> None:
@@ -2438,7 +2618,7 @@ def test_cli_run_agent_session_task_override_is_persisted(monkeypatch) -> None:
     assert calls[0]["context"]["task_type_override"] == "fraud_detection"
 
 
-def test_cli_modeler_handles_classification_dataset_without_crashing(
+def test_cli_modeler_trains_classification_dataset_without_crashing(
     monkeypatch, tmp_path: Path, capsys
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -2459,8 +2639,83 @@ def test_cli_modeler_handles_classification_dataset_without_crashing(
         ]
     )
     monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
 
     exit_code = main(["run-agent-session", "--agent", "modeler", "--max-turns", "5"])
     assert exit_code == 0
     output = capsys.readouterr().out
-    assert "regression-only" in output
+    assert "Task profile: type=binary_classification" in output
+    assert "Model build complete:" in output
+    assert "test_f1=" in output
+    assert "Selected hyperparameters:" in output
+
+
+def test_cli_modeler_handoff_trains_fraud_classifier(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    csv_path = tmp_path / "fraud.csv"
+    rows = ["amount_norm,device_risk,velocity_score,fraud_flag"]
+    for idx in range(120):
+        fraud = 1 if idx % 9 == 0 else 0
+        if fraud == 1:
+            amount = 0.90
+            device = 0.94
+            velocity = 0.91
+        else:
+            amount = 0.06 + ((idx % 7) * 0.08)
+            device = 0.08 + ((idx % 4) * 0.09)
+            velocity = 0.10 + ((idx % 5) * 0.07)
+        rows.append(f"{amount:.5f},{device:.5f},{velocity:.5f},{fraud}")
+    csv_path.write_text("\n".join(rows), encoding="utf-8")
+    handoff_path = tmp_path / "fraud_report.json"
+    handoff_path.write_text(
+        json.dumps(
+            {
+                "data_path": str(csv_path),
+                "data_mode": "steady_state",
+                "preprocessing": {
+                    "missing_data_plan": {
+                        "strategy": "fill_median",
+                    }
+                },
+                "task_profiles": [
+                    {
+                        "target_signal": "fraud_flag",
+                        "task_type": "fraud_detection",
+                    }
+                ],
+                "model_strategy_recommendations": {
+                    "target_recommendations": [
+                        {
+                            "target_signal": "fraud_flag",
+                            "probe_predictor_signals": [
+                                "amount_norm",
+                                "device_risk",
+                                "velocity_score",
+                            ],
+                            "recommended_model_family": "tree_ensemble_candidate",
+                            "priority_model_families": [
+                                "tree_ensemble_candidate",
+                                "linear_ridge",
+                            ],
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    inputs = iter([f"use handoff {handoff_path}", "", "", "", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
+
+    exit_code = main(["run-agent-session", "--agent", "modeler", "--max-turns", "6"])
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Handoff contract:" in output
+    assert "Task profile: type=fraud_detection" in output
+    assert "Model build complete:" in output
+    assert "test_recall=" in output
+    assert "test_pr_auc=" in output

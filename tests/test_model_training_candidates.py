@@ -1,11 +1,6 @@
 from pathlib import Path
 
-import pytest
-
 from corr2surrogate.orchestration.default_tools import build_default_registry
-from corr2surrogate.orchestration.tool_registry import ToolExecutionError
-
-
 def test_train_surrogate_candidates_tool_runs_split_safe_linear_and_tree(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -196,7 +191,7 @@ def test_train_surrogate_candidates_tool_supports_lagged_tree_ensemble(
     assert payload["selected_metrics"]["test"]["r2"] > 0.75
 
 
-def test_train_surrogate_candidates_rejects_classification_targets_with_clear_error(
+def test_train_surrogate_candidates_supports_binary_classification_targets(
     monkeypatch, tmp_path: Path
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -210,14 +205,63 @@ def test_train_surrogate_candidates_rejects_classification_targets_with_clear_er
     csv_path.write_text("\n".join(rows), encoding="utf-8")
 
     registry = build_default_registry()
-    with pytest.raises(ToolExecutionError, match="regression-only"):
-        registry.execute(
-            "train_surrogate_candidates",
-            {
-                "data_path": str(csv_path),
-                "target_column": "class_label",
-                "feature_columns": ["feature_a", "feature_b"],
-                "requested_model_family": "auto",
-                "run_id": "classification_reject",
-            },
-        )
+    result = registry.execute(
+        "train_surrogate_candidates",
+        {
+            "data_path": str(csv_path),
+            "target_column": "class_label",
+            "feature_columns": ["feature_a", "feature_b"],
+            "requested_model_family": "auto",
+            "run_id": "classification_run",
+        },
+    )
+    assert result.status == "ok"
+    payload = result.output
+    assert payload["task_profile"]["task_type"] == "binary_classification"
+    assert payload["split"]["strategy"] == "stratified_deterministic_modulo_70_15_15"
+    families = [row["model_family"] for row in payload["comparison"]]
+    assert "logistic_regression" in families
+    assert "bagged_tree_classifier" in families
+    assert payload["selected_model_family"] in {"logistic_regression", "bagged_tree_classifier"}
+    assert payload["selected_metrics"]["test"]["f1"] >= 0.70
+    assert "r2" not in payload["selected_metrics"]["test"]
+
+
+def test_train_surrogate_candidates_supports_fraud_detection_targets(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    csv_path = tmp_path / "fraud.csv"
+    rows = ["amount_norm,device_risk,velocity_score,fraud_flag"]
+    for idx in range(160):
+        fraud = 1 if idx % 10 == 0 else 0
+        if fraud == 1:
+            amount = 0.88 + ((idx % 3) * 0.03)
+            device = 0.92
+            velocity = 0.90
+        else:
+            amount = 0.05 + ((idx % 8) * 0.07)
+            device = 0.10 + ((idx % 5) * 0.08)
+            velocity = 0.08 + ((idx % 6) * 0.06)
+        rows.append(f"{amount:.5f},{device:.5f},{velocity:.5f},{fraud}")
+    csv_path.write_text("\n".join(rows), encoding="utf-8")
+
+    registry = build_default_registry()
+    result = registry.execute(
+        "train_surrogate_candidates",
+        {
+            "data_path": str(csv_path),
+            "target_column": "fraud_flag",
+            "feature_columns": ["amount_norm", "device_risk", "velocity_score"],
+            "requested_model_family": "auto",
+            "run_id": "fraud_run",
+        },
+    )
+    assert result.status == "ok"
+    payload = result.output
+    assert payload["task_profile"]["task_type"] == "fraud_detection"
+    assert payload["split"]["strategy"] == "stratified_deterministic_modulo_70_15_15"
+    assert payload["selected_model_family"] in {"logistic_regression", "bagged_tree_classifier"}
+    test_metrics = payload["selected_metrics"]["test"]
+    assert test_metrics["recall"] >= 0.70
+    assert test_metrics["pr_auc"] >= 0.35

@@ -15,7 +15,8 @@ from corr2surrogate.core.json_utils import write_json
 from corr2surrogate.persistence.artifact_store import ArtifactStore
 from .baselines import IncrementalLinearSurrogate
 from .checkpoints import ModelCheckpointStore
-from .evaluation import regression_metrics
+from .classifiers import BaggedTreeClassifierSurrogate, LogisticClassificationSurrogate
+from .evaluation import classification_metrics, regression_metrics
 from .normalization import MinMaxNormalizer
 from .splitters import DatasetSplit, build_train_validation_test_split
 
@@ -39,6 +40,8 @@ _MODEL_TIEBREAK = {
     "lagged_linear": 1,
     "bagged_tree_ensemble": 2,
     "lagged_tree_ensemble": 3,
+    "logistic_regression": 0,
+    "bagged_tree_classifier": 1,
 }
 
 
@@ -53,10 +56,19 @@ def normalize_candidate_model_family(requested_model_family: str) -> str | None:
         "ridge": "linear_ridge",
         "linear": "linear_ridge",
         "incremental_linear_surrogate": "linear_ridge",
+        "logistic_regression": "logistic_regression",
+        "logistic": "logistic_regression",
+        "logit": "logistic_regression",
+        "linear_classifier": "logistic_regression",
+        "classifier": "logistic_regression",
         "lagged_linear": "lagged_linear",
         "lagged": "lagged_linear",
         "temporal_linear": "lagged_linear",
         "arx": "lagged_linear",
+        "bagged_tree_classifier": "bagged_tree_classifier",
+        "tree_classifier": "bagged_tree_classifier",
+        "classifier_tree": "bagged_tree_classifier",
+        "fraud_tree": "bagged_tree_classifier",
         "lagged_tree_ensemble": "lagged_tree_ensemble",
         "lagged_tree": "lagged_tree_ensemble",
         "lag_window_tree": "lagged_tree_ensemble",
@@ -107,13 +119,35 @@ def train_surrogate_candidates(
         task_type=task_profile.task_type,
         stratify_labels=frame[target_column] if is_classification_task(task_profile.task_type) else None,
     )
-    if is_classification_task(task_profile.task_type):
+    requested = normalize_candidate_model_family(requested_model_family)
+    if requested is None:
         raise ValueError(
-            "Detected task type "
-            f"`{task_profile.task_type}` for target `{target_column}`. "
-            "Current Agent 2 trainers are regression-only. "
-            f"The split policy is still prepared as `{split.strategy}` for future classifiers, "
-            "but executable classification training is not implemented yet."
+            "Requested model is not implemented. "
+            "Supported: auto, linear_ridge/ridge/linear, logistic_regression/logistic/linear_classifier, "
+            "lagged_linear/lagged/temporal_linear/arx, "
+            "lagged_tree_ensemble/lagged_tree/lag_window_tree/temporal_tree, "
+            "bagged_tree_ensemble/tree/tree_ensemble/extra_trees/hist_gradient_boosting, "
+            "bagged_tree_classifier/tree_classifier/classifier_tree."
+        )
+    requested = _resolve_requested_for_task(
+        requested=requested,
+        task_type=task_profile.task_type,
+    )
+    if is_classification_task(task_profile.task_type):
+        return _train_classification_candidates(
+            frame=frame,
+            target_column=target_column,
+            feature_columns=feature_columns,
+            requested=requested,
+            normalize=normalize,
+            missing_data_strategy=missing_data_strategy,
+            fill_constant_value=fill_constant_value,
+            compare_against_baseline=compare_against_baseline,
+            split=split,
+            task_profile=task_profile,
+            run_id=run_id,
+            checkpoint_tag=checkpoint_tag,
+            data_references=data_references,
         )
     split_frames = {
         "train": frame.iloc[split.train_indices].reset_index(drop=True),
@@ -151,15 +185,6 @@ def train_surrogate_candidates(
         frames=prepared_frames,
         notes="Split-safe ridge baseline with train-only preprocessing.",
     )
-
-    requested = normalize_candidate_model_family(requested_model_family)
-    if requested is None:
-        raise ValueError(
-            "Requested model is not implemented. "
-            "Supported: auto, linear_ridge/ridge/linear, lagged_linear/lagged/temporal_linear/arx, "
-            "lagged_tree_ensemble/lagged_tree/lag_window_tree/temporal_tree, "
-            "bagged_tree_ensemble/tree/tree_ensemble/extra_trees/hist_gradient_boosting."
-        )
 
     candidates: list[CandidateMetrics] = [linear_candidate]
     lagged_model: LaggedLinearSurrogate | None = None
@@ -236,10 +261,11 @@ def train_surrogate_candidates(
             )
         )
 
-    best_by_validation = _select_best_candidate(candidates)
+    best_by_validation = _select_best_candidate(candidates, task_type=task_profile.task_type)
     selected_candidate = _resolve_selected_candidate(
         requested=requested,
         candidates=candidates,
+        task_type=task_profile.task_type,
     )
     selected_model_name = selected_candidate.model_family
     selected_model_obj: Any
@@ -327,6 +353,220 @@ def train_surrogate_candidates(
         "model_params_path": str(params_path),
         "selected_hyperparameters": selected_hyperparameters,
         "lag_horizon_samples": int(lagged_horizon) if lagged_horizon is not None else 0,
+        "rows_used": int(rows_used_by_model.get(selected_model_name, prepared_frames["train"].shape[0])),
+        "rows_used_by_model": rows_used_by_model,
+        "selected_metrics": {
+            "train": selected_candidate.train_metrics,
+            "validation": selected_candidate.validation_metrics,
+            "test": selected_candidate.test_metrics,
+        },
+    }
+
+
+def _resolve_requested_for_task(*, requested: str, task_type: str) -> str:
+    if not is_classification_task(task_type):
+        return requested
+    if requested in {"auto", "logistic_regression", "bagged_tree_classifier"}:
+        return requested
+    if requested in {"linear_ridge", "lagged_linear"}:
+        return "logistic_regression"
+    if requested in {"bagged_tree_ensemble", "lagged_tree_ensemble"}:
+        return "bagged_tree_classifier"
+    return requested
+
+
+def _train_classification_candidates(
+    *,
+    frame: pd.DataFrame,
+    target_column: str,
+    feature_columns: list[str],
+    requested: str,
+    normalize: bool,
+    missing_data_strategy: str,
+    fill_constant_value: float | None,
+    compare_against_baseline: bool,
+    split: DatasetSplit,
+    task_profile: Any,
+    run_id: str | None,
+    checkpoint_tag: str | None,
+    data_references: list[str] | None,
+) -> dict[str, Any]:
+    split_frames = {
+        "train": frame.iloc[split.train_indices].reset_index(drop=True),
+        "validation": frame.iloc[split.validation_indices].reset_index(drop=True),
+        "test": frame.iloc[split.test_indices].reset_index(drop=True),
+    }
+    prepared = _prepare_split_safe_frames_classification(
+        split_frames=split_frames,
+        feature_columns=feature_columns,
+        target_column=target_column,
+        missing_data_strategy=missing_data_strategy,
+        fill_constant_value=fill_constant_value,
+    )
+    prepared_frames = prepared["frames"]
+    preprocessing = prepared["preprocessing"]
+
+    normalizer: MinMaxNormalizer | None = None
+    if normalize:
+        normalizer = MinMaxNormalizer()
+        normalizer.fit(prepared_frames["train"], feature_columns=feature_columns)
+        prepared_frames = {
+            name: normalizer.transform_features(part)
+            for name, part in prepared_frames.items()
+        }
+
+    logistic_model = LogisticClassificationSurrogate(
+        feature_columns=feature_columns,
+        target_column=target_column,
+    )
+    logistic_rows_used = logistic_model.fit_dataframe(prepared_frames["train"])
+    rows_used_by_model: dict[str, int] = {"logistic_regression": int(logistic_rows_used)}
+    classifier_thresholds: dict[str, float] = {}
+    logistic_candidate = _classification_candidate_metrics_from_model(
+        model_family="logistic_regression",
+        model=logistic_model,
+        frames=prepared_frames,
+        task_type=str(task_profile.task_type),
+        notes=(
+            "One-vs-rest logistic classifier as the first split-safe classification baseline. "
+            f"Train rows used={logistic_rows_used}."
+        ),
+    )
+    classifier_thresholds["logistic_regression"] = float(
+        logistic_candidate.train_metrics.get("decision_threshold", 0.5)
+    )
+
+    candidates: list[CandidateMetrics] = [logistic_candidate]
+    tree_classifier: BaggedTreeClassifierSurrogate | None = None
+    if compare_against_baseline or requested == "bagged_tree_classifier":
+        tree_classifier = BaggedTreeClassifierSurrogate(
+            feature_columns=feature_columns,
+            target_column=target_column,
+        )
+        tree_rows_used = tree_classifier.fit_dataframe(prepared_frames["train"])
+        rows_used_by_model["bagged_tree_classifier"] = int(tree_rows_used)
+        candidates.append(
+            _classification_candidate_metrics_from_model(
+                model_family="bagged_tree_classifier",
+                model=tree_classifier,
+                frames=prepared_frames,
+                task_type=str(task_profile.task_type),
+                notes=(
+                    "Bagged depth-limited tree classifier as the first nonlinear classification baseline. "
+                    f"Train rows used={tree_rows_used}."
+                ),
+            )
+        )
+        classifier_thresholds["bagged_tree_classifier"] = float(
+            candidates[-1].train_metrics.get("decision_threshold", 0.5)
+        )
+
+    best_by_validation = _select_best_candidate(candidates, task_type=str(task_profile.task_type))
+    selected_candidate = _resolve_selected_candidate(
+        requested=requested,
+        candidates=candidates,
+        task_type=str(task_profile.task_type),
+    )
+    selected_model_name = selected_candidate.model_family
+    if selected_model_name == "logistic_regression":
+        selected_model_obj: Any = logistic_model
+    elif selected_model_name == "bagged_tree_classifier" and tree_classifier is not None:
+        selected_model_obj = tree_classifier
+    else:
+        raise RuntimeError("Selected classifier model object is unavailable.")
+
+    artifact_store = ArtifactStore()
+    run_dir = artifact_store.create_run_dir(run_id=run_id)
+    normalizer_path: str | None = None
+    if normalizer is not None:
+        normalizer_path = str(artifact_store.save_normalizer(run_dir=run_dir, normalizer=normalizer))
+
+    model_state_path = _save_selected_model_state(
+        model=selected_model_obj,
+        run_dir=run_dir,
+        model_name=selected_model_name,
+    )
+    selected_hyperparameters = {
+        "requested_model_family": requested,
+        "task_type": str(task_profile.task_type),
+    }
+    if selected_model_name == "logistic_regression":
+        selected_hyperparameters.update(
+            {
+                "learning_rate": float(logistic_model.learning_rate),
+                "epochs": int(logistic_model.epochs),
+                "l2": float(logistic_model.l2),
+                "training_rows_used": int(logistic_rows_used),
+                "class_count": int(len(logistic_model.class_labels)),
+                "decision_threshold": float(classifier_thresholds.get("logistic_regression", 0.5)),
+            }
+        )
+    elif tree_classifier is not None:
+        selected_hyperparameters.update(
+            {
+                "n_estimators": int(tree_classifier.n_estimators),
+                "max_depth": int(tree_classifier.max_depth),
+                "min_leaf": int(tree_classifier.min_leaf),
+                "training_rows_used": int(rows_used_by_model.get("bagged_tree_classifier", 0)),
+                "class_count": int(len(tree_classifier.class_labels)),
+                "decision_threshold": float(classifier_thresholds.get("bagged_tree_classifier", 0.5)),
+            }
+        )
+
+    params_path = artifact_store.save_model_params(
+        run_dir=run_dir,
+        model_name=selected_model_name,
+        best_params=selected_hyperparameters,
+        metrics=selected_candidate.test_metrics,
+        feature_columns=feature_columns,
+        target_column=target_column,
+        split_strategy=split.strategy,
+        normalizer_path=normalizer_path,
+        extra={
+            "requested_model_family": requested,
+            "selected_model_family": selected_candidate.model_family,
+            "best_validation_model_family": best_by_validation.model_family,
+            "data_mode": "time_series" if split.data_mode == "time_series" else "steady_state",
+            "split": split.to_dict(),
+            "preprocessing": preprocessing,
+            "comparison": [item.to_dict() for item in candidates],
+            "task_profile": task_profile.to_dict(),
+            "decision_thresholds": classifier_thresholds,
+        },
+    )
+    checkpoint_store = ModelCheckpointStore()
+    checkpoint = checkpoint_store.create_checkpoint(
+        model_name=selected_model_name,
+        run_dir=run_dir,
+        model_state_path=model_state_path,
+        target_column=target_column,
+        feature_columns=feature_columns,
+        metrics=selected_candidate.test_metrics,
+        data_references=list(data_references or []),
+        notes=checkpoint_tag or "",
+        tags=[checkpoint_tag] if checkpoint_tag else [],
+    )
+    return {
+        "status": "ok",
+        "data_mode": "time_series" if split.data_mode == "time_series" else "steady_state",
+        "task_profile": task_profile.to_dict(),
+        "requested_model_family": requested,
+        "selected_model_family": selected_candidate.model_family,
+        "best_validation_model_family": best_by_validation.model_family,
+        "comparison": [item.to_dict() for item in candidates],
+        "split": split.to_dict(),
+        "preprocessing": preprocessing,
+        "normalization": {
+            "enabled": bool(normalizer is not None),
+            "method": "minmax" if normalizer is not None else "none",
+            "normalizer_path": normalizer_path,
+        },
+        "checkpoint_id": checkpoint.checkpoint_id,
+        "run_dir": str(run_dir),
+        "model_state_path": str(model_state_path),
+        "model_params_path": str(params_path),
+        "selected_hyperparameters": selected_hyperparameters,
+        "lag_horizon_samples": 0,
         "rows_used": int(rows_used_by_model.get(selected_model_name, prepared_frames["train"].shape[0])),
         "rows_used_by_model": rows_used_by_model,
         "selected_metrics": {
@@ -650,6 +890,61 @@ def _candidate_metrics_from_model(
     )
 
 
+def _classification_candidate_metrics_from_model(
+    *,
+    model_family: str,
+    model: Any,
+    frames: dict[str, pd.DataFrame],
+    task_type: str,
+    notes: str,
+) -> CandidateMetrics:
+    class_labels = [str(item) for item in getattr(model, "class_labels", [])]
+    target_column = str(getattr(model, "target_column", "")).strip()
+    if not class_labels or not target_column:
+        raise RuntimeError("Classification candidate is missing class labels or target column.")
+    positive_label = _minority_label_token(
+        frame=frames["train"],
+        target_column=target_column,
+    )
+    decision_threshold = _select_binary_decision_threshold(
+        model=model,
+        validation_frame=frames["validation"],
+        class_labels=class_labels,
+        positive_label=positive_label,
+        task_type=task_type,
+    )
+    train_metrics = _classification_metrics_for_frame(
+        model=model,
+        frame=frames["train"],
+        class_labels=class_labels,
+        positive_label=positive_label,
+        decision_threshold=decision_threshold,
+    )
+    validation_metrics = _classification_metrics_for_frame(
+        model=model,
+        frame=frames["validation"],
+        class_labels=class_labels,
+        positive_label=positive_label,
+        decision_threshold=decision_threshold,
+    )
+    test_metrics = _classification_metrics_for_frame(
+        model=model,
+        frame=frames["test"],
+        class_labels=class_labels,
+        positive_label=positive_label,
+        decision_threshold=decision_threshold,
+    )
+    for bundle in (train_metrics, validation_metrics, test_metrics):
+        bundle["decision_threshold"] = float(decision_threshold)
+    return CandidateMetrics(
+        model_family=model_family,
+        train_metrics=train_metrics,
+        validation_metrics=validation_metrics,
+        test_metrics=test_metrics,
+        notes=notes,
+    )
+
+
 def _candidate_metrics_with_context(
     *,
     model_family: str,
@@ -675,11 +970,88 @@ def _candidate_metrics_with_context(
     )
 
 
-def _select_best_candidate(candidates: list[CandidateMetrics]) -> CandidateMetrics:
+def _classification_metrics_for_frame(
+    *,
+    model: Any,
+    frame: pd.DataFrame,
+    class_labels: list[str],
+    positive_label: str | None,
+    decision_threshold: float,
+) -> dict[str, float]:
+    y_true = [str(item) for item in frame[str(getattr(model, "target_column", ""))].tolist()]
+    probabilities = model.predict_proba_dataframe(frame)
+    metrics = classification_metrics(
+        y_true=y_true,
+        probabilities=probabilities,
+        class_labels=class_labels,
+        positive_label=positive_label,
+        decision_threshold=decision_threshold if len(class_labels) == 2 else None,
+    ).to_dict()
+    return {str(key): float(value) for key, value in metrics.items()}
+
+
+def _minority_label_token(*, frame: pd.DataFrame, target_column: str) -> str | None:
+    if target_column not in frame.columns:
+        return None
+    counts = frame[target_column].astype(str).value_counts()
+    if counts.empty:
+        return None
+    return str(counts.sort_values(kind="stable").index[0])
+
+
+def _select_binary_decision_threshold(
+    *,
+    model: Any,
+    validation_frame: pd.DataFrame,
+    class_labels: list[str],
+    positive_label: str | None,
+    task_type: str,
+) -> float:
+    if len(class_labels) != 2 or not positive_label:
+        return 0.5
+    thresholds = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+    best_threshold = 0.5
+    best_rank: tuple[float, ...] | None = None
+    y_true = [str(item) for item in validation_frame[str(getattr(model, "target_column", ""))].tolist()]
+    probabilities = model.predict_proba_dataframe(validation_frame)
+    for threshold in thresholds:
+        metrics = classification_metrics(
+            y_true=y_true,
+            probabilities=probabilities,
+            class_labels=class_labels,
+            positive_label=positive_label,
+            decision_threshold=threshold,
+        ).to_dict()
+        if task_type in {"fraud_detection", "anomaly_detection"}:
+            rank = (
+                -float(metrics.get("f1", 0.0)),
+                -float(metrics.get("recall", 0.0)),
+                -float(metrics.get("precision", 0.0)),
+                float(metrics.get("log_loss", float("inf"))),
+            )
+        else:
+            rank = (
+                -float(metrics.get("f1", 0.0)),
+                -float(metrics.get("accuracy", 0.0)),
+                -float(metrics.get("precision", 0.0)),
+                -float(metrics.get("recall", 0.0)),
+                float(metrics.get("log_loss", float("inf"))),
+            )
+        if best_rank is None or rank < best_rank:
+            best_rank = rank
+            best_threshold = float(threshold)
+    return best_threshold
+
+
+def _select_best_candidate(
+    candidates: list[CandidateMetrics],
+    *,
+    task_type: str,
+) -> CandidateMetrics:
     ranked = sorted(
         candidates,
         key=lambda item: (
-            float(item.validation_metrics.get("mae", float("inf"))),
+            _candidate_validation_rank(item=item, task_type=task_type),
             _MODEL_TIEBREAK.get(item.model_family, 9),
         ),
     )
@@ -690,13 +1062,38 @@ def _resolve_selected_candidate(
     *,
     requested: str,
     candidates: list[CandidateMetrics],
+    task_type: str,
 ) -> CandidateMetrics:
     if requested == "auto":
-        return _select_best_candidate(candidates)
+        return _select_best_candidate(candidates, task_type=task_type)
     for item in candidates:
         if item.model_family == requested:
             return item
-    return _select_best_candidate(candidates)
+    return _select_best_candidate(candidates, task_type=task_type)
+
+
+def _candidate_validation_rank(*, item: CandidateMetrics, task_type: str) -> tuple[float, ...]:
+    metrics = item.validation_metrics
+    if is_classification_task(task_type):
+        if task_type in {"fraud_detection", "anomaly_detection"}:
+            return (
+                -float(metrics.get("pr_auc", 0.0)),
+                -float(metrics.get("recall", 0.0)),
+                -float(metrics.get("f1", 0.0)),
+                -float(metrics.get("accuracy", 0.0)),
+                float(metrics.get("log_loss", float("inf"))),
+            )
+        return (
+            -float(metrics.get("f1", 0.0)),
+            -float(metrics.get("accuracy", 0.0)),
+            -float(metrics.get("precision", 0.0)),
+            -float(metrics.get("recall", 0.0)),
+            float(metrics.get("log_loss", float("inf"))),
+        )
+    return (
+        float(metrics.get("mae", float("inf"))),
+        float(metrics.get("rmse", float("inf"))),
+    )
 
 
 def _save_selected_model_state(*, model: Any, run_dir: Path, model_name: str) -> Path:
@@ -829,6 +1226,86 @@ def _prepare_split_safe_frames(
         raise ValueError(
             "Split-safe preprocessing left too few rows in one or more splits. "
             "Reduce missingness, change strategy, or use more data."
+        )
+
+    return {
+        "frames": coerced,
+        "preprocessing": {
+            "missing_data_strategy_requested": strategy,
+            "missing_data_strategy_effective": effective_strategy,
+            "fill_values": fill_values,
+            "rows_after": {name: int(part.shape[0]) for name, part in coerced.items()},
+        },
+    }
+
+
+def _prepare_split_safe_frames_classification(
+    *,
+    split_frames: dict[str, pd.DataFrame],
+    feature_columns: list[str],
+    target_column: str,
+    missing_data_strategy: str,
+    fill_constant_value: float | None,
+) -> dict[str, Any]:
+    coerced: dict[str, pd.DataFrame] = {}
+    for name, frame in split_frames.items():
+        subset = frame[feature_columns + [target_column]].copy()
+        for col in feature_columns:
+            subset[col] = pd.to_numeric(subset[col], errors="coerce")
+        target = subset[target_column]
+        target = target.where(target.notna(), None)
+        target = target.map(lambda value: None if value is None else str(value).strip())
+        subset[target_column] = target
+        subset = subset[(subset[target_column].notna()) & (subset[target_column] != "")].reset_index(drop=True)
+        coerced[name] = subset
+
+    strategy = missing_data_strategy.strip().lower()
+    effective_strategy = strategy
+    fill_values: dict[str, float] = {}
+    if strategy in {"fill_median", "median"}:
+        train = coerced["train"]
+        for col in feature_columns:
+            median = float(train[col].median()) if train[col].notna().any() else 0.0
+            fill_values[col] = median
+        for name in list(coerced.keys()):
+            for col, value in fill_values.items():
+                coerced[name][col] = coerced[name][col].fillna(value)
+        effective_strategy = "fill_median_train_only"
+    elif strategy in {"fill_constant", "constant"}:
+        value = 0.0 if fill_constant_value is None else float(fill_constant_value)
+        fill_values = {col: value for col in feature_columns}
+        for name in list(coerced.keys()):
+            for col, fill_value in fill_values.items():
+                coerced[name][col] = coerced[name][col].fillna(fill_value)
+        effective_strategy = "fill_constant_train_policy"
+    else:
+        if strategy == "keep":
+            effective_strategy = "keep_requested_drop_remaining_for_model"
+        for name in list(coerced.keys()):
+            coerced[name] = coerced[name].dropna(subset=feature_columns).reset_index(drop=True)
+
+    for name in list(coerced.keys()):
+        if strategy in {"fill_median", "median", "fill_constant", "constant"}:
+            coerced[name] = coerced[name].dropna(subset=feature_columns).reset_index(drop=True)
+
+    if coerced["train"].shape[0] < 6 or coerced["validation"].shape[0] < 2 or coerced["test"].shape[0] < 2:
+        raise ValueError(
+            "Split-safe preprocessing left too few rows in one or more splits. "
+            "Reduce missingness, change strategy, or use more data."
+        )
+
+    train_labels = {str(item) for item in coerced["train"][target_column]}
+    unseen = set()
+    for part_name in ("validation", "test"):
+        unseen |= {
+            str(item)
+            for item in coerced[part_name][target_column]
+            if str(item) not in train_labels
+        }
+    if unseen:
+        raise ValueError(
+            "Split-safe classification preprocessing produced labels in validation/test "
+            "that were not present in the training split. Collect more examples per class."
         )
 
     return {
