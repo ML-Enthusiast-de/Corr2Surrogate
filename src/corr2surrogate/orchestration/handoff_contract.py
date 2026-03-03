@@ -48,6 +48,8 @@ class AgenticLoopPolicy:
     min_relative_improvement: float = 0.02
     allow_architecture_switch: bool = True
     allow_feature_set_expansion: bool = True
+    allow_lag_horizon_expansion: bool = True
+    allow_threshold_policy_tuning: bool = True
     suggest_more_data_when_stalled: bool = True
 
 

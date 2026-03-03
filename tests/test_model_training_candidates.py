@@ -225,6 +225,7 @@ def test_train_surrogate_candidates_supports_binary_classification_targets(
     assert payload["selected_model_family"] in {"logistic_regression", "bagged_tree_classifier"}
     assert payload["selected_metrics"]["test"]["f1"] >= 0.70
     assert "r2" not in payload["selected_metrics"]["test"]
+    assert payload["selected_hyperparameters"]["threshold_policy"] == "auto"
 
 
 def test_train_surrogate_candidates_supports_fraud_detection_targets(
@@ -265,3 +266,35 @@ def test_train_surrogate_candidates_supports_fraud_detection_targets(
     test_metrics = payload["selected_metrics"]["test"]
     assert test_metrics["recall"] >= 0.70
     assert test_metrics["pr_auc"] >= 0.35
+
+
+def test_train_surrogate_candidates_honors_binary_threshold_policy(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    csv_path = tmp_path / "classification_threshold.csv"
+    rows = ["feature_a,feature_b,class_label"]
+    for idx in range(100):
+        a = idx / 99.0
+        b = 1 if idx % 4 == 0 else 0
+        label = 1 if (a > 0.62 or b == 1) else 0
+        rows.append(f"{a:.5f},{b},{label}")
+    csv_path.write_text("\n".join(rows), encoding="utf-8")
+
+    registry = build_default_registry()
+    result = registry.execute(
+        "train_surrogate_candidates",
+        {
+            "data_path": str(csv_path),
+            "target_column": "class_label",
+            "feature_columns": ["feature_a", "feature_b"],
+            "requested_model_family": "logistic_regression",
+            "threshold_policy": "favor_recall",
+            "run_id": "classification_threshold_run",
+        },
+    )
+    assert result.status == "ok"
+    payload = result.output
+    assert payload["selected_model_family"] == "logistic_regression"
+    assert payload["selected_hyperparameters"]["threshold_policy"] == "favor_recall"
+    assert 0.0 < payload["selected_hyperparameters"]["decision_threshold"] < 1.0

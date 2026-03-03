@@ -22,6 +22,11 @@ Corr2Surrogate is a local-first framework for converting real-world sensor data 
 - Split-safe Agent 2 training (train-only preprocessing, time-ordered splits for time series, stratified steady-state splits for classification labels)
 - Executable classifier baselines: `logistic_regression` and `bagged_tree_classifier`
 - Validation-tuned decision thresholds for binary classification and fraud screening
+- Adaptive bounded optimization in Agent 2:
+  - safe model-family switches
+  - feature-set expansion
+  - lag-window expansion
+  - threshold-policy retuning for binary classifiers
 - First nonlinear modeling baseline: local bagged tree ensemble / tree classifier
 - Candidate comparison with LLM-assisted model interpretation in the CLI
 - Local runtime by default; optional API mode via explicit opt-in
@@ -194,6 +199,13 @@ Current classification note:
 - Default acceptance checks are task-aware:
   - balanced classification defaults to `f1` + `accuracy`
   - fraud / anomaly screening defaults to `recall` + `pr_auc`
+- Binary classifier thresholds are validation-tuned by default, and users can override the next run with:
+  - `threshold favor_recall`
+  - `threshold favor_precision`
+  - `threshold favor_f1`
+  - `threshold favor_pr_auc`
+  - `threshold 0.35`
+  - `threshold auto`
 
 Recommended model families to implement next:
 - steady-state / tabular: add `ElasticNet`
@@ -235,8 +247,9 @@ This is the planned implementation order to maximize practical value while keepi
    - Optuna only after the deterministic training pipeline is correct
 
 Current state:
-- steps 1-5 are now implemented in the first modeler path
-- the next highest-value gap is extending the handoff into full acceptance-loop execution and adding stronger temporal/nonlinear families beyond the current baselines
+- steps 1-7 are now implemented in the first production path
+- the current modeler loop already performs bounded retries across model family, feature set, lag horizon, and binary threshold policy when the loop policy allows it
+- the next highest-value gaps are stronger boosted-tree families, lagged classifier families, post-failure experiment design, inference workflows, and uncertainty reporting
 
 ## Modeling Entry Modes
 Two user entry paths are part of the intended product behavior:
@@ -261,8 +274,15 @@ Example direct modeler request:
 
 Current implementation note:
 - the direct modeler session currently executes `auto`, `linear_ridge` / `ridge` / `linear`, `logistic_regression` / `logistic` / `logit` / `linear_classifier`, `bagged_tree_classifier` / `tree_classifier`, `lagged_linear` / `lagged` / `temporal_linear` / `arx`, `lagged_tree_ensemble` / `lagged_tree` / `lag_window_tree` / `temporal_tree`, and `bagged_tree_ensemble` / `tree`
-- the modeler CLI now runs a split-safe comparison between the linear baseline and the available temporal/nonlinear comparators, performs a bounded acceptance check, optionally retries with the next safe family when policy allows it, and uses the LLM to interpret the final measured result
+- the modeler CLI now runs a split-safe comparison between the linear baseline and the available temporal/nonlinear comparators, performs a bounded acceptance check, and can retry with the next safe model family, expanded feature set, wider lag window, or retuned binary threshold when policy allows it
 - if the selected target looks like classification or fraud detection, the modeler reports that explicitly, applies the correct split policy, trains the local classifier candidates, and evaluates them with classification-aware metrics
+- before a modeler run, users can steer binary decision policy with:
+  - `threshold favor_recall`
+  - `threshold favor_precision`
+  - `threshold favor_f1`
+  - `threshold favor_pr_auc`
+  - `threshold 0.35`
+  - `threshold auto`
 
 ## User Override Rules For Agent 2
 Even when a valid Agent 1 handoff exists, the user must remain in control of the modeling scope.

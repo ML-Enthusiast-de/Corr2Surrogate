@@ -228,6 +228,8 @@ def build_default_registry() -> ToolRegistry:
                 "fill_constant_value": {"type": "number"},
                 "compare_against_baseline": {"type": "boolean"},
                 "lag_horizon_samples": {"type": "integer"},
+                "threshold_policy": {"type": "string"},
+                "decision_threshold": {"type": "number"},
                 "task_type_hint": {"type": "string"},
             },
             "required": ["data_path", "target_column", "feature_columns", "requested_model_family"],
@@ -751,6 +753,8 @@ def _tool_train_surrogate_candidates(
     fill_constant_value: float | None = None,
     compare_against_baseline: bool = True,
     lag_horizon_samples: int | None = None,
+    threshold_policy: str | None = None,
+    decision_threshold: float | None = None,
     task_type_hint: str | None = None,
 ) -> dict[str, Any]:
     frame = _load_frame(data_path=data_path, sheet_name=sheet_name)
@@ -765,6 +769,8 @@ def _tool_train_surrogate_candidates(
         fill_constant_value=fill_constant_value,
         compare_against_baseline=compare_against_baseline,
         lag_horizon_samples=lag_horizon_samples,
+        threshold_policy=threshold_policy,
+        decision_threshold=decision_threshold,
         task_type=task_type_hint,
         run_id=run_id,
         checkpoint_tag=checkpoint_tag,

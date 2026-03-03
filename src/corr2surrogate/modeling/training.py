@@ -96,6 +96,8 @@ def train_surrogate_candidates(
     fill_constant_value: float | None = None,
     compare_against_baseline: bool = True,
     lag_horizon_samples: int | None = None,
+    threshold_policy: str | None = None,
+    decision_threshold: float | None = None,
     task_type: str | None = None,
     run_id: str | None = None,
     checkpoint_tag: str | None = None,
@@ -145,6 +147,8 @@ def train_surrogate_candidates(
             compare_against_baseline=compare_against_baseline,
             split=split,
             task_profile=task_profile,
+            threshold_policy=threshold_policy,
+            decision_threshold=decision_threshold,
             run_id=run_id,
             checkpoint_tag=checkpoint_tag,
             data_references=data_references,
@@ -352,6 +356,7 @@ def train_surrogate_candidates(
         "model_state_path": str(model_state_path),
         "model_params_path": str(params_path),
         "selected_hyperparameters": selected_hyperparameters,
+        "feature_columns": list(feature_columns),
         "lag_horizon_samples": int(lagged_horizon) if lagged_horizon is not None else 0,
         "rows_used": int(rows_used_by_model.get(selected_model_name, prepared_frames["train"].shape[0])),
         "rows_used_by_model": rows_used_by_model,
@@ -387,6 +392,8 @@ def _train_classification_candidates(
     compare_against_baseline: bool,
     split: DatasetSplit,
     task_profile: Any,
+    threshold_policy: str | None,
+    decision_threshold: float | None,
     run_id: str | None,
     checkpoint_tag: str | None,
     data_references: list[str] | None,
@@ -427,6 +434,8 @@ def _train_classification_candidates(
         model=logistic_model,
         frames=prepared_frames,
         task_type=str(task_profile.task_type),
+        threshold_policy=threshold_policy,
+        decision_threshold=decision_threshold,
         notes=(
             "One-vs-rest logistic classifier as the first split-safe classification baseline. "
             f"Train rows used={logistic_rows_used}."
@@ -451,6 +460,8 @@ def _train_classification_candidates(
                 model=tree_classifier,
                 frames=prepared_frames,
                 task_type=str(task_profile.task_type),
+                threshold_policy=threshold_policy,
+                decision_threshold=decision_threshold,
                 notes=(
                     "Bagged depth-limited tree classifier as the first nonlinear classification baseline. "
                     f"Train rows used={tree_rows_used}."
@@ -489,6 +500,7 @@ def _train_classification_candidates(
     selected_hyperparameters = {
         "requested_model_family": requested,
         "task_type": str(task_profile.task_type),
+        "threshold_policy": str(threshold_policy or "").strip() or "auto",
     }
     if selected_model_name == "logistic_regression":
         selected_hyperparameters.update(
@@ -532,6 +544,7 @@ def _train_classification_candidates(
             "comparison": [item.to_dict() for item in candidates],
             "task_profile": task_profile.to_dict(),
             "decision_thresholds": classifier_thresholds,
+            "threshold_policy": str(threshold_policy or "").strip() or "auto",
         },
     )
     checkpoint_store = ModelCheckpointStore()
@@ -566,6 +579,7 @@ def _train_classification_candidates(
         "model_state_path": str(model_state_path),
         "model_params_path": str(params_path),
         "selected_hyperparameters": selected_hyperparameters,
+        "feature_columns": list(feature_columns),
         "lag_horizon_samples": 0,
         "rows_used": int(rows_used_by_model.get(selected_model_name, prepared_frames["train"].shape[0])),
         "rows_used_by_model": rows_used_by_model,
@@ -896,6 +910,8 @@ def _classification_candidate_metrics_from_model(
     model: Any,
     frames: dict[str, pd.DataFrame],
     task_type: str,
+    threshold_policy: str | None,
+    decision_threshold: float | None,
     notes: str,
 ) -> CandidateMetrics:
     class_labels = [str(item) for item in getattr(model, "class_labels", [])]
@@ -912,6 +928,8 @@ def _classification_candidate_metrics_from_model(
         class_labels=class_labels,
         positive_label=positive_label,
         task_type=task_type,
+        threshold_policy=threshold_policy,
+        explicit_threshold=decision_threshold,
     )
     train_metrics = _classification_metrics_for_frame(
         model=model,
@@ -1006,12 +1024,17 @@ def _select_binary_decision_threshold(
     class_labels: list[str],
     positive_label: str | None,
     task_type: str,
+    threshold_policy: str | None,
+    explicit_threshold: float | None,
 ) -> float:
     if len(class_labels) != 2 or not positive_label:
         return 0.5
+    if explicit_threshold is not None:
+        return float(max(0.01, min(0.99, explicit_threshold)))
     thresholds = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
     best_threshold = 0.5
     best_rank: tuple[float, ...] | None = None
+    normalized_policy = str(threshold_policy or "").strip().lower() or "auto"
     y_true = [str(item) for item in validation_frame[str(getattr(model, "target_column", ""))].tolist()]
     probabilities = model.predict_proba_dataframe(validation_frame)
     for threshold in thresholds:
@@ -1022,10 +1045,43 @@ def _select_binary_decision_threshold(
             positive_label=positive_label,
             decision_threshold=threshold,
         ).to_dict()
-        if task_type in {"fraud_detection", "anomaly_detection"}:
+        if normalized_policy == "favor_recall":
+            rank = (
+                -float(metrics.get("recall", 0.0)),
+                -float(metrics.get("f1", 0.0)),
+                -float(metrics.get("pr_auc", 0.0)),
+                -float(metrics.get("precision", 0.0)),
+                float(metrics.get("log_loss", float("inf"))),
+            )
+        elif normalized_policy == "favor_precision":
+            rank = (
+                -float(metrics.get("precision", 0.0)),
+                -float(metrics.get("f1", 0.0)),
+                -float(metrics.get("recall", 0.0)),
+                -float(metrics.get("pr_auc", 0.0)),
+                float(metrics.get("log_loss", float("inf"))),
+            )
+        elif normalized_policy == "favor_pr_auc":
+            rank = (
+                -float(metrics.get("pr_auc", 0.0)),
+                -float(metrics.get("recall", 0.0)),
+                -float(metrics.get("f1", 0.0)),
+                -float(metrics.get("precision", 0.0)),
+                float(metrics.get("log_loss", float("inf"))),
+            )
+        elif normalized_policy == "favor_f1":
             rank = (
                 -float(metrics.get("f1", 0.0)),
                 -float(metrics.get("recall", 0.0)),
+                -float(metrics.get("precision", 0.0)),
+                -float(metrics.get("pr_auc", 0.0)),
+                float(metrics.get("log_loss", float("inf"))),
+            )
+        elif task_type in {"fraud_detection", "anomaly_detection"}:
+            rank = (
+                -float(metrics.get("recall", 0.0)),
+                -float(metrics.get("pr_auc", 0.0)),
+                -float(metrics.get("f1", 0.0)),
                 -float(metrics.get("precision", 0.0)),
                 float(metrics.get("log_loss", float("inf"))),
             )

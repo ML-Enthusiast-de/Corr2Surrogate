@@ -412,6 +412,13 @@ def _parse_task_override_command(user_message: str) -> str | None:
     return stripped[5:].strip()
 
 
+def _parse_threshold_override_command(user_message: str) -> str | None:
+    stripped = user_message.strip()
+    if not stripped.lower().startswith("threshold "):
+        return None
+    return stripped[10:].strip()
+
+
 def _drop_none_fields(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if value is not None}
 
@@ -447,6 +454,10 @@ def _run_agent_session(
         print(
             "agent> Task override: use `task regression`, `task binary_classification`, "
             "`task fraud_detection`, or `task auto` to clear it."
+        )
+        print(
+            "agent> Threshold override: use `threshold favor_recall`, `threshold favor_precision`, "
+            "`threshold favor_f1`, `threshold favor_pr_auc`, `threshold 0.35`, or `threshold auto`."
         )
         print(
             "agent> Hypothesis syntax: "
@@ -494,7 +505,8 @@ def _run_agent_session(
         )
         print(
             "agent> During training I will print staged progress, compare candidates on "
-            "validation/test, and then give an LLM interpretation grounded in those metrics."
+            "validation/test, adapt model family/features/lags/thresholds when safe, "
+            "and then give an LLM interpretation grounded in those metrics."
         )
         print(
             "agent> Handoff syntax: "
@@ -554,6 +566,10 @@ def _run_agent_session(
                     "`task fraud_detection`, or `task auto`."
                 )
                 print(
+                    "agent> Threshold override: `threshold favor_recall`, `threshold favor_precision`, "
+                    "`threshold favor_f1`, `threshold favor_pr_auc`, numeric `threshold 0.35`, or `threshold auto`."
+                )
+                print(
                     "agent> You can also add hypotheses: "
                     "`hypothesis corr target:pred1,pred2` or "
                     "`hypothesis feature target:signal->rate_change`."
@@ -600,6 +616,10 @@ def _run_agent_session(
                     "`use handoff path\\\\to\\\\structured_report.json`."
                 )
                 print(
+                    "agent> Adaptive retry loop: when quality is weak, I can switch model family, "
+                    "expand the feature set, widen lag windows, and retune binary thresholds when safe."
+                )
+                print(
                     "agent> Task override: `task regression`, `task binary_classification`, "
                     "`task fraud_detection`, or `task auto`."
                 )
@@ -638,6 +658,36 @@ def _run_agent_session(
             print(
                 f"agent> Task override set to `{normalized_task}`. "
                 "I will use that for the next analysis/modeling step."
+            )
+            continue
+        threshold_override_command = _parse_threshold_override_command(user_message)
+        if threshold_override_command is not None:
+            if agent != "modeler":
+                print(
+                    "agent> Threshold overrides apply to Agent 2 modeling. "
+                    "Start or continue a modeler session to use them."
+                )
+                continue
+            threshold_override = _normalize_threshold_override(threshold_override_command)
+            if threshold_override is None:
+                print(
+                    "agent> Unsupported threshold override. Use `threshold auto`, "
+                    "`threshold favor_recall`, `threshold favor_precision`, `threshold favor_f1`, "
+                    "`threshold favor_pr_auc`, or `threshold 0.35`."
+                )
+                continue
+            if threshold_override == "auto":
+                session_context.pop("threshold_policy_override", None)
+                print(
+                    "agent> Threshold override cleared. "
+                    "I will use validation-tuned automatic threshold selection again."
+                )
+                continue
+            session_context["threshold_policy_override"] = threshold_override
+            print(
+                "agent> Threshold override set to "
+                f"`{_format_threshold_override(threshold_override)}`. "
+                "I will use that for the next modeling step."
             )
             continue
 
@@ -1687,8 +1737,11 @@ def _parse_modeler_build_request(user_message: str) -> dict[str, Any] | None:
         "acceptance_criteria": {},
         "loop_policy": {
             "enabled": True,
-            "max_attempts": 2,
+            "max_attempts": 3,
             "allow_architecture_switch": True,
+            "allow_feature_set_expansion": True,
+            "allow_lag_horizon_expansion": True,
+            "allow_threshold_policy_tuning": True,
         },
         "user_locked_model_family": normalized_model not in {None, "auto"},
         "source": "direct",
@@ -1779,6 +1832,7 @@ def _execute_modeler_build_request(
             "response": response,
             "event": {"status": "respond", "message": response, "error": "features_unresolved"},
         }
+    current_features = list(features)
 
     requested_model = str(build_request.get("requested_model_family", "")).strip() or "linear_ridge"
     resolved_model = _normalize_modeler_model_family(requested_model)
@@ -1805,11 +1859,18 @@ def _execute_modeler_build_request(
     fill_constant_value = build_request.get("fill_constant_value")
     compare_against_baseline = bool(build_request.get("compare_against_baseline", True))
     lag_horizon_samples = build_request.get("lag_horizon_samples")
+    current_lag_horizon = _coerce_optional_int(lag_horizon_samples)
     task_type_hint = str(
         build_request.get("task_type_hint")
         or session_context.get("task_type_override")
         or ""
     ).strip() or None
+    threshold_override = build_request.get("threshold_policy")
+    if threshold_override in {None, ""}:
+        threshold_override = session_context.get("threshold_policy_override")
+    threshold_policy, explicit_decision_threshold = _resolve_threshold_training_controls(
+        threshold_override
+    )
     timestamp_column = str(
         build_request.get("timestamp_column")
         or dataset.get("timestamp_column_hint")
@@ -1826,7 +1887,7 @@ def _execute_modeler_build_request(
 
     print(
         "agent> Training request: "
-        f"model=`{resolved_model}`, target=`{target}`, inputs={features}."
+        f"model=`{resolved_model}`, target=`{target}`, inputs={current_features}."
     )
     if build_request.get("source") == "handoff" and raw_search_order:
         print(
@@ -1838,19 +1899,37 @@ def _execute_modeler_build_request(
         print(f"agent> Task override: forcing task profile `{task_type_hint}` before training.")
     if timestamp_column:
         print(f"agent> Timestamp context: using `{timestamp_column}` for data-mode-aware splitting.")
+    if threshold_policy is not None or explicit_decision_threshold is not None:
+        print(
+            "agent> Threshold policy: "
+            f"{_format_threshold_override(explicit_decision_threshold if explicit_decision_threshold is not None else threshold_policy)}."
+        )
 
     attempt = 1
     max_attempts = int(loop_policy.get("max_attempts", 2))
     allow_loop = bool(loop_policy.get("enabled", True))
     allow_architecture_switch = bool(loop_policy.get("allow_architecture_switch", True))
+    allow_feature_set_expansion = bool(loop_policy.get("allow_feature_set_expansion", True))
+    allow_lag_horizon_expansion = bool(loop_policy.get("allow_lag_horizon_expansion", True))
+    allow_threshold_policy_tuning = bool(loop_policy.get("allow_threshold_policy_tuning", True))
     current_requested_model = resolved_model
     tried_models: set[str] = set()
+    tried_configurations: set[str] = set()
     last_training: dict[str, Any] | None = None
     best_training: dict[str, Any] | None = None
     last_loop_eval: dict[str, Any] | None = None
 
     while True:
         tried_models.add(current_requested_model)
+        tried_configurations.add(
+            _training_configuration_signature(
+                model_family=current_requested_model,
+                feature_columns=current_features,
+                lag_horizon_samples=current_lag_horizon,
+                threshold_policy=threshold_policy,
+                decision_threshold=explicit_decision_threshold,
+            )
+        )
         print(
             f"agent> Attempt {attempt}/{max_attempts}: requested candidate family `{current_requested_model}`."
         )
@@ -1863,14 +1942,16 @@ def _execute_modeler_build_request(
         tool_args = _modeler_training_tool_args(
             dataset=dataset,
             target=target,
-            features=features,
+            features=current_features,
             requested_model_family=current_requested_model,
             timestamp_column=timestamp_column,
             requested_normalize=requested_normalize,
             missing_data_strategy=missing_data_strategy,
             fill_constant_value=fill_constant_value,
             compare_against_baseline=compare_against_baseline,
-            lag_horizon_samples=lag_horizon_samples,
+            lag_horizon_samples=current_lag_horizon,
+            threshold_policy=threshold_policy,
+            decision_threshold=explicit_decision_threshold,
             task_type_hint=task_type_hint,
             checkpoint_tag=f"modeler_session_attempt_{attempt}",
         )
@@ -1951,33 +2032,57 @@ def _execute_modeler_build_request(
         if not allow_loop:
             should_continue = False
         if user_locked_model_family and current_requested_model != "auto":
-            if should_continue:
+            if should_continue and allow_architecture_switch:
                 print(
                     "agent> Architecture auto-switch is disabled because this model family was explicitly chosen by the user."
                 )
-            should_continue = False
-        if not allow_architecture_switch:
-            should_continue = False
+            allow_architecture_switch = False
         if not should_continue:
             break
 
-        next_model = _choose_model_retry_candidate(
+        retry_plan = _choose_model_retry_plan(
             training=training,
             current_model_family=current_requested_model,
             model_search_order=raw_search_order,
             tried_models=tried_models,
+            current_feature_columns=current_features,
+            available_signals=list(dataset.get("numeric_signal_columns", [])),
+            target_signal=target,
+            timestamp_column=timestamp_column,
+            current_lag_horizon=current_lag_horizon,
+            threshold_policy=threshold_policy,
+            decision_threshold=explicit_decision_threshold,
+            loop_evaluation=last_loop_eval,
+            allow_architecture_switch=allow_architecture_switch,
+            allow_feature_set_expansion=allow_feature_set_expansion,
+            allow_lag_horizon_expansion=allow_lag_horizon_expansion,
+            allow_threshold_policy_tuning=allow_threshold_policy_tuning,
+            tried_configurations=tried_configurations,
         )
-        if next_model is None:
+        if retry_plan is None:
             print(
-                "agent> No additional safe model-family retry is available from the current comparison set."
+                "agent> No additional safe adaptive retry is available from the current comparison set and search space."
             )
             break
         attempt += 1
         if attempt > max_attempts:
             break
-        current_requested_model = next_model
+        current_requested_model = str(retry_plan.get("model_family", current_requested_model))
+        current_features = list(retry_plan.get("feature_columns", current_features))
+        current_lag_horizon = _coerce_optional_int(retry_plan.get("lag_horizon_samples"))
+        threshold_policy = (
+            str(retry_plan["threshold_policy"]).strip()
+            if retry_plan.get("threshold_policy") is not None
+            else None
+        )
+        explicit_decision_threshold = (
+            float(retry_plan["decision_threshold"])
+            if retry_plan.get("decision_threshold") is not None
+            else None
+        )
         print(
-            f"agent> Continuing bounded optimization loop with `{current_requested_model}` as the next retry."
+            "agent> Continuing bounded optimization loop with "
+            f"`{current_requested_model}` and {_describe_retry_plan(retry_plan)}."
         )
 
     if last_training is None:
@@ -1998,6 +2103,11 @@ def _execute_modeler_build_request(
         else {}
     )
     comparison = training.get("comparison") if isinstance(training.get("comparison"), list) else []
+    final_feature_columns = [
+        str(item)
+        for item in (training.get("feature_columns") if isinstance(training.get("feature_columns"), list) else current_features)
+        if str(item)
+    ]
     summary = (
         "Model build complete: "
         f"requested_model={resolved_model}, "
@@ -2005,7 +2115,7 @@ def _execute_modeler_build_request(
         f"selected_model={training.get('selected_model_family', 'n/a')}, "
         f"best_validation_model={training.get('best_validation_model_family', 'n/a')}, "
         f"target={target}, "
-        f"inputs={len(features)}, "
+        f"inputs={len(final_feature_columns)}, "
         f"rows_used={training.get('rows_used', 'n/a')}, "
         f"{_format_model_outcome_summary(test_metrics, training.get('task_profile'))}."
     )
@@ -2035,7 +2145,7 @@ def _execute_modeler_build_request(
     session_context["workflow_stage"] = "model_training_completed"
     session_context["last_model_request"] = {
         "target_signal": target,
-        "feature_signals": features,
+        "feature_signals": final_feature_columns,
         "requested_model_family": requested_model,
         "final_attempt_model_family": current_requested_model,
         "resolved_model_family": training.get("selected_model_family", current_requested_model),
@@ -2043,6 +2153,7 @@ def _execute_modeler_build_request(
         "checkpoint_id": training.get("checkpoint_id"),
         "run_dir": training.get("run_dir"),
         "lag_horizon_samples": int(training.get("lag_horizon_samples") or 0),
+        "threshold_policy": threshold_policy if threshold_policy is not None else explicit_decision_threshold,
         "acceptance_check": last_loop_eval or {},
     }
     response = f"{summary} {checkpoint_line}"
@@ -2053,7 +2164,7 @@ def _execute_modeler_build_request(
             "message": response,
             "tool_output": {
                 "target_signal": target,
-                "feature_signals": features,
+                "feature_signals": final_feature_columns,
                 "resolved_model_family": training.get("selected_model_family", current_requested_model),
                 "checkpoint_id": training.get("checkpoint_id"),
                 "run_dir": training.get("run_dir"),
@@ -2112,6 +2223,8 @@ def _modeler_training_tool_args(
     fill_constant_value: Any,
     compare_against_baseline: bool,
     lag_horizon_samples: Any,
+    threshold_policy: Any,
+    decision_threshold: Any,
     task_type_hint: str | None,
     checkpoint_tag: str,
 ) -> dict[str, Any]:
@@ -2128,6 +2241,8 @@ def _modeler_training_tool_args(
         "fill_constant_value": fill_constant_value,
         "compare_against_baseline": compare_against_baseline,
         "lag_horizon_samples": lag_horizon_samples,
+        "threshold_policy": threshold_policy,
+        "decision_threshold": decision_threshold,
         "task_type_hint": task_type_hint,
     }
 
@@ -2154,6 +2269,11 @@ def _print_modeler_training_summary(*, training: dict[str, Any]) -> None:
             task_line += f", minority_fraction={minority:.3%}"
         task_line += "."
         print(task_line)
+        if _task_is_classification(str(task_profile.get("task_type", "")).strip()):
+            print(
+                "agent> Binary classification thresholding is validation-tuned by default. "
+                "Use `threshold ...` before the next run if you want to favor recall, precision, F1, PR-AUC, or set an explicit cutoff."
+            )
     print(
         "agent> Split-safe pipeline: "
         f"strategy={split_info.get('strategy', 'n/a')}, "
@@ -2306,6 +2426,274 @@ def _training_result_rank(training: dict[str, Any]) -> tuple[float, ...]:
     )
 
 
+def _normalize_threshold_override(raw: str) -> str | float | None:
+    text = str(raw).strip()
+    if not text:
+        return None
+    lowered = text.lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "auto": "auto",
+        "favor_recall": "favor_recall",
+        "favor_precision": "favor_precision",
+        "favor_f1": "favor_f1",
+        "favor_pr_auc": "favor_pr_auc",
+        "favor_prauc": "favor_pr_auc",
+    }
+    if lowered in aliases:
+        return aliases[lowered]
+    try:
+        numeric = float(text)
+    except (TypeError, ValueError):
+        return None
+    if 0.0 < numeric < 1.0:
+        return float(numeric)
+    return None
+
+
+def _format_threshold_override(value: str | float | None) -> str:
+    if value is None:
+        return "auto"
+    if isinstance(value, (int, float)):
+        return f"explicit threshold {float(value):.2f}"
+    return str(value)
+
+
+def _resolve_threshold_training_controls(
+    raw: Any,
+) -> tuple[str | None, float | None]:
+    if raw is None:
+        return None, None
+    if isinstance(raw, (int, float)):
+        numeric = float(raw)
+        if 0.0 < numeric < 1.0:
+            return None, numeric
+        return None, None
+    normalized = _normalize_threshold_override(str(raw))
+    if isinstance(normalized, float):
+        return None, normalized
+    if normalized == "auto":
+        return None, None
+    if isinstance(normalized, str):
+        return normalized, None
+    return None, None
+
+
+def _coerce_optional_int(raw: Any) -> int | None:
+    if raw is None:
+        return None
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _training_configuration_signature(
+    *,
+    model_family: str,
+    feature_columns: list[str],
+    lag_horizon_samples: int | None,
+    threshold_policy: str | None,
+    decision_threshold: float | None,
+) -> str:
+    feature_key = ",".join(sorted(str(item) for item in feature_columns))
+    threshold_key = (
+        f"threshold={float(decision_threshold):.4f}"
+        if decision_threshold is not None
+        else f"policy={str(threshold_policy or 'auto')}"
+    )
+    return (
+        f"{model_family}|features={feature_key}|lag={int(lag_horizon_samples or 0)}|{threshold_key}"
+    )
+
+
+def _choose_model_retry_plan(
+    *,
+    training: dict[str, Any],
+    current_model_family: str,
+    model_search_order: list[str],
+    tried_models: set[str],
+    current_feature_columns: list[str],
+    available_signals: list[str],
+    target_signal: str,
+    timestamp_column: str | None,
+    current_lag_horizon: int | None,
+    threshold_policy: str | None,
+    decision_threshold: float | None,
+    loop_evaluation: dict[str, Any],
+    allow_architecture_switch: bool,
+    allow_feature_set_expansion: bool,
+    allow_lag_horizon_expansion: bool,
+    allow_threshold_policy_tuning: bool,
+    tried_configurations: set[str],
+) -> dict[str, Any] | None:
+    unmet = [
+        str(item).strip().lower()
+        for item in (loop_evaluation.get("unmet_criteria") if isinstance(loop_evaluation, dict) else [])
+        if str(item).strip()
+    ]
+    task_profile = training.get("task_profile") if isinstance(training.get("task_profile"), dict) else {}
+    task_type = str(task_profile.get("task_type", "")).strip()
+    normalized_current = _normalize_modeler_model_family(current_model_family) or current_model_family
+
+    def _candidate_plan(
+        *,
+        model_family: str | None = None,
+        feature_columns: list[str] | None = None,
+        lag_horizon_samples: int | None = None,
+        threshold_policy_value: str | None = threshold_policy,
+        decision_threshold_value: float | None = decision_threshold,
+        note: str,
+    ) -> dict[str, Any] | None:
+        plan = {
+            "model_family": model_family or normalized_current,
+            "feature_columns": list(feature_columns or current_feature_columns),
+            "lag_horizon_samples": lag_horizon_samples,
+            "threshold_policy": threshold_policy_value,
+            "decision_threshold": decision_threshold_value,
+            "note": note,
+        }
+        signature = _training_configuration_signature(
+            model_family=str(plan["model_family"]),
+            feature_columns=list(plan["feature_columns"]),
+            lag_horizon_samples=_coerce_optional_int(plan["lag_horizon_samples"]),
+            threshold_policy=(
+                str(plan["threshold_policy"]).strip()
+                if plan["threshold_policy"] is not None
+                else None
+            ),
+            decision_threshold=(
+                float(plan["decision_threshold"])
+                if plan["decision_threshold"] is not None
+                else None
+            ),
+        )
+        if signature in tried_configurations:
+            return None
+        return plan
+
+    if _task_is_classification(task_type) and allow_threshold_policy_tuning:
+        if "recall" in unmet and threshold_policy != "favor_recall":
+            plan = _candidate_plan(
+                threshold_policy_value="favor_recall",
+                decision_threshold_value=None,
+                note="raising minority-class sensitivity via `favor_recall` threshold policy",
+            )
+            if plan is not None:
+                return plan
+        if "precision" in unmet and threshold_policy != "favor_precision":
+            plan = _candidate_plan(
+                threshold_policy_value="favor_precision",
+                decision_threshold_value=None,
+                note="tightening positive decisions via `favor_precision` threshold policy",
+            )
+            if plan is not None:
+                return plan
+        if "f1" in unmet and threshold_policy != "favor_f1":
+            plan = _candidate_plan(
+                threshold_policy_value="favor_f1",
+                decision_threshold_value=None,
+                note="retuning the binary decision threshold for F1 balance",
+            )
+            if plan is not None:
+                return plan
+        if "pr_auc" in unmet and threshold_policy != "favor_pr_auc":
+            plan = _candidate_plan(
+                threshold_policy_value="favor_pr_auc",
+                decision_threshold_value=None,
+                note="retuning the binary decision threshold to favor precision-recall separation",
+            )
+            if plan is not None:
+                return plan
+
+    if allow_architecture_switch:
+        next_model = _choose_model_retry_candidate(
+            training=training,
+            current_model_family=current_model_family,
+            model_search_order=model_search_order,
+            tried_models=tried_models,
+        )
+        if next_model is not None:
+            plan = _candidate_plan(
+                model_family=next_model,
+                note=f"switching candidate family to `{next_model}`",
+            )
+            if plan is not None:
+                return plan
+
+    if allow_feature_set_expansion:
+        extras = [
+            str(item)
+            for item in available_signals
+            if (
+                str(item)
+                and str(item) != target_signal
+                and str(item) not in current_feature_columns
+                and str(item) != str(timestamp_column or "").strip()
+            )
+        ]
+        if extras:
+            addition = extras[: min(2, len(extras))]
+            expanded_features = list(current_feature_columns) + addition
+            plan = _candidate_plan(
+                feature_columns=expanded_features,
+                note=f"expanding the feature set with {addition}",
+            )
+            if plan is not None:
+                return plan
+
+    if allow_lag_horizon_expansion:
+        data_mode = str(training.get("data_mode", "")).strip()
+        target_model = normalized_current
+        if data_mode == "time_series" and target_model in {
+            "auto",
+            "lagged_linear",
+            "lagged_tree_ensemble",
+        }:
+            current_lag = int(current_lag_horizon or training.get("lag_horizon_samples") or 0)
+            next_lag = current_lag + 1 if current_lag > 0 else 2
+            if next_lag <= 12:
+                lagged_model = (
+                    target_model
+                    if target_model in {"lagged_linear", "lagged_tree_ensemble"}
+                    else "lagged_linear"
+                )
+                plan = _candidate_plan(
+                    model_family=lagged_model,
+                    lag_horizon_samples=next_lag,
+                    note=f"widening the lag window to {next_lag} samples",
+                )
+                if plan is not None:
+                    return plan
+
+    return None
+
+
+def _describe_retry_plan(plan: dict[str, Any]) -> str:
+    note = str(plan.get("note", "")).strip()
+    feature_columns = [str(item) for item in (plan.get("feature_columns") or []) if str(item)]
+    extras = []
+    if feature_columns:
+        extras.append(f"inputs={feature_columns}")
+    lag_value = _coerce_optional_int(plan.get("lag_horizon_samples"))
+    if lag_value is not None:
+        extras.append(f"lag_horizon={lag_value}")
+    threshold_display = None
+    if plan.get("decision_threshold") is not None:
+        threshold_display = _format_threshold_override(float(plan["decision_threshold"]))
+    elif plan.get("threshold_policy") is not None:
+        threshold_display = _format_threshold_override(str(plan["threshold_policy"]))
+    if threshold_display is not None:
+        extras.append(f"threshold={threshold_display}")
+    if note and extras:
+        return f"{note} ({', '.join(extras)})"
+    if note:
+        return note
+    if extras:
+        return ", ".join(extras)
+    return "the next safe retry plan"
+
+
 def _safe_acceptance_criteria(raw: Any, *, task_type_hint: str | None = None) -> dict[str, float]:
     default = _default_acceptance_criteria(task_type_hint=task_type_hint)
     if not isinstance(raw, dict):
@@ -2330,17 +2718,30 @@ def _safe_acceptance_criteria(raw: Any, *, task_type_hint: str | None = None) ->
 
 def _safe_loop_policy(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
-        return {"enabled": True, "max_attempts": 2, "allow_architecture_switch": True}
+        return {
+            "enabled": True,
+            "max_attempts": 3,
+            "allow_architecture_switch": True,
+            "allow_feature_set_expansion": True,
+            "allow_lag_horizon_expansion": True,
+            "allow_threshold_policy_tuning": True,
+        }
     enabled = bool(raw.get("enabled", True))
     try:
-        max_attempts = max(1, int(raw.get("max_attempts", 2)))
+        max_attempts = max(1, int(raw.get("max_attempts", 3)))
     except (TypeError, ValueError):
-        max_attempts = 2
+        max_attempts = 3
     allow_architecture_switch = bool(raw.get("allow_architecture_switch", True))
+    allow_feature_set_expansion = bool(raw.get("allow_feature_set_expansion", True))
+    allow_lag_horizon_expansion = bool(raw.get("allow_lag_horizon_expansion", True))
+    allow_threshold_policy_tuning = bool(raw.get("allow_threshold_policy_tuning", True))
     return {
         "enabled": enabled,
         "max_attempts": max_attempts,
         "allow_architecture_switch": allow_architecture_switch,
+        "allow_feature_set_expansion": allow_feature_set_expansion,
+        "allow_lag_horizon_expansion": allow_lag_horizon_expansion,
+        "allow_threshold_policy_tuning": allow_threshold_policy_tuning,
     }
 
 
@@ -2503,7 +2904,14 @@ def _modeler_request_from_handoff(
         "loop_policy": (
             dict(handoff.get("loop_policy"))
             if isinstance(handoff.get("loop_policy"), dict)
-            else {"enabled": True, "max_attempts": 3, "allow_architecture_switch": True}
+            else {
+                "enabled": True,
+                "max_attempts": 3,
+                "allow_architecture_switch": True,
+                "allow_feature_set_expansion": True,
+                "allow_lag_horizon_expansion": True,
+                "allow_threshold_policy_tuning": True,
+            }
         ),
         "user_locked_model_family": False,
         "model_search_order": [

@@ -67,7 +67,8 @@ Outputs:
   - direct modeler mode and Agent 1 structured-report handoff both reach a split-safe trainer
   - executable families today: `linear_ridge`, `logistic_regression`, `bagged_tree_classifier`, `lagged_linear`, `lagged_tree_ensemble`, `bagged_tree_ensemble`
   - classification / fraud targets now train local classifier baselines with task-aware acceptance checks instead of stopping at detection
-  - modeler compares available candidates, runs a bounded acceptance check, can retry with the next safe family when policy allows it, persists artifacts, and then lets the LLM interpret the measured result
+  - modeler compares available candidates, runs a bounded acceptance check, can retry with the next safe family when policy allows it, and can also expand the feature set, widen the lag window, or retune binary thresholds inside the same bounded loop
+  - persists artifacts, then lets the LLM interpret the measured result
 - User control:
   - if a handoff exists, user can accept the recommendation or override target, predictors, and architecture
   - explicit user overrides win unless blocked by hard policy / safety constraints
@@ -186,8 +187,9 @@ Add Optuna only after deterministic training is stable.
 Add GRU / LSTM only after lagged and tree-based baselines are in place.
 
 Current status:
-- steps 1-6 are now partially implemented in the first executable Agent 2 path
-- remaining work is to extend from single-pass training into full acceptance-loop retries, stronger model families, and deeper post-failure experiment guidance
+- steps 1-7 are now implemented in the first production path
+- bounded acceptance-loop retries are already active across model family, feature set, lag horizon, and binary threshold policy when allowed by loop policy
+- remaining work is stronger boosted-tree families, lagged classifier families, post-failure experiment design, inference-first workflows, uncertainty estimation, and later Optuna
 
 ## 11. Bounded LLM Autonomy
 The LLM should act as an agent, but not as an uncontrolled replacement for deterministic analytics.
