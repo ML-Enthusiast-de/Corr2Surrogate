@@ -108,13 +108,18 @@ def build_agent2_handoff_from_report_payload(payload: dict[str, Any]) -> Agent2H
     recommended_model = _recommended_model_for_task(
         recommended_model=raw_recommended_model,
         task_type=task_type,
+        data_mode=data_mode,
     )
     search_order = [
         str(item).strip()
         for item in ((target_rec or {}).get("priority_model_families") or [])
         if str(item).strip()
     ]
-    search_order = _search_order_for_task(search_order=search_order, task_type=task_type)
+    search_order = _search_order_for_task(
+        search_order=search_order,
+        task_type=task_type,
+        data_mode=data_mode,
+    )
     lag_horizon = _derive_lag_horizon_samples(target_rec or {})
     preprocessing = payload.get("preprocessing") if isinstance(payload.get("preprocessing"), dict) else {}
     missing_plan = preprocessing.get("missing_data_plan") if isinstance(preprocessing.get("missing_data_plan"), dict) else {}
@@ -245,12 +250,18 @@ def _forced_requests_from_report(payload: dict[str, Any]) -> list[ForcedModeling
 def _derive_lag_horizon_samples(target_rec: dict[str, Any]) -> int:
     if not isinstance(target_rec, dict):
         return 0
-    if str(target_rec.get("recommended_model_family", "")).strip() != "lagged_linear":
+    if str(target_rec.get("recommended_model_family", "")).strip() not in {
+        "lagged_linear",
+        "lagged_tree_ensemble",
+    }:
         return 0
     for item in target_rec.get("candidate_models", []):
         if not isinstance(item, dict):
             continue
-        if str(item.get("model_family", "")).strip() != "lagged_linear":
+        if str(item.get("model_family", "")).strip() not in {
+            "lagged_linear",
+            "lagged_tree_ensemble",
+        }:
             continue
         notes = str(item.get("notes", ""))
         match = re.search(r"up to\s+(\d+)\s+samples", notes, flags=re.IGNORECASE)
@@ -259,7 +270,12 @@ def _derive_lag_horizon_samples(target_rec: dict[str, Any]) -> int:
     return 3
 
 
-def _recommended_model_for_task(*, recommended_model: str, task_type: str) -> str:
+def _recommended_model_for_task(
+    *,
+    recommended_model: str,
+    task_type: str,
+    data_mode: str = "steady_state",
+) -> str:
     normalized = str(recommended_model).strip() or "linear_ridge"
     if task_type not in {
         "binary_classification",
@@ -268,14 +284,29 @@ def _recommended_model_for_task(*, recommended_model: str, task_type: str) -> st
         "anomaly_detection",
     }:
         return normalized
-    if normalized in {"logistic_regression", "bagged_tree_classifier"}:
+    is_temporal = str(data_mode).strip() == "time_series"
+    if normalized in {
+        "logistic_regression",
+        "lagged_logistic_regression",
+        "bagged_tree_classifier",
+        "lagged_tree_classifier",
+    }:
         return normalized
+    if normalized == "lagged_linear":
+        return "lagged_logistic_regression" if is_temporal else "logistic_regression"
+    if normalized == "lagged_tree_ensemble":
+        return "lagged_tree_classifier" if is_temporal else "bagged_tree_classifier"
     if normalized in {"bagged_tree_ensemble", "lagged_tree_ensemble", "tree_ensemble_candidate"}:
         return "bagged_tree_classifier"
     return "logistic_regression"
 
 
-def _search_order_for_task(*, search_order: list[str], task_type: str) -> list[str]:
+def _search_order_for_task(
+    *,
+    search_order: list[str],
+    task_type: str,
+    data_mode: str = "steady_state",
+) -> list[str]:
     if task_type not in {
         "binary_classification",
         "multiclass_classification",
@@ -285,10 +316,19 @@ def _search_order_for_task(*, search_order: list[str], task_type: str) -> list[s
         return search_order
     mapped: list[str] = []
     for item in search_order:
-        normalized = _recommended_model_for_task(recommended_model=item, task_type=task_type)
+        normalized = _recommended_model_for_task(
+            recommended_model=item,
+            task_type=task_type,
+            data_mode=data_mode,
+        )
         if normalized not in mapped:
             mapped.append(normalized)
-    for fallback in ("logistic_regression", "bagged_tree_classifier"):
+    fallbacks = (
+        ("lagged_logistic_regression", "lagged_tree_classifier")
+        if str(data_mode).strip() == "time_series"
+        else ("logistic_regression", "bagged_tree_classifier")
+    )
+    for fallback in fallbacks:
         if fallback not in mapped:
             mapped.append(fallback)
     return mapped

@@ -151,6 +151,11 @@ def build_default_registry() -> ToolRegistry:
                 "max_attempts": {"type": "integer"},
                 "min_relative_improvement": {"type": "number"},
                 "previous_best_score": {"type": "number"},
+                "task_type_hint": {"type": "string"},
+                "data_mode": {"type": "string"},
+                "feature_columns": {"type": "array", "items": {"type": "string"}},
+                "target_column": {"type": "string"},
+                "lag_horizon_samples": {"type": "integer"},
             },
             "required": ["metrics", "acceptance_criteria", "attempt", "max_attempts"],
             "additionalProperties": False,
@@ -391,6 +396,11 @@ def _tool_evaluate_training_iteration(
     max_attempts: int,
     min_relative_improvement: float = 0.02,
     previous_best_score: float | None = None,
+    task_type_hint: str | None = None,
+    data_mode: str | None = None,
+    feature_columns: list[str] | None = None,
+    target_column: str | None = None,
+    lag_horizon_samples: int | None = None,
 ) -> dict[str, Any]:
     result = evaluate_training_iteration(
         metrics=metrics,
@@ -399,6 +409,11 @@ def _tool_evaluate_training_iteration(
         max_attempts=max_attempts,
         min_relative_improvement=min_relative_improvement,
         previous_best_score=previous_best_score,
+        task_type_hint=task_type_hint,
+        data_mode=data_mode,
+        feature_columns=feature_columns,
+        target_column=target_column,
+        lag_horizon_samples=lag_horizon_samples,
     )
     return asdict(result)
 

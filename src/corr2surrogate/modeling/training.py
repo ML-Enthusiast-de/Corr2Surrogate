@@ -41,7 +41,9 @@ _MODEL_TIEBREAK = {
     "bagged_tree_ensemble": 2,
     "lagged_tree_ensemble": 3,
     "logistic_regression": 0,
-    "bagged_tree_classifier": 1,
+    "lagged_logistic_regression": 1,
+    "bagged_tree_classifier": 2,
+    "lagged_tree_classifier": 3,
 }
 
 
@@ -61,6 +63,12 @@ def normalize_candidate_model_family(requested_model_family: str) -> str | None:
         "logit": "logistic_regression",
         "linear_classifier": "logistic_regression",
         "classifier": "logistic_regression",
+        "lagged_logistic_regression": "lagged_logistic_regression",
+        "lagged_logistic": "lagged_logistic_regression",
+        "lagged_logit": "lagged_logistic_regression",
+        "temporal_logistic": "lagged_logistic_regression",
+        "temporal_classifier": "lagged_logistic_regression",
+        "lagged_classifier": "lagged_logistic_regression",
         "lagged_linear": "lagged_linear",
         "lagged": "lagged_linear",
         "temporal_linear": "lagged_linear",
@@ -69,6 +77,10 @@ def normalize_candidate_model_family(requested_model_family: str) -> str | None:
         "tree_classifier": "bagged_tree_classifier",
         "classifier_tree": "bagged_tree_classifier",
         "fraud_tree": "bagged_tree_classifier",
+        "lagged_tree_classifier": "lagged_tree_classifier",
+        "temporal_tree_classifier": "lagged_tree_classifier",
+        "lag_window_tree_classifier": "lagged_tree_classifier",
+        "temporal_fraud_tree": "lagged_tree_classifier",
         "lagged_tree_ensemble": "lagged_tree_ensemble",
         "lagged_tree": "lagged_tree_ensemble",
         "lag_window_tree": "lagged_tree_ensemble",
@@ -126,7 +138,9 @@ def train_surrogate_candidates(
         raise ValueError(
             "Requested model is not implemented. "
             "Supported: auto, linear_ridge/ridge/linear, logistic_regression/logistic/linear_classifier, "
+            "lagged_logistic_regression/lagged_logistic/temporal_classifier, "
             "lagged_linear/lagged/temporal_linear/arx, "
+            "lagged_tree_classifier/temporal_tree_classifier, "
             "lagged_tree_ensemble/lagged_tree/lag_window_tree/temporal_tree, "
             "bagged_tree_ensemble/tree/tree_ensemble/extra_trees/hist_gradient_boosting, "
             "bagged_tree_classifier/tree_classifier/classifier_tree."
@@ -145,6 +159,7 @@ def train_surrogate_candidates(
             missing_data_strategy=missing_data_strategy,
             fill_constant_value=fill_constant_value,
             compare_against_baseline=compare_against_baseline,
+            lag_horizon_samples=lag_horizon_samples,
             split=split,
             task_profile=task_profile,
             threshold_policy=threshold_policy,
@@ -371,12 +386,22 @@ def train_surrogate_candidates(
 def _resolve_requested_for_task(*, requested: str, task_type: str) -> str:
     if not is_classification_task(task_type):
         return requested
-    if requested in {"auto", "logistic_regression", "bagged_tree_classifier"}:
+    if requested in {
+        "auto",
+        "logistic_regression",
+        "lagged_logistic_regression",
+        "bagged_tree_classifier",
+        "lagged_tree_classifier",
+    }:
         return requested
-    if requested in {"linear_ridge", "lagged_linear"}:
+    if requested == "linear_ridge":
         return "logistic_regression"
-    if requested in {"bagged_tree_ensemble", "lagged_tree_ensemble"}:
+    if requested == "lagged_linear":
+        return "lagged_logistic_regression"
+    if requested == "bagged_tree_ensemble":
         return "bagged_tree_classifier"
+    if requested == "lagged_tree_ensemble":
+        return "lagged_tree_classifier"
     return requested
 
 
@@ -390,6 +415,7 @@ def _train_classification_candidates(
     missing_data_strategy: str,
     fill_constant_value: float | None,
     compare_against_baseline: bool,
+    lag_horizon_samples: int | None,
     split: DatasetSplit,
     task_profile: Any,
     threshold_policy: str | None,
@@ -422,6 +448,17 @@ def _train_classification_candidates(
             for name, part in prepared_frames.items()
         }
 
+    lagged_horizon = _resolve_lag_horizon(
+        data_mode="time_series" if split.data_mode == "time_series" else "steady_state",
+        requested=requested,
+        lag_horizon_samples=lag_horizon_samples,
+        split=split,
+    )
+    if requested in {"lagged_logistic_regression", "lagged_tree_classifier"} and lagged_horizon is None:
+        raise ValueError(
+            "Lagged classifier families require time-series structure and a usable timestamp column."
+        )
+
     logistic_model = LogisticClassificationSurrogate(
         feature_columns=feature_columns,
         target_column=target_column,
@@ -446,6 +483,32 @@ def _train_classification_candidates(
     )
 
     candidates: list[CandidateMetrics] = [logistic_candidate]
+    lagged_logistic_model: LaggedLogisticClassificationSurrogate | None = None
+    if lagged_horizon is not None and (compare_against_baseline or requested == "lagged_logistic_regression"):
+        lagged_logistic_model = LaggedLogisticClassificationSurrogate(
+            feature_columns=feature_columns,
+            target_column=target_column,
+            lag_horizon=lagged_horizon,
+        )
+        lagged_logistic_rows = lagged_logistic_model.fit_dataframe(prepared_frames["train"])
+        rows_used_by_model["lagged_logistic_regression"] = int(lagged_logistic_rows)
+        lagged_logistic_candidate = _classification_candidate_metrics_with_context(
+            model_family="lagged_logistic_regression",
+            model=lagged_logistic_model,
+            frames=prepared_frames,
+            task_type=str(task_profile.task_type),
+            threshold_policy=threshold_policy,
+            decision_threshold=decision_threshold,
+            notes=(
+                "Lagged logistic classifier over current and historical predictor windows. "
+                f"Lag horizon={lagged_horizon} samples. Train rows used={lagged_logistic_rows}."
+            ),
+        )
+        candidates.append(lagged_logistic_candidate)
+        classifier_thresholds["lagged_logistic_regression"] = float(
+            lagged_logistic_candidate.train_metrics.get("decision_threshold", 0.5)
+        )
+
     tree_classifier: BaggedTreeClassifierSurrogate | None = None
     if compare_against_baseline or requested == "bagged_tree_classifier":
         tree_classifier = BaggedTreeClassifierSurrogate(
@@ -472,6 +535,32 @@ def _train_classification_candidates(
             candidates[-1].train_metrics.get("decision_threshold", 0.5)
         )
 
+    lagged_tree_classifier: LaggedTreeClassifierSurrogate | None = None
+    if lagged_horizon is not None and (compare_against_baseline or requested == "lagged_tree_classifier"):
+        lagged_tree_classifier = LaggedTreeClassifierSurrogate(
+            feature_columns=feature_columns,
+            target_column=target_column,
+            lag_horizon=lagged_horizon,
+        )
+        lagged_tree_rows = lagged_tree_classifier.fit_dataframe(prepared_frames["train"])
+        rows_used_by_model["lagged_tree_classifier"] = int(lagged_tree_rows)
+        lagged_tree_candidate = _classification_candidate_metrics_with_context(
+            model_family="lagged_tree_classifier",
+            model=lagged_tree_classifier,
+            frames=prepared_frames,
+            task_type=str(task_profile.task_type),
+            threshold_policy=threshold_policy,
+            decision_threshold=decision_threshold,
+            notes=(
+                "Lag-window bagged tree classifier over current and historical predictor windows. "
+                f"Lag horizon={lagged_horizon} samples. Train rows used={lagged_tree_rows}."
+            ),
+        )
+        candidates.append(lagged_tree_candidate)
+        classifier_thresholds["lagged_tree_classifier"] = float(
+            lagged_tree_candidate.train_metrics.get("decision_threshold", 0.5)
+        )
+
     best_by_validation = _select_best_candidate(candidates, task_type=str(task_profile.task_type))
     selected_candidate = _resolve_selected_candidate(
         requested=requested,
@@ -481,8 +570,12 @@ def _train_classification_candidates(
     selected_model_name = selected_candidate.model_family
     if selected_model_name == "logistic_regression":
         selected_model_obj: Any = logistic_model
+    elif selected_model_name == "lagged_logistic_regression" and lagged_logistic_model is not None:
+        selected_model_obj = lagged_logistic_model
     elif selected_model_name == "bagged_tree_classifier" and tree_classifier is not None:
         selected_model_obj = tree_classifier
+    elif selected_model_name == "lagged_tree_classifier" and lagged_tree_classifier is not None:
+        selected_model_obj = lagged_tree_classifier
     else:
         raise RuntimeError("Selected classifier model object is unavailable.")
 
@@ -513,6 +606,36 @@ def _train_classification_candidates(
                 "decision_threshold": float(classifier_thresholds.get("logistic_regression", 0.5)),
             }
         )
+    elif selected_model_name == "lagged_logistic_regression" and lagged_logistic_model is not None:
+        selected_hyperparameters.update(
+            {
+                "learning_rate": float(lagged_logistic_model.learning_rate),
+                "epochs": int(lagged_logistic_model.epochs),
+                "l2": float(lagged_logistic_model.l2),
+                "lag_horizon_samples": int(lagged_logistic_model.lag_horizon),
+                "training_rows_used": int(rows_used_by_model.get("lagged_logistic_regression", 0)),
+                "class_count": int(len(lagged_logistic_model.class_labels)),
+                "training_feature_count": int(len(lagged_logistic_model._lagged_feature_columns)),
+                "decision_threshold": float(
+                    classifier_thresholds.get("lagged_logistic_regression", 0.5)
+                ),
+            }
+        )
+    elif selected_model_name == "lagged_tree_classifier" and lagged_tree_classifier is not None:
+        selected_hyperparameters.update(
+            {
+                "n_estimators": int(lagged_tree_classifier.n_estimators),
+                "max_depth": int(lagged_tree_classifier.max_depth),
+                "min_leaf": int(lagged_tree_classifier.min_leaf),
+                "lag_horizon_samples": int(lagged_tree_classifier.lag_horizon),
+                "training_rows_used": int(rows_used_by_model.get("lagged_tree_classifier", 0)),
+                "class_count": int(len(lagged_tree_classifier.class_labels)),
+                "training_feature_count": int(len(lagged_tree_classifier._lagged_feature_columns)),
+                "decision_threshold": float(
+                    classifier_thresholds.get("lagged_tree_classifier", 0.5)
+                ),
+            }
+        )
     elif tree_classifier is not None:
         selected_hyperparameters.update(
             {
@@ -521,7 +644,9 @@ def _train_classification_candidates(
                 "min_leaf": int(tree_classifier.min_leaf),
                 "training_rows_used": int(rows_used_by_model.get("bagged_tree_classifier", 0)),
                 "class_count": int(len(tree_classifier.class_labels)),
-                "decision_threshold": float(classifier_thresholds.get("bagged_tree_classifier", 0.5)),
+                "decision_threshold": float(
+                    classifier_thresholds.get("bagged_tree_classifier", 0.5)
+                ),
             }
         )
 
@@ -545,6 +670,7 @@ def _train_classification_candidates(
             "task_profile": task_profile.to_dict(),
             "decision_thresholds": classifier_thresholds,
             "threshold_policy": str(threshold_policy or "").strip() or "auto",
+            "lag_horizon_samples": int(lagged_horizon) if lagged_horizon is not None else 0,
         },
     )
     checkpoint_store = ModelCheckpointStore()
@@ -580,7 +706,7 @@ def _train_classification_candidates(
         "model_params_path": str(params_path),
         "selected_hyperparameters": selected_hyperparameters,
         "feature_columns": list(feature_columns),
-        "lag_horizon_samples": 0,
+        "lag_horizon_samples": int(lagged_horizon) if lagged_horizon is not None else 0,
         "rows_used": int(rows_used_by_model.get(selected_model_name, prepared_frames["train"].shape[0])),
         "rows_used_by_model": rows_used_by_model,
         "selected_metrics": {
@@ -886,6 +1012,220 @@ class LaggedTreeEnsembleSurrogate:
         return self._delegate
 
 
+class LaggedLogisticClassificationSurrogate:
+    """Logistic classifier over current and lagged predictor windows."""
+
+    def __init__(
+        self,
+        *,
+        feature_columns: list[str],
+        target_column: str,
+        lag_horizon: int = 3,
+        learning_rate: float = 0.25,
+        epochs: int = 350,
+        l2: float = 1e-4,
+    ) -> None:
+        if not feature_columns:
+            raise ValueError("feature_columns cannot be empty.")
+        if int(lag_horizon) <= 0:
+            raise ValueError("lag_horizon must be > 0.")
+        self.feature_columns = list(feature_columns)
+        self.target_column = target_column
+        self.lag_horizon = int(lag_horizon)
+        self.learning_rate = float(learning_rate)
+        self.epochs = int(epochs)
+        self.l2 = float(l2)
+        self._lagged_feature_columns = _lagged_feature_names(
+            feature_columns=self.feature_columns,
+            lag_horizon=self.lag_horizon,
+        )
+        self._delegate: LogisticClassificationSurrogate | None = None
+
+    @property
+    def class_labels(self) -> list[str]:
+        return list(self._require_delegate().class_labels)
+
+    def fit_dataframe(self, frame: pd.DataFrame) -> int:
+        lagged = self._lagged_frame(frame=frame)
+        if lagged.shape[0] == 0:
+            raise ValueError("No valid rows available after lagged feature construction.")
+        self._delegate = LogisticClassificationSurrogate(
+            feature_columns=list(self._lagged_feature_columns),
+            target_column=self.target_column,
+            learning_rate=self.learning_rate,
+            epochs=self.epochs,
+            l2=self.l2,
+        )
+        return self._delegate.fit_dataframe(lagged)
+
+    def predict_proba_dataframe(
+        self,
+        frame: pd.DataFrame,
+        *,
+        context_frame: pd.DataFrame | None = None,
+    ) -> np.ndarray:
+        lagged = self._lagged_frame(frame=frame, context_frame=context_frame)
+        if lagged.shape[0] == 0:
+            raise ValueError("Lagged prediction frame is empty for the requested split.")
+        return self._require_delegate().predict_proba_dataframe(lagged)
+
+    def predict_dataframe(
+        self,
+        frame: pd.DataFrame,
+        *,
+        context_frame: pd.DataFrame | None = None,
+    ) -> np.ndarray:
+        lagged = self._lagged_frame(frame=frame, context_frame=context_frame)
+        if lagged.shape[0] == 0:
+            raise ValueError("Lagged prediction frame is empty for the requested split.")
+        return self._require_delegate().predict_dataframe(lagged)
+
+    def state_dict(self) -> dict[str, Any]:
+        delegate = self._require_delegate()
+        return {
+            "model_name": "lagged_logistic_regression",
+            "feature_columns": list(self.feature_columns),
+            "target_column": self.target_column,
+            "lag_horizon": int(self.lag_horizon),
+            "learning_rate": float(self.learning_rate),
+            "epochs": int(self.epochs),
+            "l2": float(self.l2),
+            "lagged_feature_columns": list(self._lagged_feature_columns),
+            "logistic_state": delegate.state_dict(),
+        }
+
+    def save(self, path: str | Path) -> Path:
+        output = Path(path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        return write_json(output, self.state_dict(), indent=2)
+
+    def _lagged_frame(
+        self,
+        *,
+        frame: pd.DataFrame,
+        context_frame: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        return _build_lagged_design_frame(
+            frame=frame,
+            feature_columns=self.feature_columns,
+            target_column=self.target_column,
+            lag_horizon=self.lag_horizon,
+            context_frame=context_frame,
+        )
+
+    def _require_delegate(self) -> LogisticClassificationSurrogate:
+        if self._delegate is None:
+            raise RuntimeError("Lagged logistic classifier has not been fitted yet.")
+        return self._delegate
+
+
+class LaggedTreeClassifierSurrogate:
+    """Bagged tree classifier over current and lagged predictor windows."""
+
+    def __init__(
+        self,
+        *,
+        feature_columns: list[str],
+        target_column: str,
+        lag_horizon: int = 3,
+        n_estimators: int = 12,
+        max_depth: int = 4,
+        min_leaf: int = 6,
+    ) -> None:
+        if not feature_columns:
+            raise ValueError("feature_columns cannot be empty.")
+        if int(lag_horizon) <= 0:
+            raise ValueError("lag_horizon must be > 0.")
+        self.feature_columns = list(feature_columns)
+        self.target_column = target_column
+        self.lag_horizon = int(lag_horizon)
+        self.n_estimators = int(n_estimators)
+        self.max_depth = int(max_depth)
+        self.min_leaf = int(min_leaf)
+        self._lagged_feature_columns = _lagged_feature_names(
+            feature_columns=self.feature_columns,
+            lag_horizon=self.lag_horizon,
+        )
+        self._delegate: BaggedTreeClassifierSurrogate | None = None
+
+    @property
+    def class_labels(self) -> list[str]:
+        return list(self._require_delegate().class_labels)
+
+    def fit_dataframe(self, frame: pd.DataFrame) -> int:
+        lagged = self._lagged_frame(frame=frame)
+        if lagged.shape[0] == 0:
+            raise ValueError("No valid rows available after lagged feature construction.")
+        self._delegate = BaggedTreeClassifierSurrogate(
+            feature_columns=list(self._lagged_feature_columns),
+            target_column=self.target_column,
+            n_estimators=self.n_estimators,
+            max_depth=self.max_depth,
+            min_leaf=self.min_leaf,
+        )
+        return self._delegate.fit_dataframe(lagged)
+
+    def predict_proba_dataframe(
+        self,
+        frame: pd.DataFrame,
+        *,
+        context_frame: pd.DataFrame | None = None,
+    ) -> np.ndarray:
+        lagged = self._lagged_frame(frame=frame, context_frame=context_frame)
+        if lagged.shape[0] == 0:
+            raise ValueError("Lagged prediction frame is empty for the requested split.")
+        return self._require_delegate().predict_proba_dataframe(lagged)
+
+    def predict_dataframe(
+        self,
+        frame: pd.DataFrame,
+        *,
+        context_frame: pd.DataFrame | None = None,
+    ) -> np.ndarray:
+        lagged = self._lagged_frame(frame=frame, context_frame=context_frame)
+        if lagged.shape[0] == 0:
+            raise ValueError("Lagged prediction frame is empty for the requested split.")
+        return self._require_delegate().predict_dataframe(lagged)
+
+    def state_dict(self) -> dict[str, Any]:
+        delegate = self._require_delegate()
+        return {
+            "model_name": "lagged_tree_classifier",
+            "feature_columns": list(self.feature_columns),
+            "target_column": self.target_column,
+            "lag_horizon": int(self.lag_horizon),
+            "n_estimators": int(self.n_estimators),
+            "max_depth": int(self.max_depth),
+            "min_leaf": int(self.min_leaf),
+            "lagged_feature_columns": list(self._lagged_feature_columns),
+            "tree_state": delegate.state_dict(),
+        }
+
+    def save(self, path: str | Path) -> Path:
+        output = Path(path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        return write_json(output, self.state_dict(), indent=2)
+
+    def _lagged_frame(
+        self,
+        *,
+        frame: pd.DataFrame,
+        context_frame: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        return _build_lagged_design_frame(
+            frame=frame,
+            feature_columns=self.feature_columns,
+            target_column=self.target_column,
+            lag_horizon=self.lag_horizon,
+            context_frame=context_frame,
+        )
+
+    def _require_delegate(self) -> BaggedTreeClassifierSurrogate:
+        if self._delegate is None:
+            raise RuntimeError("Lagged tree classifier has not been fitted yet.")
+        return self._delegate
+
+
 def _candidate_metrics_from_model(
     *,
     model_family: str,
@@ -954,6 +1294,78 @@ def _classification_candidate_metrics_from_model(
     )
     for bundle in (train_metrics, validation_metrics, test_metrics):
         bundle["decision_threshold"] = float(decision_threshold)
+    return CandidateMetrics(
+        model_family=model_family,
+        train_metrics=train_metrics,
+        validation_metrics=validation_metrics,
+        test_metrics=test_metrics,
+        notes=notes,
+    )
+
+
+def _classification_candidate_metrics_with_context(
+    *,
+    model_family: str,
+    model: Any,
+    frames: dict[str, pd.DataFrame],
+    task_type: str,
+    threshold_policy: str | None,
+    decision_threshold: float | None,
+    notes: str,
+) -> CandidateMetrics:
+    train_design = model._lagged_frame(frame=frames["train"])
+    validation_design = model._lagged_frame(
+        frame=frames["validation"],
+        context_frame=frames["train"],
+    )
+    test_design = model._lagged_frame(
+        frame=frames["test"],
+        context_frame=pd.concat([frames["train"], frames["validation"]], ignore_index=True),
+    )
+    if train_design.shape[0] == 0 or validation_design.shape[0] == 0 or test_design.shape[0] == 0:
+        raise ValueError("Lagged classification design frame is empty for one or more splits.")
+
+    delegate_model = model._require_delegate()
+    class_labels = [str(item) for item in getattr(model, "class_labels", [])]
+    target_column = str(getattr(model, "target_column", "")).strip()
+    if not class_labels or not target_column:
+        raise RuntimeError("Lagged classification candidate is missing class labels or target column.")
+    positive_label = _minority_label_token(
+        frame=train_design,
+        target_column=target_column,
+    )
+    resolved_threshold = _select_binary_decision_threshold(
+        model=delegate_model,
+        validation_frame=validation_design,
+        class_labels=class_labels,
+        positive_label=positive_label,
+        task_type=task_type,
+        threshold_policy=threshold_policy,
+        explicit_threshold=decision_threshold,
+    )
+    train_metrics = _classification_metrics_for_frame(
+        model=delegate_model,
+        frame=train_design,
+        class_labels=class_labels,
+        positive_label=positive_label,
+        decision_threshold=resolved_threshold,
+    )
+    validation_metrics = _classification_metrics_for_frame(
+        model=delegate_model,
+        frame=validation_design,
+        class_labels=class_labels,
+        positive_label=positive_label,
+        decision_threshold=resolved_threshold,
+    )
+    test_metrics = _classification_metrics_for_frame(
+        model=delegate_model,
+        frame=test_design,
+        class_labels=class_labels,
+        positive_label=positive_label,
+        decision_threshold=resolved_threshold,
+    )
+    for bundle in (train_metrics, validation_metrics, test_metrics):
+        bundle["decision_threshold"] = float(resolved_threshold)
     return CandidateMetrics(
         model_family=model_family,
         train_metrics=train_metrics,
@@ -1213,7 +1625,7 @@ def _resolve_lag_horizon(
         return None
     if lag_horizon_samples is not None:
         return max(1, min(int(lag_horizon_samples), max_safe))
-    if requested == "lagged_linear":
+    if requested in {"lagged_linear", "lagged_logistic_regression"}:
         return min(4, max_safe)
     return min(3, max_safe)
 

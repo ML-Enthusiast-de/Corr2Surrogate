@@ -506,7 +506,7 @@ def _run_agent_session(
         print(
             "agent> During training I will print staged progress, compare candidates on "
             "validation/test, adapt model family/features/lags/thresholds when safe, "
-            "and then give an LLM interpretation grounded in those metrics."
+            "suggest next data trajectories if the loop stalls, and then give an LLM interpretation grounded in those metrics."
         )
         print(
             "agent> Handoff syntax: "
@@ -617,7 +617,8 @@ def _run_agent_session(
                 )
                 print(
                     "agent> Adaptive retry loop: when quality is weak, I can switch model family, "
-                    "expand the feature set, widen lag windows, and retune binary thresholds when safe."
+                    "expand the feature set, widen lag windows, retune binary thresholds when safe, "
+                    "and print concrete experiment recommendations if retries stall."
                 )
                 print(
                     "agent> Task override: `task regression`, `task binary_classification`, "
@@ -1742,6 +1743,7 @@ def _parse_modeler_build_request(user_message: str) -> dict[str, Any] | None:
             "allow_feature_set_expansion": True,
             "allow_lag_horizon_expansion": True,
             "allow_threshold_policy_tuning": True,
+            "suggest_more_data_when_stalled": True,
         },
         "user_locked_model_family": normalized_model not in {None, "auto"},
         "source": "direct",
@@ -1912,6 +1914,7 @@ def _execute_modeler_build_request(
     allow_feature_set_expansion = bool(loop_policy.get("allow_feature_set_expansion", True))
     allow_lag_horizon_expansion = bool(loop_policy.get("allow_lag_horizon_expansion", True))
     allow_threshold_policy_tuning = bool(loop_policy.get("allow_threshold_policy_tuning", True))
+    suggest_more_data_when_stalled = bool(loop_policy.get("suggest_more_data_when_stalled", True))
     current_requested_model = resolved_model
     tried_models: set[str] = set()
     tried_configurations: set[str] = set()
@@ -2002,6 +2005,11 @@ def _execute_modeler_build_request(
                     "acceptance_criteria": acceptance_criteria,
                     "attempt": attempt,
                     "max_attempts": max_attempts,
+                    "task_type_hint": effective_task_type,
+                    "data_mode": training.get("data_mode"),
+                    "feature_columns": current_features,
+                    "target_column": target,
+                    "lag_horizon_samples": current_lag_horizon or training.get("lag_horizon_samples"),
                 },
             )
         except Exception:
@@ -2038,6 +2046,10 @@ def _execute_modeler_build_request(
                 )
             allow_architecture_switch = False
         if not should_continue:
+            _print_stalled_experiment_recommendations(
+                loop_evaluation=last_loop_eval,
+                enabled=suggest_more_data_when_stalled,
+            )
             break
 
         retry_plan = _choose_model_retry_plan(
@@ -2062,6 +2074,10 @@ def _execute_modeler_build_request(
         if retry_plan is None:
             print(
                 "agent> No additional safe adaptive retry is available from the current comparison set and search space."
+            )
+            _print_stalled_experiment_recommendations(
+                loop_evaluation=last_loop_eval,
+                enabled=suggest_more_data_when_stalled,
             )
             break
         attempt += 1
@@ -2648,16 +2664,19 @@ def _choose_model_retry_plan(
         if data_mode == "time_series" and target_model in {
             "auto",
             "lagged_linear",
+            "lagged_logistic_regression",
             "lagged_tree_ensemble",
+            "lagged_tree_classifier",
         }:
             current_lag = int(current_lag_horizon or training.get("lag_horizon_samples") or 0)
             next_lag = current_lag + 1 if current_lag > 0 else 2
             if next_lag <= 12:
-                lagged_model = (
-                    target_model
-                    if target_model in {"lagged_linear", "lagged_tree_ensemble"}
-                    else "lagged_linear"
-                )
+                if target_model in {"lagged_linear", "lagged_logistic_regression", "lagged_tree_ensemble", "lagged_tree_classifier"}:
+                    lagged_model = target_model
+                elif _task_is_classification(task_type):
+                    lagged_model = "lagged_logistic_regression"
+                else:
+                    lagged_model = "lagged_linear"
                 plan = _candidate_plan(
                     model_family=lagged_model,
                     lag_horizon_samples=next_lag,
@@ -2694,6 +2713,27 @@ def _describe_retry_plan(plan: dict[str, Any]) -> str:
     return "the next safe retry plan"
 
 
+def _print_stalled_experiment_recommendations(
+    *,
+    loop_evaluation: dict[str, Any],
+    enabled: bool,
+) -> None:
+    if not enabled or not isinstance(loop_evaluation, dict):
+        return
+    suggestions = loop_evaluation.get("trajectory_recommendations")
+    if not isinstance(suggestions, list):
+        return
+    printed = 0
+    for item in suggestions:
+        text = str(item).strip()
+        if not text:
+            continue
+        print(f"agent> Experiment recommendation: {text}")
+        printed += 1
+        if printed >= 3:
+            break
+
+
 def _safe_acceptance_criteria(raw: Any, *, task_type_hint: str | None = None) -> dict[str, float]:
     default = _default_acceptance_criteria(task_type_hint=task_type_hint)
     if not isinstance(raw, dict):
@@ -2725,6 +2765,7 @@ def _safe_loop_policy(raw: Any) -> dict[str, Any]:
             "allow_feature_set_expansion": True,
             "allow_lag_horizon_expansion": True,
             "allow_threshold_policy_tuning": True,
+            "suggest_more_data_when_stalled": True,
         }
     enabled = bool(raw.get("enabled", True))
     try:
@@ -2735,6 +2776,7 @@ def _safe_loop_policy(raw: Any) -> dict[str, Any]:
     allow_feature_set_expansion = bool(raw.get("allow_feature_set_expansion", True))
     allow_lag_horizon_expansion = bool(raw.get("allow_lag_horizon_expansion", True))
     allow_threshold_policy_tuning = bool(raw.get("allow_threshold_policy_tuning", True))
+    suggest_more_data_when_stalled = bool(raw.get("suggest_more_data_when_stalled", True))
     return {
         "enabled": enabled,
         "max_attempts": max_attempts,
@@ -2742,6 +2784,7 @@ def _safe_loop_policy(raw: Any) -> dict[str, Any]:
         "allow_feature_set_expansion": allow_feature_set_expansion,
         "allow_lag_horizon_expansion": allow_lag_horizon_expansion,
         "allow_threshold_policy_tuning": allow_threshold_policy_tuning,
+        "suggest_more_data_when_stalled": suggest_more_data_when_stalled,
     }
 
 
@@ -2911,6 +2954,7 @@ def _modeler_request_from_handoff(
                 "allow_feature_set_expansion": True,
                 "allow_lag_horizon_expansion": True,
                 "allow_threshold_policy_tuning": True,
+                "suggest_more_data_when_stalled": True,
             }
         ),
         "user_locked_model_family": False,

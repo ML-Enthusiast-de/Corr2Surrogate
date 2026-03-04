@@ -268,6 +268,44 @@ def test_train_surrogate_candidates_supports_fraud_detection_targets(
     assert test_metrics["pr_auc"] >= 0.35
 
 
+def test_train_surrogate_candidates_supports_lagged_binary_classification(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    csv_path = tmp_path / "classification_lagged.csv"
+    rows = ["time,feature_x,class_label"]
+    base = [0.9, 0.2, 0.8, 0.1, 0.7, 0.3, 0.85, 0.15]
+    values = [base[idx % len(base)] for idx in range(120)]
+    for idx in range(120):
+        x = values[idx]
+        label = 0 if idx < 2 else int(values[idx - 2] > 0.5)
+        rows.append(f"{idx},{x:.5f},{label}")
+    csv_path.write_text("\n".join(rows), encoding="utf-8")
+
+    registry = build_default_registry()
+    result = registry.execute(
+        "train_surrogate_candidates",
+        {
+            "data_path": str(csv_path),
+            "target_column": "class_label",
+            "feature_columns": ["feature_x"],
+            "requested_model_family": "lagged_logistic_regression",
+            "timestamp_column": "time",
+            "lag_horizon_samples": 2,
+            "run_id": "classification_lagged_run",
+        },
+    )
+    assert result.status == "ok"
+    payload = result.output
+    assert payload["task_profile"]["task_type"] == "binary_classification"
+    assert payload["requested_model_family"] == "lagged_logistic_regression"
+    assert payload["selected_model_family"] == "lagged_logistic_regression"
+    assert payload["lag_horizon_samples"] == 2
+    assert payload["selected_hyperparameters"]["threshold_policy"] == "auto"
+    assert payload["selected_hyperparameters"]["lag_horizon_samples"] == 2
+    assert payload["selected_metrics"]["test"]["f1"] >= 0.75
+
+
 def test_train_surrogate_candidates_honors_binary_threshold_policy(
     monkeypatch, tmp_path: Path
 ) -> None:

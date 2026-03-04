@@ -44,6 +44,7 @@ class LoopEvaluation:
     max_attempts: int
     unmet_criteria: list[str]
     recommendations: list[str] = field(default_factory=list)
+    trajectory_recommendations: list[str] = field(default_factory=list)
     summary: str = ""
 
 
@@ -123,6 +124,11 @@ def evaluate_training_iteration(
     max_attempts: int,
     min_relative_improvement: float = 0.02,
     previous_best_score: float | None = None,
+    task_type_hint: str | None = None,
+    data_mode: str | None = None,
+    feature_columns: list[str] | None = None,
+    target_column: str | None = None,
+    lag_horizon_samples: int | None = None,
 ) -> LoopEvaluation:
     """Assess model quality and decide whether to continue agentic loop."""
     unmet = _find_unmet_criteria(metrics=metrics, acceptance_criteria=acceptance_criteria)
@@ -142,6 +148,15 @@ def evaluate_training_iteration(
         min_relative_improvement=min_relative_improvement,
         previous_best_score=previous_best_score,
     )
+    trajectory_recommendations = _build_trajectory_recommendations(
+        metrics=metrics,
+        unmet_criteria=unmet,
+        task_type_hint=task_type_hint,
+        data_mode=data_mode,
+        feature_columns=feature_columns or [],
+        target_column=target_column,
+        lag_horizon_samples=lag_horizon_samples,
+    )
     can_retry = attempt < max_attempts
     summary = (
         "Acceptance criteria not met. Continuing optimization loop."
@@ -154,6 +169,7 @@ def evaluate_training_iteration(
         max_attempts=max_attempts,
         unmet_criteria=unmet,
         recommendations=recommendations,
+        trajectory_recommendations=trajectory_recommendations,
         summary=summary,
     )
 
@@ -255,3 +271,70 @@ def _build_recommendations(
             + ", ".join(unmet_criteria)
         )
     return recommendations
+
+
+def _build_trajectory_recommendations(
+    *,
+    metrics: dict[str, float],
+    unmet_criteria: list[str],
+    task_type_hint: str | None,
+    data_mode: str | None,
+    feature_columns: list[str],
+    target_column: str | None,
+    lag_horizon_samples: int | None,
+) -> list[str]:
+    if not unmet_criteria:
+        return []
+
+    task_type = str(task_type_hint or "").strip().lower()
+    mode = str(data_mode or "").strip().lower()
+    predictors = [str(item).strip() for item in feature_columns if str(item).strip()]
+    primary_predictors = predictors[: min(3, len(predictors))]
+    predictor_text = ", ".join(primary_predictors) if primary_predictors else "the current predictor set"
+    target_text = str(target_column or "the selected target").strip() or "the selected target"
+    lag_horizon = max(int(lag_horizon_samples or 0), 0)
+
+    suggestions: list[str] = []
+    if task_type in {"fraud_detection", "anomaly_detection"}:
+        suggestions.append(
+            f"Collect additional positive-event runs around the operating region covered by {predictor_text} so `{target_text}` sees more rare-event examples."
+        )
+        suggestions.append(
+            "Add hard negative and near-boundary examples that look similar to positives to improve precision-recall separation."
+        )
+        if mode == "time_series":
+            suggestions.append(
+                f"Record longer sequential windows spanning the lead-in to each event so temporal precursors are visible across at least {max(lag_horizon, 3)} samples."
+            )
+        return suggestions
+
+    if task_type in {"binary_classification", "multiclass_classification"}:
+        suggestions.append(
+            f"Collect more balanced label coverage in the predictor space defined by {predictor_text} so `{target_text}` sees all decision regions in train/validation/test."
+        )
+        suggestions.append(
+            "Add boundary-crossing examples near class transitions rather than only easy, well-separated cases."
+        )
+        if mode == "time_series":
+            suggestions.append(
+                f"Capture contiguous sequences through class transitions so lagged features can observe the state change over at least {max(lag_horizon, 3)} samples."
+            )
+        return suggestions
+
+    suggestions.append(
+        f"Run dense sweeps across the strongest current inputs ({predictor_text}) and include repeated low/mid/high operating points for `{target_text}`."
+    )
+    if mode == "time_series":
+        suggestions.append(
+            f"Add ramp-up and ramp-down trajectories that hold excitation long enough to cover at least {max(lag_horizon + 1, 4)} sequential samples."
+        )
+    else:
+        suggestions.append(
+            "Collect mixed-condition steady-state points that combine the current feature extremes instead of varying one factor at a time."
+        )
+    sample_count = metrics.get("n_samples")
+    if sample_count is not None and sample_count < 500:
+        suggestions.append(
+            "Increase dataset size with another acquisition batch before escalating to a more complex model family."
+        )
+    return suggestions

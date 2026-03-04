@@ -21,12 +21,15 @@ Corr2Surrogate is a local-first framework for converting real-world sensor data 
 - User task override command: `task regression`, `task binary_classification`, `task fraud_detection`, `task auto`
 - Split-safe Agent 2 training (train-only preprocessing, time-ordered splits for time series, stratified steady-state splits for classification labels)
 - Executable classifier baselines: `logistic_regression` and `bagged_tree_classifier`
+- Executable time-series classifier baselines: `lagged_logistic_regression` and `lagged_tree_classifier`
 - Validation-tuned decision thresholds for binary classification and fraud screening
 - Adaptive bounded optimization in Agent 2:
   - safe model-family switches
   - feature-set expansion
   - lag-window expansion
   - threshold-policy retuning for binary classifiers
+- Post-stall experiment guidance:
+  - when retries stop, Agent 2 proposes concrete next data-collection trajectories instead of only saying "collect more data"
 - First nonlinear modeling baseline: local bagged tree ensemble / tree classifier
 - Candidate comparison with LLM-assisted model interpretation in the CLI
 - Local runtime by default; optional API mode via explicit opt-in
@@ -189,8 +192,10 @@ Agent 1 now emits a model-strategy prior for each target. Agent 2 should treat t
 Current executable model families:
 - `linear_ridge`
 - `logistic_regression`
+- `lagged_logistic_regression`
 - `bagged_tree_classifier`
 - `lagged_linear`
+- `lagged_tree_classifier`
 - `lagged_tree_ensemble`
 - `bagged_tree_ensemble`
 
@@ -210,7 +215,6 @@ Current classification note:
 Recommended model families to implement next:
 - steady-state / tabular: add `ElasticNet`
 - stronger tabular baseline: add boosted-tree alternatives beyond the current bagged tree path
-- time-series classification: add lagged classifier baselines (`lagged_logistic`, lag-window tree classifier)
 - sequence models: `GRU`/`LSTM` only when lagged/tabular probes still leave meaningful residual dynamics
 
 Operational rule:
@@ -249,7 +253,8 @@ This is the planned implementation order to maximize practical value while keepi
 Current state:
 - steps 1-7 are now implemented in the first production path
 - the current modeler loop already performs bounded retries across model family, feature set, lag horizon, and binary threshold policy when the loop policy allows it
-- the next highest-value gaps are stronger boosted-tree families, lagged classifier families, post-failure experiment design, inference workflows, and uncertainty reporting
+- the current loop also prints concrete next experiment trajectories when retries stall
+- the next highest-value gaps are stronger boosted-tree families, deeper region-aware experiment design, inference workflows, and uncertainty reporting
 
 ## Modeling Entry Modes
 Two user entry paths are part of the intended product behavior:
@@ -259,7 +264,7 @@ Two user entry paths are part of the intended product behavior:
    - pass Agent 1 recommendations into Agent 2 as a prior
 2. Direct modeler mode (skip Agent 1):
    - user may immediately ask Agent 2 to build a model with explicit inputs and target
-   - current executable implementation supports `auto`, `linear_ridge`, `logistic_regression`, `bagged_tree_classifier`, `lagged_linear`, `lagged_tree_ensemble`, and `bagged_tree_ensemble`
+   - current executable implementation supports `auto`, `linear_ridge`, `logistic_regression`, `lagged_logistic_regression`, `bagged_tree_classifier`, `lagged_linear`, `lagged_tree_classifier`, `lagged_tree_ensemble`, and `bagged_tree_ensemble`
    - example intent: "build model `linear_ridge` with inputs `A,B,C` and target `D`"
    - this fast path should not require a prior Agent 1 handoff
 
@@ -273,9 +278,10 @@ Example direct modeler request:
 - `build model tree with inputs torque,temp,flow and target pressure`
 
 Current implementation note:
-- the direct modeler session currently executes `auto`, `linear_ridge` / `ridge` / `linear`, `logistic_regression` / `logistic` / `logit` / `linear_classifier`, `bagged_tree_classifier` / `tree_classifier`, `lagged_linear` / `lagged` / `temporal_linear` / `arx`, `lagged_tree_ensemble` / `lagged_tree` / `lag_window_tree` / `temporal_tree`, and `bagged_tree_ensemble` / `tree`
+- the direct modeler session currently executes `auto`, `linear_ridge` / `ridge` / `linear`, `logistic_regression` / `logistic` / `logit` / `linear_classifier`, `lagged_logistic_regression` / `lagged_logistic` / `lagged_logit` / `temporal_classifier`, `bagged_tree_classifier` / `tree_classifier`, `lagged_linear` / `lagged` / `temporal_linear` / `arx`, `lagged_tree_classifier` / `temporal_tree_classifier`, `lagged_tree_ensemble` / `lagged_tree` / `lag_window_tree` / `temporal_tree`, and `bagged_tree_ensemble` / `tree`
 - the modeler CLI now runs a split-safe comparison between the linear baseline and the available temporal/nonlinear comparators, performs a bounded acceptance check, and can retry with the next safe model family, expanded feature set, wider lag window, or retuned binary threshold when policy allows it
 - if the selected target looks like classification or fraud detection, the modeler reports that explicitly, applies the correct split policy, trains the local classifier candidates, and evaluates them with classification-aware metrics
+- if retries stop without meeting quality, the modeler prints concrete experiment recommendations for the next data collection pass
 - before a modeler run, users can steer binary decision policy with:
   - `threshold favor_recall`
   - `threshold favor_precision`

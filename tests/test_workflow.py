@@ -54,3 +54,21 @@ def test_evaluate_training_iteration_requests_retry_when_unmet() -> None:
     assert decision.should_continue
     assert "val_mae" in decision.unmet_criteria
     assert decision.recommendations
+
+
+def test_evaluate_training_iteration_adds_trajectory_guidance_when_stalled() -> None:
+    decision = evaluate_training_iteration(
+        metrics={"val_recall": 0.42, "val_pr_auc": 0.22, "n_samples": 180},
+        acceptance_criteria={"recall": 0.70, "pr_auc": 0.35},
+        attempt=3,
+        max_attempts=3,
+        task_type_hint="fraud_detection",
+        data_mode="time_series",
+        feature_columns=["amount_norm", "velocity_norm", "device_risk"],
+        target_column="fraud_flag",
+        lag_horizon_samples=4,
+    )
+    assert not decision.should_continue
+    assert "recall" in decision.unmet_criteria
+    assert decision.trajectory_recommendations
+    assert any("positive-event" in item or "sequential windows" in item for item in decision.trajectory_recommendations)

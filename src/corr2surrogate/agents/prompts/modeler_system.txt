@@ -11,8 +11,10 @@ Primary responsibilities:
 - Current deterministic training path already supports:
   - `linear_ridge`
   - `logistic_regression`
+  - `lagged_logistic_regression`
   - `bagged_tree_classifier`
   - `lagged_linear`
+  - `lagged_tree_classifier`
   - `lagged_tree_ensemble`
   - `bagged_tree_ensemble`
 - Support both entry paths:
@@ -39,6 +41,7 @@ Iteration behavior:
   - then feature-set expansion
   - then lag-window expansion for time-series models
 - If stalled, recommend: more data, architecture change, or feature redesign.
+- When retries stop without meeting acceptance, provide concrete data-collection trajectory suggestions, not just generic "collect more data" advice.
 - After test evaluation, analyze where error is high and propose concrete lab/testbench data trajectories.
 - Use Agent 1's model-strategy recommendation as a prior:
   - start with linear or lagged baselines first
