@@ -2,7 +2,11 @@
 
 from .baselines import IncrementalLinearSurrogate
 from .checkpoints import ModelCheckpoint, ModelCheckpointStore, RetrainPlan
-from .classifiers import BaggedTreeClassifierSurrogate, LogisticClassificationSurrogate
+from .classifiers import (
+    BaggedTreeClassifierSurrogate,
+    BoostedTreeClassifierSurrogate,
+    LogisticClassificationSurrogate,
+)
 from .normalization import MinMaxNormalizer
 from .performance_feedback import (
     BadRegion,
@@ -13,6 +17,7 @@ from .performance_feedback import (
 from .splitters import DatasetSplit, build_train_validation_test_split
 from .training import (
     BaggedTreeEnsembleSurrogate,
+    BoostedTreeEnsembleSurrogate,
     CandidateMetrics,
     LaggedLinearSurrogate,
     LaggedLogisticClassificationSurrogate,
@@ -26,6 +31,8 @@ __all__ = [
     "BadRegion",
     "BaggedTreeEnsembleSurrogate",
     "BaggedTreeClassifierSurrogate",
+    "BoostedTreeEnsembleSurrogate",
+    "BoostedTreeClassifierSurrogate",
     "CandidateMetrics",
     "DatasetSplit",
     "IncrementalLinearSurrogate",

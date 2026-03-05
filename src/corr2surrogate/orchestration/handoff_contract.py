@@ -296,8 +296,12 @@ def _recommended_model_for_task(
         return "lagged_logistic_regression" if is_temporal else "logistic_regression"
     if normalized == "lagged_tree_ensemble":
         return "lagged_tree_classifier" if is_temporal else "bagged_tree_classifier"
-    if normalized in {"bagged_tree_ensemble", "lagged_tree_ensemble", "tree_ensemble_candidate"}:
+    if normalized in {"bagged_tree_ensemble", "tree_ensemble_candidate"}:
         return "bagged_tree_classifier"
+    if normalized in {"boosted_tree_ensemble", "gradient_boosting", "hist_gradient_boosting"}:
+        return "boosted_tree_classifier"
+    if normalized == "lagged_tree_ensemble":
+        return "lagged_tree_classifier" if is_temporal else "bagged_tree_classifier"
     return "logistic_regression"
 
 

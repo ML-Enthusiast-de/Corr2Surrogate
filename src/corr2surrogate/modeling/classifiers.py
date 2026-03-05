@@ -217,6 +217,157 @@ class BaggedTreeClassifierSurrogate:
         return write_json(output, self.state_dict(), indent=2)
 
 
+class BoostedTreeClassifierSurrogate:
+    """Simple SAMME-style boosted tree classifier with local decision trees."""
+
+    def __init__(
+        self,
+        *,
+        feature_columns: list[str],
+        target_column: str,
+        n_estimators: int = 24,
+        learning_rate: float = 0.6,
+        max_depth: int = 3,
+        min_leaf: int = 5,
+    ) -> None:
+        if not feature_columns:
+            raise ValueError("feature_columns cannot be empty.")
+        self.feature_columns = list(feature_columns)
+        self.target_column = target_column
+        self.n_estimators = int(n_estimators)
+        self.learning_rate = float(learning_rate)
+        self.max_depth = int(max_depth)
+        self.min_leaf = int(min_leaf)
+        self.class_labels: list[str] = []
+        self._estimators: list[dict[str, Any]] = []
+
+    def fit_dataframe(self, frame: pd.DataFrame) -> int:
+        x = _prepare_feature_matrix(frame=frame, feature_columns=self.feature_columns)
+        y_labels = _prepare_label_vector(frame=frame, target_column=self.target_column)
+        if x.shape[0] == 0:
+            raise ValueError("No valid rows available for boosted classifier training.")
+        self.class_labels = sorted({label for label in y_labels})
+        if len(self.class_labels) < 2:
+            raise ValueError("Classification requires at least two target classes.")
+
+        label_to_idx = {label: idx for idx, label in enumerate(self.class_labels)}
+        y = np.asarray([label_to_idx[label] for label in y_labels], dtype=int)
+        n_rows = int(x.shape[0])
+        n_classes = int(len(self.class_labels))
+        feature_count = int(x.shape[1])
+        feature_subsample = max(1, int(feature_count))
+        weights = np.full(n_rows, 1.0 / n_rows, dtype=float)
+        self._estimators = []
+
+        for step in range(self.n_estimators):
+            rng = np.random.default_rng(900 + step)
+            row_idx = rng.choice(n_rows, size=n_rows, replace=True, p=weights).astype(int)
+            feat_idx = np.sort(
+                rng.choice(feature_count, size=feature_subsample, replace=False)
+            ).astype(int)
+            tree = _fit_classification_tree(
+                x_train=x[row_idx][:, feat_idx],
+                y_train=y[row_idx],
+                depth=0,
+                max_depth=self.max_depth,
+                min_leaf=min(self.min_leaf, max(2, n_rows // 10)),
+                n_classes=n_classes,
+            )
+            prob = _predict_classification_tree_batch(
+                tree=tree,
+                x=x[:, feat_idx],
+                n_classes=n_classes,
+            )
+            pred = np.argmax(prob, axis=1).astype(int)
+            miss = (pred != y).astype(float)
+            weighted_error = float(np.sum(weights * miss))
+            weighted_error = min(max(weighted_error, 1e-6), 1.0 - 1e-6)
+
+            if n_classes > 2:
+                alpha = self.learning_rate * (
+                    math.log((1.0 - weighted_error) / weighted_error) + math.log(n_classes - 1.0)
+                )
+            else:
+                alpha = self.learning_rate * 0.5 * math.log((1.0 - weighted_error) / weighted_error)
+
+            if not math.isfinite(alpha):
+                continue
+            weights *= np.exp(alpha * miss)
+            weight_sum = float(np.sum(weights))
+            if weight_sum <= 0.0 or not math.isfinite(weight_sum):
+                break
+            weights /= weight_sum
+            self._estimators.append(
+                {
+                    "feature_indices": feat_idx.tolist(),
+                    "tree": tree,
+                    "alpha": float(alpha),
+                }
+            )
+            if weighted_error <= 1e-4:
+                break
+
+        if not self._estimators:
+            raise RuntimeError("Boosted classifier failed to build any valid weak learner.")
+        return n_rows
+
+    def predict_proba_dataframe(self, frame: pd.DataFrame) -> np.ndarray:
+        if not self._estimators:
+            raise RuntimeError("Boosted classifier has not been fitted yet.")
+        x = _prepare_feature_matrix(frame=frame, feature_columns=self.feature_columns)
+        n_classes = len(self.class_labels)
+        scores = np.zeros((x.shape[0], n_classes), dtype=float)
+        for estimator in self._estimators:
+            feat_idx = np.asarray(estimator["feature_indices"], dtype=int)
+            alpha = float(estimator.get("alpha", 1.0))
+            probs = _predict_classification_tree_batch(
+                tree=estimator["tree"],
+                x=x[:, feat_idx],
+                n_classes=n_classes,
+            )
+            pred_idx = np.argmax(probs, axis=1)
+            scores[np.arange(x.shape[0]), pred_idx] += alpha
+        shifted = scores - np.max(scores, axis=1, keepdims=True)
+        exp_scores = np.exp(np.clip(shifted, -40.0, 40.0))
+        denom = np.sum(exp_scores, axis=1, keepdims=True)
+        denom[denom <= 1e-12] = 1.0
+        return exp_scores / denom
+
+    def predict_dataframe(self, frame: pd.DataFrame) -> np.ndarray:
+        probs = self.predict_proba_dataframe(frame)
+        labels = np.asarray(self.class_labels, dtype=object)
+        return labels[np.argmax(probs, axis=1)]
+
+    def evaluate_dataframe(self, frame: pd.DataFrame) -> dict[str, float]:
+        y_true = _prepare_label_vector(frame=frame, target_column=self.target_column)
+        probs = self.predict_proba_dataframe(frame)
+        return classification_metrics(
+            y_true=y_true,
+            probabilities=probs,
+            class_labels=self.class_labels,
+        ).to_dict()
+
+    def state_dict(self) -> dict[str, Any]:
+        if not self._estimators:
+            raise RuntimeError("Boosted classifier has not been fitted yet.")
+        return {
+            "model_name": "boosted_tree_classifier",
+            "feature_columns": list(self.feature_columns),
+            "target_column": self.target_column,
+            "n_estimators": int(self.n_estimators),
+            "learning_rate": float(self.learning_rate),
+            "max_depth": int(self.max_depth),
+            "min_leaf": int(self.min_leaf),
+            "class_labels": list(self.class_labels),
+            "estimators": self._estimators,
+        }
+
+    def save(self, path: str | Path) -> Path:
+        output = Path(path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        return write_json(output, self.state_dict(), indent=2)
+
+
 def _prepare_feature_matrix(*, frame: pd.DataFrame, feature_columns: list[str]) -> np.ndarray:
     subset = frame[feature_columns].copy()
     if subset.isna().any().any():

@@ -2460,6 +2460,112 @@ def test_cli_modeler_prints_experiment_recommendations_when_stalled(
     assert "Experiment recommendation: Run dense sweeps across the strongest current inputs" in output
 
 
+def test_cli_modeler_prints_professional_analysis_and_suggestions(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    data_path = tmp_path / "model_professional.csv"
+    data_path.write_text("A,B,C\n1,2,3\n", encoding="utf-8")
+    inputs = iter(
+        [
+            "build model boosted_tree_ensemble with inputs A,B and target C",
+            str(data_path),
+            "/exit",
+        ]
+    )
+    registry = _SessionRegistry(
+        scripted_outputs={
+            "prepare_ingestion_step": [
+                {
+                    "status": "ok",
+                    "message": "Ingestion ready.",
+                    "options": [],
+                    "selected_sheet": None,
+                    "available_sheets": [],
+                    "header_row": 0,
+                    "data_start_row": 1,
+                    "header_confidence": 1.0,
+                    "needs_user_confirmation": False,
+                    "row_count": 80,
+                    "column_count": 3,
+                    "signal_columns": ["A", "B", "C"],
+                    "numeric_signal_columns": ["A", "B", "C"],
+                    "timestamp_column_hint": None,
+                }
+            ],
+            "train_surrogate_candidates": [
+                {
+                    "status": "ok",
+                    "checkpoint_id": "ckpt_prof_1",
+                    "run_dir": "artifacts/run_prof_1",
+                    "selected_model_family": "boosted_tree_ensemble",
+                    "best_validation_model_family": "boosted_tree_ensemble",
+                    "lag_horizon_samples": 0,
+                    "split": {
+                        "strategy": "deterministic_modulo_70_15_15",
+                        "train_size": 56,
+                        "validation_size": 12,
+                        "test_size": 12,
+                    },
+                    "preprocessing": {
+                        "missing_data_strategy_requested": "fill_median",
+                        "missing_data_strategy_effective": "fill_median_train_only",
+                    },
+                    "normalization": {"method": "minmax"},
+                    "comparison": [
+                        {
+                            "model_family": "linear_ridge",
+                            "validation_metrics": {"r2": 0.56, "mae": 0.27},
+                            "test_metrics": {"r2": 0.54, "mae": 0.29},
+                        },
+                        {
+                            "model_family": "boosted_tree_ensemble",
+                            "validation_metrics": {"r2": 0.84, "mae": 0.12},
+                            "test_metrics": {"r2": 0.82, "mae": 0.13},
+                        },
+                    ],
+                    "professional_analysis": {
+                        "summary": "Boosted tree fit is strong with manageable generalization gap.",
+                        "diagnostics": ["Generalization gap (MAE): train=0.10, val=0.12, ratio=1.20."],
+                        "risk_flags": ["monitor_extrapolation_regions"],
+                        "suggestions": [
+                            "Collect dense sweeps near the high-error x1 range.",
+                            "Add mixed-condition points at feature extremes.",
+                        ],
+                    },
+                    "selected_metrics": {
+                        "train": {"r2": 0.88, "mae": 0.10},
+                        "validation": {"r2": 0.84, "mae": 0.12},
+                        "test": {"r2": 0.82, "mae": 0.13},
+                    },
+                    "rows_used": 56,
+                }
+            ],
+            "evaluate_training_iteration": [
+                {
+                    "should_continue": False,
+                    "attempt": 1,
+                    "max_attempts": 3,
+                    "unmet_criteria": [],
+                    "recommendations": ["Quality criteria met. Proceed to artifact export."],
+                    "summary": "Model meets all acceptance criteria.",
+                }
+            ],
+        }
+    )
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
+
+    exit_code = main(["run-agent-session", "--agent", "modeler"])
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Professional analysis: Boosted tree fit is strong" in output
+    assert "Diagnostic: Generalization gap (MAE)" in output
+    assert "Risk flags: monitor_extrapolation_regions." in output
+    assert "Suggestion: Collect dense sweeps near the high-error x1 range." in output
+
+
 def test_cli_modeler_threshold_override_is_applied_to_training_args(
     monkeypatch, capsys, tmp_path: Path
 ) -> None:

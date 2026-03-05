@@ -65,9 +65,10 @@ Outputs:
   - sequence models only after simpler lagged/tabular baselines fail
 - Current executable baseline path:
   - direct modeler mode and Agent 1 structured-report handoff both reach a split-safe trainer
-  - executable families today: `linear_ridge`, `logistic_regression`, `lagged_logistic_regression`, `bagged_tree_classifier`, `lagged_linear`, `lagged_tree_classifier`, `lagged_tree_ensemble`, `bagged_tree_ensemble`
+  - executable families today: `linear_ridge`, `logistic_regression`, `lagged_logistic_regression`, `bagged_tree_classifier`, `boosted_tree_classifier`, `lagged_linear`, `lagged_tree_classifier`, `lagged_tree_ensemble`, `bagged_tree_ensemble`, `boosted_tree_ensemble`
   - classification / fraud targets now train local classifier baselines with task-aware acceptance checks instead of stopping at detection
   - modeler compares available candidates, runs a bounded acceptance check, can retry with the next safe family when policy allows it, and can also expand the feature set, widen the lag window, or retune binary thresholds inside the same bounded loop
+  - every training attempt emits professional diagnostics (generalization gaps, risk flags, high-error regions, and targeted suggestions)
   - if retries stall, modeler emits concrete next experiment / data-collection trajectory suggestions
   - persists artifacts, then lets the LLM interpret the measured result
 - User control:
@@ -190,7 +191,7 @@ Add GRU / LSTM only after lagged and tree-based baselines are in place.
 Current status:
 - steps 1-7 are now implemented in the first production path
 - bounded acceptance-loop retries are already active across model family, feature set, lag horizon, and binary threshold policy when allowed by loop policy
-- a first post-stall experiment-guidance layer is implemented; remaining work is stronger boosted-tree families, deeper region-aware experiment design, inference-first workflows, uncertainty estimation, and later Optuna
+- boosted-tree baselines and a first post-stall experiment-guidance layer are implemented; remaining work is deeper region-aware experiment design, inference-first workflows, uncertainty estimation, and later Optuna
 
 ## 11. Bounded LLM Autonomy
 The LLM should act as an agent, but not as an uncontrolled replacement for deterministic analytics.

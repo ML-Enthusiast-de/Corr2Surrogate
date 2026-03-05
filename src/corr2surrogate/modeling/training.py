@@ -15,9 +15,14 @@ from corr2surrogate.core.json_utils import write_json
 from corr2surrogate.persistence.artifact_store import ArtifactStore
 from .baselines import IncrementalLinearSurrogate
 from .checkpoints import ModelCheckpointStore
-from .classifiers import BaggedTreeClassifierSurrogate, LogisticClassificationSurrogate
+from .classifiers import (
+    BaggedTreeClassifierSurrogate,
+    BoostedTreeClassifierSurrogate,
+    LogisticClassificationSurrogate,
+)
 from .evaluation import classification_metrics, regression_metrics
 from .normalization import MinMaxNormalizer
+from .performance_feedback import analyze_model_performance
 from .splitters import DatasetSplit, build_train_validation_test_split
 
 
@@ -39,11 +44,13 @@ _MODEL_TIEBREAK = {
     "linear_ridge": 0,
     "lagged_linear": 1,
     "bagged_tree_ensemble": 2,
-    "lagged_tree_ensemble": 3,
+    "boosted_tree_ensemble": 3,
+    "lagged_tree_ensemble": 4,
     "logistic_regression": 0,
     "lagged_logistic_regression": 1,
     "bagged_tree_classifier": 2,
-    "lagged_tree_classifier": 3,
+    "boosted_tree_classifier": 3,
+    "lagged_tree_classifier": 4,
 }
 
 
@@ -91,7 +98,15 @@ def normalize_candidate_model_family(requested_model_family: str) -> str | None:
         "tree_ensemble_candidate": "bagged_tree_ensemble",
         "tree": "bagged_tree_ensemble",
         "extra_trees": "bagged_tree_ensemble",
-        "hist_gradient_boosting": "bagged_tree_ensemble",
+        "boosted_tree_ensemble": "boosted_tree_ensemble",
+        "boosted_tree": "boosted_tree_ensemble",
+        "gradient_boosting": "boosted_tree_ensemble",
+        "hist_gradient_boosting": "boosted_tree_ensemble",
+        "gbdt": "boosted_tree_ensemble",
+        "boosted_tree_classifier": "boosted_tree_classifier",
+        "gradient_boosting_classifier": "boosted_tree_classifier",
+        "hist_gradient_boosting_classifier": "boosted_tree_classifier",
+        "gbdt_classifier": "boosted_tree_classifier",
     }
     return aliases.get(normalized)
 
@@ -142,8 +157,10 @@ def train_surrogate_candidates(
             "lagged_linear/lagged/temporal_linear/arx, "
             "lagged_tree_classifier/temporal_tree_classifier, "
             "lagged_tree_ensemble/lagged_tree/lag_window_tree/temporal_tree, "
-            "bagged_tree_ensemble/tree/tree_ensemble/extra_trees/hist_gradient_boosting, "
-            "bagged_tree_classifier/tree_classifier/classifier_tree."
+            "bagged_tree_ensemble/tree/tree_ensemble/extra_trees, "
+            "boosted_tree_ensemble/gradient_boosting/hist_gradient_boosting, "
+            "bagged_tree_classifier/tree_classifier/classifier_tree, "
+            "boosted_tree_classifier/gradient_boosting_classifier."
         )
     requested = _resolve_requested_for_task(
         requested=requested,
@@ -280,6 +297,27 @@ def train_surrogate_candidates(
             )
         )
 
+    boosted_tree_model: BoostedTreeEnsembleSurrogate | None = None
+    if compare_against_baseline or requested == "boosted_tree_ensemble":
+        boosted_tree_model = BoostedTreeEnsembleSurrogate(
+            feature_columns=feature_columns,
+            target_column=target_column,
+        )
+        boosted_rows_used = boosted_tree_model.fit_dataframe(prepared_frames["train"])
+        rows_used_by_model["boosted_tree_ensemble"] = int(boosted_rows_used)
+        boosted_notes = (
+            "Stage-wise boosted depth-limited regression trees for stronger nonlinear fitting. "
+            f"Train rows used={boosted_rows_used}."
+        )
+        candidates.append(
+            _candidate_metrics_from_model(
+                model_family="boosted_tree_ensemble",
+                model=boosted_tree_model,
+                frames=prepared_frames,
+                notes=boosted_notes,
+            )
+        )
+
     best_by_validation = _select_best_candidate(candidates, task_type=task_profile.task_type)
     selected_candidate = _resolve_selected_candidate(
         requested=requested,
@@ -296,6 +334,8 @@ def train_surrogate_candidates(
         selected_model_obj = lagged_tree_model
     elif selected_model_name == "bagged_tree_ensemble" and tree_model is not None:
         selected_model_obj = tree_model
+    elif selected_model_name == "boosted_tree_ensemble" and boosted_tree_model is not None:
+        selected_model_obj = boosted_tree_model
     else:
         raise RuntimeError("Selected model object is unavailable.")
 
@@ -316,7 +356,17 @@ def train_surrogate_candidates(
         lagged_model=lagged_model,
         lagged_tree_model=lagged_tree_model,
         tree_model=tree_model,
+        boosted_tree_model=boosted_tree_model,
         requested=requested,
+    )
+    professional_analysis = _build_regression_professional_analysis(
+        selected_model_name=selected_model_name,
+        selected_model_obj=selected_model_obj,
+        selected_candidate=selected_candidate,
+        prepared_frames=prepared_frames,
+        feature_columns=feature_columns,
+        target_column=target_column,
+        lag_horizon_samples=lagged_horizon,
     )
     params_path = artifact_store.save_model_params(
         run_dir=run_dir,
@@ -336,6 +386,7 @@ def train_surrogate_candidates(
             "split": split.to_dict(),
             "preprocessing": preprocessing,
             "comparison": [item.to_dict() for item in candidates],
+            "professional_analysis": professional_analysis,
         },
     )
     checkpoint_store = ModelCheckpointStore()
@@ -375,6 +426,7 @@ def train_surrogate_candidates(
         "lag_horizon_samples": int(lagged_horizon) if lagged_horizon is not None else 0,
         "rows_used": int(rows_used_by_model.get(selected_model_name, prepared_frames["train"].shape[0])),
         "rows_used_by_model": rows_used_by_model,
+        "professional_analysis": professional_analysis,
         "selected_metrics": {
             "train": selected_candidate.train_metrics,
             "validation": selected_candidate.validation_metrics,
@@ -391,6 +443,7 @@ def _resolve_requested_for_task(*, requested: str, task_type: str) -> str:
         "logistic_regression",
         "lagged_logistic_regression",
         "bagged_tree_classifier",
+        "boosted_tree_classifier",
         "lagged_tree_classifier",
     }:
         return requested
@@ -400,6 +453,8 @@ def _resolve_requested_for_task(*, requested: str, task_type: str) -> str:
         return "lagged_logistic_regression"
     if requested == "bagged_tree_ensemble":
         return "bagged_tree_classifier"
+    if requested == "boosted_tree_ensemble":
+        return "boosted_tree_classifier"
     if requested == "lagged_tree_ensemble":
         return "lagged_tree_classifier"
     return requested
@@ -535,6 +590,31 @@ def _train_classification_candidates(
             candidates[-1].train_metrics.get("decision_threshold", 0.5)
         )
 
+    boosted_tree_classifier: BoostedTreeClassifierSurrogate | None = None
+    if compare_against_baseline or requested == "boosted_tree_classifier":
+        boosted_tree_classifier = BoostedTreeClassifierSurrogate(
+            feature_columns=feature_columns,
+            target_column=target_column,
+        )
+        boosted_rows_used = boosted_tree_classifier.fit_dataframe(prepared_frames["train"])
+        rows_used_by_model["boosted_tree_classifier"] = int(boosted_rows_used)
+        boosted_candidate = _classification_candidate_metrics_from_model(
+            model_family="boosted_tree_classifier",
+            model=boosted_tree_classifier,
+            frames=prepared_frames,
+            task_type=str(task_profile.task_type),
+            threshold_policy=threshold_policy,
+            decision_threshold=decision_threshold,
+            notes=(
+                "Stage-wise boosted depth-limited tree classifier for stronger nonlinear decision boundaries. "
+                f"Train rows used={boosted_rows_used}."
+            ),
+        )
+        candidates.append(boosted_candidate)
+        classifier_thresholds["boosted_tree_classifier"] = float(
+            boosted_candidate.train_metrics.get("decision_threshold", 0.5)
+        )
+
     lagged_tree_classifier: LaggedTreeClassifierSurrogate | None = None
     if lagged_horizon is not None and (compare_against_baseline or requested == "lagged_tree_classifier"):
         lagged_tree_classifier = LaggedTreeClassifierSurrogate(
@@ -574,6 +654,8 @@ def _train_classification_candidates(
         selected_model_obj = lagged_logistic_model
     elif selected_model_name == "bagged_tree_classifier" and tree_classifier is not None:
         selected_model_obj = tree_classifier
+    elif selected_model_name == "boosted_tree_classifier" and boosted_tree_classifier is not None:
+        selected_model_obj = boosted_tree_classifier
     elif selected_model_name == "lagged_tree_classifier" and lagged_tree_classifier is not None:
         selected_model_obj = lagged_tree_classifier
     else:
@@ -636,6 +718,20 @@ def _train_classification_candidates(
                 ),
             }
         )
+    elif selected_model_name == "boosted_tree_classifier" and boosted_tree_classifier is not None:
+        selected_hyperparameters.update(
+            {
+                "n_estimators": int(boosted_tree_classifier.n_estimators),
+                "learning_rate": float(boosted_tree_classifier.learning_rate),
+                "max_depth": int(boosted_tree_classifier.max_depth),
+                "min_leaf": int(boosted_tree_classifier.min_leaf),
+                "training_rows_used": int(rows_used_by_model.get("boosted_tree_classifier", 0)),
+                "class_count": int(len(boosted_tree_classifier.class_labels)),
+                "decision_threshold": float(
+                    classifier_thresholds.get("boosted_tree_classifier", 0.5)
+                ),
+            }
+        )
     elif tree_classifier is not None:
         selected_hyperparameters.update(
             {
@@ -649,6 +745,16 @@ def _train_classification_candidates(
                 ),
             }
         )
+
+    professional_analysis = _build_classification_professional_analysis(
+        selected_model_name=selected_model_name,
+        selected_model_obj=selected_model_obj,
+        selected_candidate=selected_candidate,
+        prepared_frames=prepared_frames,
+        feature_columns=feature_columns,
+        target_column=target_column,
+        task_type=str(task_profile.task_type),
+    )
 
     params_path = artifact_store.save_model_params(
         run_dir=run_dir,
@@ -671,6 +777,7 @@ def _train_classification_candidates(
             "decision_thresholds": classifier_thresholds,
             "threshold_policy": str(threshold_policy or "").strip() or "auto",
             "lag_horizon_samples": int(lagged_horizon) if lagged_horizon is not None else 0,
+            "professional_analysis": professional_analysis,
         },
     )
     checkpoint_store = ModelCheckpointStore()
@@ -709,6 +816,7 @@ def _train_classification_candidates(
         "lag_horizon_samples": int(lagged_horizon) if lagged_horizon is not None else 0,
         "rows_used": int(rows_used_by_model.get(selected_model_name, prepared_frames["train"].shape[0])),
         "rows_used_by_model": rows_used_by_model,
+        "professional_analysis": professional_analysis,
         "selected_metrics": {
             "train": selected_candidate.train_metrics,
             "validation": selected_candidate.validation_metrics,
@@ -744,7 +852,7 @@ class BaggedTreeEnsembleSurrogate:
             raise ValueError("No valid numeric rows available for tree training.")
         self._estimators = []
         feature_count = x.shape[1]
-        feature_subsample = max(1, int(math.sqrt(feature_count)))
+        feature_subsample = max(1, int(feature_count))
         for seed in range(self.n_estimators):
             rng = np.random.default_rng(100 + seed)
             row_idx = rng.integers(0, x.shape[0], size=x.shape[0])
@@ -795,6 +903,104 @@ class BaggedTreeEnsembleSurrogate:
             "n_estimators": self.n_estimators,
             "max_depth": self.max_depth,
             "min_leaf": self.min_leaf,
+            "estimators": self._estimators,
+        }
+
+    def save(self, path: str | Path) -> Path:
+        output = Path(path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        return write_json(output, self.state_dict(), indent=2)
+
+
+class BoostedTreeEnsembleSurrogate:
+    """Simple gradient-boosted regression trees with local weak learners."""
+
+    def __init__(
+        self,
+        *,
+        feature_columns: list[str],
+        target_column: str,
+        n_estimators: int = 28,
+        learning_rate: float = 0.25,
+        max_depth: int = 3,
+        min_leaf: int = 5,
+    ) -> None:
+        if not feature_columns:
+            raise ValueError("feature_columns cannot be empty.")
+        self.feature_columns = list(feature_columns)
+        self.target_column = target_column
+        self.n_estimators = int(n_estimators)
+        self.learning_rate = float(learning_rate)
+        self.max_depth = int(max_depth)
+        self.min_leaf = int(min_leaf)
+        self._bias: float = 0.0
+        self._estimators: list[dict[str, Any]] = []
+
+    def fit_dataframe(self, frame: pd.DataFrame) -> int:
+        x, y = _prepare_xy(frame=frame, feature_columns=self.feature_columns, target_column=self.target_column)
+        if x.shape[0] == 0:
+            raise ValueError("No valid numeric rows available for boosted tree training.")
+        self._bias = float(np.mean(y))
+        residual = y - self._bias
+        self._estimators = []
+        feature_count = x.shape[1]
+        feature_subsample = max(1, int(math.sqrt(feature_count)))
+        for step in range(self.n_estimators):
+            rng = np.random.default_rng(300 + step)
+            feat_idx = np.sort(
+                rng.choice(feature_count, size=feature_subsample, replace=False)
+            ).astype(int)
+            tree = _fit_regression_tree(
+                x_train=x[:, feat_idx],
+                y_train=residual,
+                depth=0,
+                max_depth=self.max_depth,
+                min_leaf=min(self.min_leaf, max(2, x.shape[0] // 10)),
+            )
+            update = _predict_regression_tree_batch(tree=tree, x=x[:, feat_idx])
+            residual = residual - (self.learning_rate * update)
+            self._estimators.append(
+                {
+                    "feature_indices": feat_idx.tolist(),
+                    "tree": tree,
+                }
+            )
+            if float(np.std(residual)) <= 1e-7:
+                break
+        if not self._estimators:
+            raise RuntimeError("Boosted tree ensemble failed to produce any weak learner.")
+        return int(x.shape[0])
+
+    def predict_dataframe(self, frame: pd.DataFrame) -> np.ndarray:
+        if not self._estimators:
+            raise RuntimeError("Boosted tree ensemble has not been fitted yet.")
+        x = _prepare_feature_matrix(frame=frame, feature_columns=self.feature_columns)
+        pred = np.full(x.shape[0], self._bias, dtype=float)
+        for estimator in self._estimators:
+            feat_idx = np.asarray(estimator["feature_indices"], dtype=int)
+            pred += self.learning_rate * _predict_regression_tree_batch(
+                tree=estimator["tree"],
+                x=x[:, feat_idx],
+            )
+        return pred.astype(float)
+
+    def evaluate_dataframe(self, frame: pd.DataFrame) -> dict[str, float]:
+        y_true = _prepare_target_vector(frame=frame, target_column=self.target_column)
+        y_pred = self.predict_dataframe(frame)
+        return regression_metrics(y_true=y_true, y_pred=y_pred).to_dict()
+
+    def state_dict(self) -> dict[str, Any]:
+        if not self._estimators:
+            raise RuntimeError("Boosted tree ensemble has not been fitted yet.")
+        return {
+            "model_name": "boosted_tree_ensemble",
+            "feature_columns": list(self.feature_columns),
+            "target_column": self.target_column,
+            "n_estimators": int(self.n_estimators),
+            "learning_rate": float(self.learning_rate),
+            "max_depth": int(self.max_depth),
+            "min_leaf": int(self.min_leaf),
+            "bias": float(self._bias),
             "estimators": self._estimators,
         }
 
@@ -1577,6 +1783,7 @@ def _best_params_payload(
     lagged_model: LaggedLinearSurrogate | None,
     lagged_tree_model: LaggedTreeEnsembleSurrogate | None,
     tree_model: BaggedTreeEnsembleSurrogate | None,
+    boosted_tree_model: BoostedTreeEnsembleSurrogate | None,
     requested: str,
 ) -> dict[str, Any]:
     if selected_model_name == "linear_ridge":
@@ -1601,6 +1808,14 @@ def _best_params_payload(
             "min_leaf": int(lagged_tree_model.min_leaf),
             "training_feature_count": int(len(lagged_tree_model._lagged_feature_columns)),
         }
+    if selected_model_name == "boosted_tree_ensemble" and boosted_tree_model is not None:
+        return {
+            "requested_model_family": requested,
+            "n_estimators": int(boosted_tree_model.n_estimators),
+            "learning_rate": float(boosted_tree_model.learning_rate),
+            "max_depth": int(boosted_tree_model.max_depth),
+            "min_leaf": int(boosted_tree_model.min_leaf),
+        }
     if tree_model is not None:
         return {
             "requested_model_family": requested,
@@ -1609,6 +1824,309 @@ def _best_params_payload(
             "min_leaf": int(tree_model.min_leaf),
         }
     return {"requested_model_family": requested}
+
+
+def _build_regression_professional_analysis(
+    *,
+    selected_model_name: str,
+    selected_model_obj: Any,
+    selected_candidate: CandidateMetrics,
+    prepared_frames: dict[str, pd.DataFrame],
+    feature_columns: list[str],
+    target_column: str,
+    lag_horizon_samples: int | None,
+) -> dict[str, Any]:
+    train = selected_candidate.train_metrics
+    validation = selected_candidate.validation_metrics
+    test = selected_candidate.test_metrics
+    train_mae = _metric_or_none(train, "mae")
+    val_mae = _metric_or_none(validation, "mae")
+    train_r2 = _metric_or_none(train, "r2")
+    val_r2 = _metric_or_none(validation, "r2")
+    test_r2 = _metric_or_none(test, "r2")
+
+    diagnostics: list[str] = []
+    risk_flags: list[str] = []
+    if train_mae is not None and val_mae is not None:
+        ratio = val_mae / max(train_mae, 1e-9)
+        diagnostics.append(
+            f"Generalization gap (MAE): train={train_mae:.4f}, val={val_mae:.4f}, ratio={ratio:.3f}."
+        )
+        if ratio > 1.25:
+            risk_flags.append("overfitting_risk_high")
+    if train_r2 is not None and val_r2 is not None:
+        diagnostics.append(
+            f"Generalization gap (R2): train={train_r2:.4f}, val={val_r2:.4f}, delta={train_r2 - val_r2:.4f}."
+        )
+    if test_r2 is not None and test_r2 < 0.50:
+        risk_flags.append("underfitting_or_coverage_gap")
+
+    feature_eval, y_true, y_pred = _extract_regression_eval_payload(
+        selected_model_name=selected_model_name,
+        selected_model_obj=selected_model_obj,
+        prepared_frames=prepared_frames,
+        feature_columns=feature_columns,
+        target_column=target_column,
+    )
+    feedback = analyze_model_performance(
+        y_true=y_true,
+        y_pred=y_pred,
+        feature_frame=feature_eval,
+        top_k_regions=3,
+        trajectory_budget=3,
+    )
+    feedback_payload = feedback.to_dict()
+    residual = np.asarray(y_pred, dtype=float) - np.asarray(y_true, dtype=float)
+    diagnostics.append(
+        f"Residual check: mean={float(np.mean(residual)):.4f}, std={float(np.std(residual)):.4f}, abs_max={float(np.max(np.abs(residual))):.4f}."
+    )
+
+    suggestions = [
+        str(item.get("rationale", "")).strip()
+        for item in feedback_payload.get("trajectory_suggestions", [])
+        if isinstance(item, dict) and str(item.get("rationale", "")).strip()
+    ]
+    summary = (
+        f"{feedback_payload.get('summary', 'Regression evaluation complete.')} "
+        f"Selected model `{selected_model_name}` with lag_horizon={int(lag_horizon_samples or 0)}."
+    )
+    return {
+        "summary": summary.strip(),
+        "diagnostics": diagnostics,
+        "risk_flags": risk_flags,
+        "high_error_regions": feedback_payload.get("bad_regions", []),
+        "suggestions": suggestions[:3],
+    }
+
+
+def _build_classification_professional_analysis(
+    *,
+    selected_model_name: str,
+    selected_model_obj: Any,
+    selected_candidate: CandidateMetrics,
+    prepared_frames: dict[str, pd.DataFrame],
+    feature_columns: list[str],
+    target_column: str,
+    task_type: str,
+) -> dict[str, Any]:
+    train = selected_candidate.train_metrics
+    validation = selected_candidate.validation_metrics
+    test = selected_candidate.test_metrics
+    train_f1 = _metric_or_none(train, "f1")
+    val_f1 = _metric_or_none(validation, "f1")
+    train_recall = _metric_or_none(train, "recall")
+    val_recall = _metric_or_none(validation, "recall")
+    test_recall = _metric_or_none(test, "recall")
+    test_pr_auc = _metric_or_none(test, "pr_auc")
+
+    diagnostics: list[str] = []
+    risk_flags: list[str] = []
+    if train_f1 is not None and val_f1 is not None:
+        diagnostics.append(
+            f"Generalization gap (F1): train={train_f1:.4f}, val={val_f1:.4f}, delta={train_f1 - val_f1:.4f}."
+        )
+        if train_f1 > max(val_f1 + 0.10, val_f1 * 1.10):
+            risk_flags.append("overfitting_risk_high")
+    if train_recall is not None and val_recall is not None:
+        diagnostics.append(
+            f"Minority recall stability: train={train_recall:.4f}, val={val_recall:.4f}."
+        )
+
+    feature_eval, y_true, y_pred, probs, class_labels, decision_threshold = _extract_classification_eval_payload(
+        selected_model_name=selected_model_name,
+        selected_model_obj=selected_model_obj,
+        selected_candidate=selected_candidate,
+        prepared_frames=prepared_frames,
+        feature_columns=feature_columns,
+        target_column=target_column,
+    )
+    regions = _analyze_classification_error_regions(
+        feature_frame=feature_eval,
+        y_true=y_true,
+        y_pred=y_pred,
+        max_regions=3,
+    )
+    suggestions: list[str] = []
+    for region in regions:
+        suggestions.append(
+            f"Increase labeled coverage in {region['feature']} range "
+            f"[{region['lower_bound']:.3g}, {region['upper_bound']:.3g}] where error rate is "
+            f"{region['error_rate']:.3f} (lift {region['error_lift']:.3f})."
+        )
+    if task_type in {"fraud_detection", "anomaly_detection"}:
+        if test_recall is not None and test_recall < 0.70:
+            risk_flags.append("minority_recall_below_target")
+            suggestions.append("Collect more positive-event sequences and hard negatives near the decision boundary.")
+        if test_pr_auc is not None and test_pr_auc < 0.35:
+            risk_flags.append("precision_recall_separation_weak")
+            suggestions.append("Add discriminative predictors and targeted event windows to improve PR-AUC.")
+
+    if not suggestions:
+        suggestions.append(
+            "Collect additional boundary-crossing examples in underrepresented operating regions before increasing model complexity."
+        )
+
+    avg_conf = float(np.mean(np.max(probs, axis=1))) if probs.size else float("nan")
+    diagnostics.append(
+        f"Prediction confidence: mean_max_probability={avg_conf:.4f}, classes={len(class_labels)}, decision_threshold={decision_threshold:.2f}."
+    )
+    summary = (
+        f"Classification evaluation complete for `{selected_model_name}`: "
+        f"test_f1={_metric_or_none(test, 'f1') if _metric_or_none(test, 'f1') is not None else float('nan'):.4f}, "
+        f"test_accuracy={_metric_or_none(test, 'accuracy') if _metric_or_none(test, 'accuracy') is not None else float('nan'):.4f}, "
+        f"test_recall={_metric_or_none(test, 'recall') if _metric_or_none(test, 'recall') is not None else float('nan'):.4f}."
+    )
+    return {
+        "summary": summary,
+        "diagnostics": diagnostics,
+        "risk_flags": risk_flags,
+        "high_error_regions": regions,
+        "suggestions": suggestions[:3],
+    }
+
+
+def _extract_regression_eval_payload(
+    *,
+    selected_model_name: str,
+    selected_model_obj: Any,
+    prepared_frames: dict[str, pd.DataFrame],
+    feature_columns: list[str],
+    target_column: str,
+) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+    if selected_model_name in {"lagged_linear", "lagged_tree_ensemble"} and hasattr(selected_model_obj, "_lagged_frame"):
+        context = pd.concat([prepared_frames["train"], prepared_frames["validation"]], ignore_index=True)
+        eval_frame = selected_model_obj._lagged_frame(
+            frame=prepared_frames["test"],
+            context_frame=context,
+        )
+        delegate = selected_model_obj._require_delegate()
+        model_features = list(getattr(selected_model_obj, "_lagged_feature_columns", []))
+        y_true = eval_frame[target_column].to_numpy(dtype=float)
+        y_pred = delegate.predict_dataframe(eval_frame)
+        return eval_frame[model_features].copy(), y_true, np.asarray(y_pred, dtype=float)
+
+    eval_frame = prepared_frames["test"]
+    y_true = eval_frame[target_column].to_numpy(dtype=float)
+    y_pred = selected_model_obj.predict_dataframe(eval_frame)
+    return eval_frame[feature_columns].copy(), y_true, np.asarray(y_pred, dtype=float)
+
+
+def _extract_classification_eval_payload(
+    *,
+    selected_model_name: str,
+    selected_model_obj: Any,
+    selected_candidate: CandidateMetrics,
+    prepared_frames: dict[str, pd.DataFrame],
+    feature_columns: list[str],
+    target_column: str,
+) -> tuple[pd.DataFrame, list[str], list[str], np.ndarray, list[str], float]:
+    if selected_model_name in {"lagged_logistic_regression", "lagged_tree_classifier"} and hasattr(selected_model_obj, "_lagged_frame"):
+        context = pd.concat([prepared_frames["train"], prepared_frames["validation"]], ignore_index=True)
+        eval_frame = selected_model_obj._lagged_frame(
+            frame=prepared_frames["test"],
+            context_frame=context,
+        )
+        delegate = selected_model_obj._require_delegate()
+        model_features = list(getattr(selected_model_obj, "_lagged_feature_columns", []))
+        probabilities = delegate.predict_proba_dataframe(eval_frame)
+    else:
+        eval_frame = prepared_frames["test"]
+        model_features = list(feature_columns)
+        probabilities = selected_model_obj.predict_proba_dataframe(eval_frame)
+    class_labels = [str(item) for item in getattr(selected_model_obj, "class_labels", [])]
+    y_true = [str(item) for item in eval_frame[target_column].tolist()]
+    positive_label = _minority_label_token(frame=prepared_frames["train"], target_column=target_column)
+    decision_threshold = float(selected_candidate.test_metrics.get("decision_threshold", 0.5))
+    y_pred = _predict_labels_from_probabilities(
+        probabilities=probabilities,
+        class_labels=class_labels,
+        positive_label=positive_label,
+        decision_threshold=decision_threshold,
+    )
+    return eval_frame[model_features].copy(), y_true, y_pred, probabilities, class_labels, decision_threshold
+
+
+def _predict_labels_from_probabilities(
+    *,
+    probabilities: np.ndarray,
+    class_labels: list[str],
+    positive_label: str | None,
+    decision_threshold: float,
+) -> list[str]:
+    if probabilities.size == 0 or not class_labels:
+        return []
+    if len(class_labels) == 2 and positive_label in class_labels:
+        pos_idx = class_labels.index(str(positive_label))
+        neg_idx = 1 - pos_idx
+        out: list[str] = []
+        for row in probabilities:
+            if float(row[pos_idx]) >= float(decision_threshold):
+                out.append(class_labels[pos_idx])
+            else:
+                out.append(class_labels[neg_idx])
+        return out
+    labels = np.asarray(class_labels, dtype=object)
+    return [str(item) for item in labels[np.argmax(probabilities, axis=1)]]
+
+
+def _analyze_classification_error_regions(
+    *,
+    feature_frame: pd.DataFrame,
+    y_true: list[str],
+    y_pred: list[str],
+    max_regions: int = 3,
+) -> list[dict[str, Any]]:
+    if feature_frame.empty or not y_true or len(y_true) != len(y_pred):
+        return []
+    error = np.asarray([1.0 if truth != pred else 0.0 for truth, pred in zip(y_true, y_pred)], dtype=float)
+    overall_error = float(np.mean(error))
+    minimum_region_size = max(8, int(0.05 * len(error)))
+    regions: list[dict[str, Any]] = []
+    for feature in feature_frame.columns:
+        numeric = pd.to_numeric(feature_frame[feature], errors="coerce")
+        valid = numeric.notna()
+        if int(valid.sum()) < minimum_region_size:
+            continue
+        values = numeric[valid].to_numpy(dtype=float)
+        errors = error[valid.to_numpy()]
+        boundaries = np.unique(np.quantile(values, [0.0, 0.25, 0.5, 0.75, 1.0]))
+        if len(boundaries) < 2:
+            continue
+        for idx in range(len(boundaries) - 1):
+            low = float(boundaries[idx])
+            high = float(boundaries[idx + 1])
+            if idx == len(boundaries) - 2:
+                mask = (values >= low) & (values <= high)
+            else:
+                mask = (values >= low) & (values < high)
+            count = int(np.sum(mask))
+            if count < minimum_region_size:
+                continue
+            region_error = float(np.mean(errors[mask]))
+            lift = region_error - overall_error
+            if lift <= 0.01:
+                continue
+            regions.append(
+                {
+                    "feature": str(feature),
+                    "lower_bound": low,
+                    "upper_bound": high,
+                    "sample_count": count,
+                    "error_rate": region_error,
+                    "error_lift": lift,
+                }
+            )
+    regions.sort(key=lambda item: float(item.get("error_lift", 0.0)), reverse=True)
+    return regions[: max(int(max_regions), 1)]
+
+
+def _metric_or_none(metrics: dict[str, float], key: str) -> float | None:
+    try:
+        if key not in metrics:
+            return None
+        return float(metrics[key])
+    except (TypeError, ValueError):
+        return None
 
 
 def _resolve_lag_horizon(

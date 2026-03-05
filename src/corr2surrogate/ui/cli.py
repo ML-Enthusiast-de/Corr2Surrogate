@@ -496,12 +496,15 @@ def _run_agent_session(
         )
         print(
             "agent> Current executable models: `auto`, `linear_ridge`, "
-            "`logistic_regression`, `bagged_tree_classifier`, `lagged_linear`, "
-            "`lagged_tree_ensemble`, `bagged_tree_ensemble` "
+            "`logistic_regression`, `lagged_logistic_regression`, `bagged_tree_classifier`, "
+            "`boosted_tree_classifier`, `lagged_linear`, `lagged_tree_classifier`, "
+            "`lagged_tree_ensemble`, `bagged_tree_ensemble`, `boosted_tree_ensemble` "
             "(aliases include `ridge`, `linear`, `logistic`, `logit`, `classifier`, "
-            "`tree_classifier`, `lagged`, `temporal_linear`, `arx`, `lagged_tree`, "
+            "`lagged_logistic`, `temporal_classifier`, `tree_classifier`, "
+            "`gradient_boosting_classifier`, `lagged`, `temporal_linear`, `arx`, "
+            "`temporal_tree_classifier`, `lagged_tree`, "
             "`lag_window_tree`, `temporal_tree`, `tree`, `tree_ensemble`, "
-            "`extra_trees`, `hist_gradient_boosting`)."
+            "`extra_trees`, `gradient_boosting`, `hist_gradient_boosting`)."
         )
         print(
             "agent> During training I will print staged progress, compare candidates on "
@@ -604,12 +607,14 @@ def _run_agent_session(
                 )
                 print(
                     "agent> Current executable models: `auto`, `linear_ridge`, "
-                    "`logistic_regression`, `bagged_tree_classifier`, `lagged_linear`, "
-                    "`lagged_tree_ensemble`, `bagged_tree_ensemble` "
+                    "`logistic_regression`, `lagged_logistic_regression`, `bagged_tree_classifier`, "
+                    "`boosted_tree_classifier`, `lagged_linear`, `lagged_tree_classifier`, "
+                    "`lagged_tree_ensemble`, `bagged_tree_ensemble`, `boosted_tree_ensemble` "
                     "(aliases include `ridge`, `linear`, `logistic`, `logit`, `classifier`, "
-                    "`tree_classifier`, `lagged`, `temporal_linear`, `arx`, `lagged_tree`, "
+                    "`lagged_logistic`, `temporal_classifier`, `tree_classifier`, "
+                    "`gradient_boosting_classifier`, `lagged`, `temporal_linear`, `arx`, `lagged_tree`, "
                     "`lag_window_tree`, `temporal_tree`, `tree`, `tree_ensemble`, "
-                    "`extra_trees`, `hist_gradient_boosting`)."
+                    "`extra_trees`, `gradient_boosting`, `hist_gradient_boosting`)."
                 )
                 print(
                     "agent> You can also load an Agent 1 handoff via: "
@@ -1844,10 +1849,14 @@ def _execute_modeler_build_request(
             "Currently available: `auto`, `linear_ridge` "
             "(aliases: `ridge`, `linear`, `incremental_linear_surrogate`), "
             "`logistic_regression` (aliases: `logistic`, `logit`, `linear_classifier`, `classifier`), "
+            "`lagged_logistic_regression` (aliases: `lagged_logistic`, `lagged_logit`, `temporal_classifier`), "
             "`lagged_linear` (aliases: `lagged`, `temporal_linear`, `arx`), "
+            "`lagged_tree_classifier` (aliases: `temporal_tree_classifier`, `lag_window_tree_classifier`), "
             "`lagged_tree_ensemble` (aliases: `lagged_tree`, `lag_window_tree`, `temporal_tree`), and "
-            "`bagged_tree_ensemble` (aliases: `tree`, `tree_ensemble`, `extra_trees`, `hist_gradient_boosting`), "
-            "and `bagged_tree_classifier` (aliases: `tree_classifier`, `classifier_tree`, `fraud_tree`)."
+            "`bagged_tree_ensemble` (aliases: `tree`, `tree_ensemble`, `extra_trees`), "
+            "`boosted_tree_ensemble` (aliases: `gradient_boosting`, `hist_gradient_boosting`), "
+            "`bagged_tree_classifier` (aliases: `tree_classifier`, `classifier_tree`, `fraud_tree`), "
+            "and `boosted_tree_classifier` (aliases: `gradient_boosting_classifier`, `hist_gradient_boosting_classifier`)."
         )
         print(f"agent> {response}")
         session_context["workflow_stage"] = "modeler_dataset_ready"
@@ -2267,6 +2276,11 @@ def _print_modeler_training_summary(*, training: dict[str, Any]) -> None:
     split_info = training.get("split") if isinstance(training.get("split"), dict) else {}
     preprocessing = training.get("preprocessing") if isinstance(training.get("preprocessing"), dict) else {}
     comparison = training.get("comparison") if isinstance(training.get("comparison"), list) else []
+    professional_analysis = (
+        training.get("professional_analysis")
+        if isinstance(training.get("professional_analysis"), dict)
+        else {}
+    )
     task_profile = training.get("task_profile") if isinstance(training.get("task_profile"), dict) else {}
     hyperparameters = (
         training.get("selected_hyperparameters")
@@ -2323,6 +2337,29 @@ def _print_modeler_training_summary(*, training: dict[str, Any]) -> None:
             f"`{item.get('model_family', 'n/a')}`: "
             f"{_format_candidate_metric_summary(val_metrics, test_metrics)}."
         )
+    if professional_analysis:
+        summary = str(professional_analysis.get("summary", "")).strip()
+        if summary:
+            print(f"agent> Professional analysis: {summary}")
+        diagnostics = professional_analysis.get("diagnostics")
+        if isinstance(diagnostics, list):
+            for item in diagnostics[:3]:
+                text = str(item).strip()
+                if text:
+                    print(f"agent> Diagnostic: {text}")
+        risk_flags = professional_analysis.get("risk_flags")
+        if isinstance(risk_flags, list) and risk_flags:
+            print(
+                "agent> Risk flags: "
+                + ", ".join(str(item).strip() for item in risk_flags if str(item).strip())
+                + "."
+            )
+        suggestions = professional_analysis.get("suggestions")
+        if isinstance(suggestions, list):
+            for item in suggestions[:3]:
+                text = str(item).strip()
+                if text:
+                    print(f"agent> Suggestion: {text}")
 
 
 def _default_acceptance_criteria(*, task_type_hint: str | None = None) -> dict[str, float]:
@@ -3059,10 +3096,14 @@ def _prompt_modeler_model_override(*, default_model: str) -> tuple[str, bool]:
     available = (
         "auto, linear_ridge (aliases: ridge, linear, incremental_linear_surrogate), "
         "logistic_regression (aliases: logistic, logit, linear_classifier, classifier), "
+        "lagged_logistic_regression (aliases: lagged_logistic, lagged_logit, temporal_classifier), "
         "lagged_linear (aliases: lagged, temporal_linear, arx), "
+        "lagged_tree_classifier (aliases: temporal_tree_classifier, lag_window_tree_classifier), "
         "lagged_tree_ensemble (aliases: lagged_tree, lag_window_tree, temporal_tree), "
-        "bagged_tree_ensemble (aliases: tree, tree_ensemble, extra_trees, hist_gradient_boosting), "
-        "bagged_tree_classifier (aliases: tree_classifier, classifier_tree, fraud_tree)"
+        "bagged_tree_ensemble (aliases: tree, tree_ensemble, extra_trees), "
+        "boosted_tree_ensemble (aliases: gradient_boosting, hist_gradient_boosting), "
+        "bagged_tree_classifier (aliases: tree_classifier, classifier_tree, fraud_tree), "
+        "boosted_tree_classifier (aliases: gradient_boosting_classifier, hist_gradient_boosting_classifier)"
     )
     recommended_supported = _normalize_modeler_model_family(default_model)
     while True:

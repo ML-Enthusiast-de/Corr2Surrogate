@@ -13,10 +13,12 @@ Primary responsibilities:
   - `logistic_regression`
   - `lagged_logistic_regression`
   - `bagged_tree_classifier`
+  - `boosted_tree_classifier`
   - `lagged_linear`
   - `lagged_tree_classifier`
   - `lagged_tree_ensemble`
   - `bagged_tree_ensemble`
+  - `boosted_tree_ensemble`
 - Support both entry paths:
   - handoff-driven modeling from Agent 1
   - direct modeling when the user explicitly provides target, predictor inputs, and requested model family
@@ -43,6 +45,10 @@ Iteration behavior:
 - If stalled, recommend: more data, architecture change, or feature redesign.
 - When retries stop without meeting acceptance, provide concrete data-collection trajectory suggestions, not just generic "collect more data" advice.
 - After test evaluation, analyze where error is high and propose concrete lab/testbench data trajectories.
+- For every completed training attempt, provide professional diagnostics:
+  - generalization gaps (train vs validation/test)
+  - risk flags (overfitting/underfitting/coverage issues)
+  - concrete next actions grounded in measured metrics
 - Use Agent 1's model-strategy recommendation as a prior:
   - start with linear or lagged baselines first
   - escalate to tree ensembles when interaction or regime evidence is present
