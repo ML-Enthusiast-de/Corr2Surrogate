@@ -14,6 +14,7 @@ Outputs:
 - Scientist-facing analysis report
 - Agent handoff payload (machine-readable)
 - Trained model artifacts, optimization parameters, normalization state
+- Inference report + prediction export with OOD/drift diagnostics
 - Iteration guidance when quality is insufficient
 
 ## 3. Agent Roles
@@ -54,6 +55,10 @@ Outputs:
   - selected model params (and later tuned params)
   - scaler/normalization state
   - metrics and metadata
+- Supports deterministic post-training inference from checkpoint/run artifacts:
+  - load saved model + preprocessing state
+  - score new CSV/XLSX batches
+  - export predictions and monitor OOD/drift
 - Runs agentic loops if criteria not met
 - Explains whether next step should be:
   - more data
@@ -182,16 +187,22 @@ Model parameters, split metadata, normalization state, feature list / lag schema
 8. Add post-model failure analysis:
 Identify high-error operating regions and recommend concrete new lab/testbench trajectories.
 
-9. Add bounded optimization loops:
+9. Add deterministic inference workflows:
+Load persisted artifacts, run batch inference on new data, and emit OOD/drift + retraining guidance.
+
+10. Add bounded optimization loops:
 Add Optuna only after deterministic training is stable.
 
-10. Add advanced temporal models:
+11. Add advanced temporal models:
 Add GRU / LSTM only after lagged and tree-based baselines are in place.
 
+12. Add deployment hardening for heavier models:
+Introduce pruning/quantization profiles after DNN baselines show validated gains.
+
 Current status:
-- steps 1-7 are now implemented in the first production path
+- steps 1-9 are now implemented in the first production path
 - bounded acceptance-loop retries are already active across model family, feature set, lag horizon, and binary threshold policy when allowed by loop policy
-- boosted-tree baselines and a first post-stall experiment-guidance layer are implemented; remaining work is deeper region-aware experiment design, inference-first workflows, uncertainty estimation, and later Optuna
+- boosted-tree baselines and a first post-stall experiment-guidance layer are implemented; remaining work is deeper region-aware experiment design, uncertainty estimation, Optuna, and later DNN + compression profiles
 
 ## 11. Bounded LLM Autonomy
 The LLM should act as an agent, but not as an uncontrolled replacement for deterministic analytics.

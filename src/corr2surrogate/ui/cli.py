@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 from corr2surrogate.analytics import SUPPORTED_TASK_TYPES, normalize_task_type_hint
 from corr2surrogate.core.json_utils import dumps_json
-from corr2surrogate.modeling import normalize_candidate_model_family
+from corr2surrogate.modeling import normalize_candidate_model_family, run_inference_from_artifacts
 from corr2surrogate.orchestration.default_tools import build_default_registry
 from corr2surrogate.orchestration.handoff_contract import build_agent2_handoff_from_report_payload
 from corr2surrogate.orchestration.harness_runner import run_local_agent_once
@@ -231,6 +231,47 @@ def build_parser() -> argparse.ArgumentParser:
     run_agent1.add_argument("--run-id", default=None)
     run_agent1.add_argument("--no-save-report", action="store_true")
 
+    run_inference = sub.add_parser(
+        "run-inference",
+        help="Run deterministic inference from a saved checkpoint or run directory.",
+    )
+    source = run_inference.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--checkpoint-id",
+        default=None,
+        help="Checkpoint id from artifacts/checkpoints (e.g., ckpt_...).",
+    )
+    source.add_argument(
+        "--run-dir",
+        default=None,
+        help="Run directory containing model_params.json and model state (e.g., artifacts/run_...).",
+    )
+    run_inference.add_argument("--data-path", required=True, help="CSV/XLSX data file path.")
+    run_inference.add_argument("--sheet-name", default=None, help="Excel sheet name if needed.")
+    run_inference.add_argument("--header-row", type=int, default=None, help="Optional header row.")
+    run_inference.add_argument(
+        "--data-start-row",
+        type=int,
+        default=None,
+        help="Optional data start row.",
+    )
+    run_inference.add_argument(
+        "--delimiter",
+        default=None,
+        help="Optional CSV delimiter override.",
+    )
+    run_inference.add_argument(
+        "--decision-threshold",
+        type=float,
+        default=None,
+        help="Optional binary threshold override (0..1) for classification inference.",
+    )
+    run_inference.add_argument(
+        "--output-path",
+        default=None,
+        help="Optional output JSON path; defaults to reports/inference/<dataset>/inference_<timestamp>.json",
+    )
+
     scan = sub.add_parser(
         "scan-git-safety",
         help="Scan repository for potential secret/system-path leaks.",
@@ -369,6 +410,25 @@ def main(argv: list[str] | None = None) -> int:
 
         result = registry.execute("run_agent1_analysis", _drop_none_fields(tool_args))
         print(dumps_json(result.output, indent=2))
+        return 0
+
+    if args.command == "run-inference":
+        try:
+            payload = run_inference_from_artifacts(
+                data_path=args.data_path,
+                checkpoint_id=args.checkpoint_id,
+                run_dir=args.run_dir,
+                sheet_name=args.sheet_name,
+                header_row=args.header_row,
+                data_start_row=args.data_start_row,
+                delimiter=args.delimiter,
+                decision_threshold=args.decision_threshold,
+                output_path=args.output_path,
+            )
+        except Exception as exc:
+            print(dumps_json({"status": "error", "message": str(exc)}, indent=2))
+            return 1
+        print(dumps_json(payload, indent=2))
         return 0
 
     parser.error(f"Unsupported command '{args.command}'.")

@@ -7,6 +7,7 @@ from .classifiers import (
     BoostedTreeClassifierSurrogate,
     LogisticClassificationSurrogate,
 )
+from .inference import run_inference_from_artifacts
 from .normalization import MinMaxNormalizer
 from .performance_feedback import (
     BadRegion,
@@ -50,5 +51,6 @@ __all__ = [
     "analyze_model_performance",
     "build_train_validation_test_split",
     "normalize_candidate_model_family",
+    "run_inference_from_artifacts",
     "train_surrogate_candidates",
 ]

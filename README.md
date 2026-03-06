@@ -39,6 +39,8 @@ Corr2Surrogate is a local-first framework for converting real-world sensor data 
   - high-error region summaries and next-step suggestions
 - First nonlinear modeling baseline: local bagged tree ensemble / tree classifier
 - Candidate comparison with LLM-assisted model interpretation in the CLI
+- Deterministic inference from saved checkpoints/run artifacts with batch prediction export
+- Inference diagnostics: train-range OOD checks, feature drift scoring, and retraining recommendations
 - Local runtime by default; optional API mode via explicit opt-in
 
 ## Privacy Defaults
@@ -193,6 +195,30 @@ corr2surrogate run-agent1-analysis \
   --strategy-search-candidates 4
 ```
 
+## Deterministic Inference From Saved Artifacts
+Run inference on a new CSV/XLSX dataset using an existing Agent 2 checkpoint or run directory.
+
+By checkpoint id:
+```bash
+corr2surrogate run-inference \
+  --checkpoint-id ckpt_20260301_084009_43c566cb \
+  --data-path data/private/new_batch.csv
+```
+
+By run directory:
+```bash
+corr2surrogate run-inference \
+  --run-dir artifacts/run_20260301_084009 \
+  --data-path data/private/new_batch.xlsx \
+  --sheet-name Sheet1 \
+  --decision-threshold 0.35
+```
+
+Outputs:
+- JSON report (default: `reports/inference/<dataset_slug>/inference_<timestamp>.json`)
+- prediction CSV (same folder, `..._predictions.csv`)
+- diagnostics for OOD/drift and inference-time quality (if target exists in incoming data)
+
 ## Planned Agent 2 Modeling Roadmap
 Agent 1 now emits a model-strategy prior for each target. Agent 2 should treat that as a search-order hint, not a guarantee.
 
@@ -224,6 +250,7 @@ Current classification note:
 Recommended model families to implement next:
 - steady-state / tabular: add `ElasticNet`
 - sequence models: `GRU`/`LSTM` only when lagged/tabular probes still leave meaningful residual dynamics
+- after sequence baselines are stable: add production hardening via pruning and quantization profiles
 
 Operational rule:
 - do not jump directly to LSTM just because a target is time-based
@@ -262,7 +289,8 @@ Current state:
 - steps 1-7 are now implemented in the first production path
 - the current modeler loop already performs bounded retries across model family, feature set, lag horizon, and binary threshold policy when the loop policy allows it
 - the current loop also prints concrete next experiment trajectories when retries stall
-- the next highest-value gaps are deeper region-aware experiment design, inference workflows, and uncertainty reporting
+- deterministic inference workflows are now in place via `run-inference`
+- the next highest-value gaps are deeper region-aware experiment design, uncertainty reporting, and DNN compression-ready deployment profiles
 
 ## Modeling Entry Modes
 Two user entry paths are part of the intended product behavior:

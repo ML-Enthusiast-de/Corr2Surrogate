@@ -165,6 +165,37 @@ def test_cli_setup_local_llm_handles_runtime_error(monkeypatch, capsys) -> None:
     assert "policy-blocked" in output
 
 
+def test_cli_run_inference_invokes_runner(monkeypatch, capsys) -> None:
+    captured = {}
+
+    def fake_run_inference_from_artifacts(**kwargs):
+        captured.update(kwargs)
+        return {"status": "ok", "prediction_count": 12}
+
+    monkeypatch.setattr(
+        "corr2surrogate.ui.cli.run_inference_from_artifacts",
+        fake_run_inference_from_artifacts,
+    )
+    exit_code = main(
+        [
+            "run-inference",
+            "--run-dir",
+            "artifacts/run_demo",
+            "--data-path",
+            "data/public/public_testbench_dataset_20k_minmax.csv",
+            "--decision-threshold",
+            "0.35",
+        ]
+    )
+    assert exit_code == 0
+    assert captured["run_dir"] == "artifacts/run_demo"
+    assert captured["data_path"].endswith("public_testbench_dataset_20k_minmax.csv")
+    assert captured["decision_threshold"] == 0.35
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ok"
+    assert payload["prediction_count"] == 12
+
+
 def test_cli_run_agent_session_basic_flow(monkeypatch) -> None:
     calls = []
     inputs = iter(["hello there", "/exit"])
