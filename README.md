@@ -247,10 +247,20 @@ Current classification note:
   - `threshold 0.35`
   - `threshold auto`
 
-Recommended model families to implement next:
-- steady-state / tabular: add `ElasticNet`
-- sequence models: `GRU`/`LSTM` only when lagged/tabular probes still leave meaningful residual dynamics
-- after sequence baselines are stable: add production hardening via pruning and quantization profiles
+Prioritized roadmap (next):
+1. Deepen weak-spot intelligence:
+   - region-aware error localization and targeted experiment proposals with clearer coverage metrics
+   - keep this as the first priority because it directly drives scientific data collection quality
+2. Add bounded Optuna tuning on top of deterministic baselines:
+   - tune only after split-safe baseline paths are stable
+   - keep strict acceptance gates to avoid overfitting/metric chasing
+3. Add uncertainty and calibration reporting:
+   - confidence intervals / reliability checks for model outputs and thresholds
+4. Add evidence-gated DNN families:
+   - start with `FFN` for tabular nonlinear residuals
+   - add `RNN`/`GRU`/`LSTM` only when lagged/tabular families still miss temporal structure
+5. Add deployment hardening for larger models:
+   - pruning and quantization profiles after DNN baselines show validated gains
 
 Operational rule:
 - do not jump directly to LSTM just because a target is time-based
@@ -282,15 +292,33 @@ This is the planned implementation order to maximize practical value while keepi
 7. Add post-model failure analysis:
    - identify operating regions with high error
    - recommend concrete new lab/testbench trajectories
-8. Add bounded optimization loops:
-   - Optuna only after the deterministic training pipeline is correct
+8. Add deterministic inference workflows:
+   - load persisted artifacts
+   - score new datasets
+   - export prediction files plus OOD/drift diagnostics
+
+9. Deepen weak-spot experiment planning:
+   - produce region-aware operating-space gaps and trajectory priorities from residual/error maps
+
+10. Add bounded Optuna tuning:
+   - Optuna only after the deterministic training pipeline is correct and monitored
+
+11. Add uncertainty and calibration:
+   - confidence/reliability outputs for both regression and classification
+
+12. Add evidence-gated DNN families:
+   - FFN first for tabular residual nonlinearity
+   - RNN/GRU/LSTM only after lagged/tabular baselines prove insufficient
+
+13. Add model compression for deployability:
+   - pruning and quantization profiles after DNN validation
 
 Current state:
-- steps 1-7 are now implemented in the first production path
+- steps 1-8 are now implemented in the first production path
 - the current modeler loop already performs bounded retries across model family, feature set, lag horizon, and binary threshold policy when the loop policy allows it
 - the current loop also prints concrete next experiment trajectories when retries stall
 - deterministic inference workflows are now in place via `run-inference`
-- the next highest-value gaps are deeper region-aware experiment design, uncertainty reporting, and DNN compression-ready deployment profiles
+- the next highest-value gaps are deeper region-aware weak-spot planning, bounded Optuna tuning, uncertainty/calibration, and then evidence-gated DNN + compression
 
 ## Modeling Entry Modes
 Two user entry paths are part of the intended product behavior:
@@ -319,6 +347,7 @@ Current implementation note:
 - if the selected target looks like classification or fraud detection, the modeler reports that explicitly, applies the correct split policy, trains the local classifier candidates, and evaluates them with classification-aware metrics
 - if retries stop without meeting quality, the modeler prints concrete experiment recommendations for the next data collection pass
 - every training attempt now includes professional diagnostics (generalization gaps, risk flags, and targeted suggestions) in both artifacts and CLI output
+- after a successful model build, Agent 2 now asks whether to run inference immediately; if the user opts in, it requests a dataset path (or `same`) and executes inference in-session; if the user says no, it simply continues
 - before a modeler run, users can steer binary decision policy with:
   - `threshold favor_recall`
   - `threshold favor_precision`

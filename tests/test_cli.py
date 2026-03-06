@@ -1741,6 +1741,88 @@ def test_cli_run_agent_session_modeler_direct_request_then_dataset(
     assert "Split-safe pipeline:" in output
     assert "Candidate `linear_ridge`" in output
     assert "Model build complete:" in output
+    assert "Run inference now with this selected model" in output
+    assert "run-inference --checkpoint-id ckpt_linear_1" in output
+
+
+def test_cli_modeler_runs_inference_in_session_when_user_opts_in(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    data_path = tmp_path / "model_data.csv"
+    data_path.write_text("A,B,C\n1,2,3\n", encoding="utf-8")
+    inputs = iter(
+        [
+            "build model linear_ridge with inputs A,B and target C",
+            str(data_path),
+            "yes",
+            "same",
+            "/exit",
+        ]
+    )
+    registry = _SessionRegistry(
+        scripted_outputs={
+            "prepare_ingestion_step": [
+                {
+                    "status": "ok",
+                    "message": "Ingestion ready.",
+                    "options": [],
+                    "selected_sheet": None,
+                    "available_sheets": [],
+                    "header_row": 0,
+                    "data_start_row": 1,
+                    "header_confidence": 1.0,
+                    "needs_user_confirmation": False,
+                    "row_count": 10,
+                    "column_count": 3,
+                    "signal_columns": ["A", "B", "C"],
+                    "numeric_signal_columns": ["A", "B", "C"],
+                }
+            ],
+            "train_surrogate_candidates": [
+                {
+                    "status": "ok",
+                    "checkpoint_id": "ckpt_linear_1",
+                    "run_dir": "artifacts/run_linear_1",
+                    "selected_model_family": "linear_ridge",
+                    "best_validation_model_family": "linear_ridge",
+                    "comparison": [],
+                    "selected_metrics": {"test": {"r2": 0.91, "mae": 0.12}},
+                    "rows_used": 10,
+                }
+            ],
+        }
+    )
+
+    captured_inference = {}
+
+    def fake_run_inference_from_artifacts(**kwargs):
+        captured_inference.update(kwargs)
+        return {
+            "status": "ok",
+            "prediction_count": 10,
+            "dropped_rows_missing_features": 0,
+            "report_path": "reports/inference/model_data/inference_demo.json",
+            "predictions_path": "reports/inference/model_data/inference_demo_predictions.csv",
+            "evaluation": {"metrics": {"r2": 0.9000, "mae": 0.1100}},
+            "recommendations": ["No immediate retraining trigger detected."],
+        }
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
+    monkeypatch.setattr("corr2surrogate.ui.cli.build_default_registry", lambda: registry)
+    monkeypatch.setattr("corr2surrogate.ui.cli.run_local_agent_once", _stub_llm_interpretation)
+    monkeypatch.setattr(
+        "corr2surrogate.ui.cli.run_inference_from_artifacts",
+        fake_run_inference_from_artifacts,
+    )
+
+    exit_code = main(["run-agent-session", "--agent", "modeler"])
+    assert exit_code == 0
+    assert captured_inference["checkpoint_id"] == "ckpt_linear_1"
+    assert Path(captured_inference["data_path"]).resolve() == data_path.resolve()
+    output = capsys.readouterr().out
+    assert "Running inference on:" in output
+    assert "Inference complete:" in output
+    assert "Inference report:" in output
 
 
 def test_cli_run_agent_session_modeler_handoff_allows_override_prompts(

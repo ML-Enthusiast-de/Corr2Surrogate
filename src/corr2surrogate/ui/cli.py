@@ -569,7 +569,8 @@ def _run_agent_session(
         print(
             "agent> During training I will print staged progress, compare candidates on "
             "validation/test, adapt model family/features/lags/thresholds when safe, "
-            "suggest next data trajectories if the loop stalls, and then give an LLM interpretation grounded in those metrics."
+            "suggest next data trajectories if the loop stalls, propose an inference command for the selected model, "
+            "and then give an LLM interpretation grounded in those metrics."
         )
         print(
             "agent> Handoff syntax: "
@@ -684,6 +685,10 @@ def _run_agent_session(
                     "agent> Adaptive retry loop: when quality is weak, I can switch model family, "
                     "expand the feature set, widen lag windows, retune binary thresholds when safe, "
                     "and print concrete experiment recommendations if retries stall."
+                )
+                print(
+                    "agent> After a successful run I will also propose ready-to-run "
+                    "`run-inference` commands for new data using the selected checkpoint."
                 )
                 print(
                     "agent> Task override: `task regression`, `task binary_classification`, "
@@ -1466,6 +1471,21 @@ def _run_modeler_autopilot_turn(
 ) -> dict[str, Any] | None:
     stripped = user_message.strip()
     lowered = stripped.lower()
+    stage = str(session_context.get("workflow_stage", "")).strip().lower()
+
+    if stage == "awaiting_inference_decision":
+        return _handle_modeler_inference_decision_turn(
+            user_message=user_message,
+            session_context=session_context,
+            chat_reply_only=chat_reply_only,
+        )
+
+    if stage == "awaiting_inference_data_path":
+        return _handle_modeler_inference_data_path_turn(
+            user_message=user_message,
+            session_context=session_context,
+            chat_reply_only=chat_reply_only,
+        )
 
     if lowered.startswith(("use handoff", "load handoff")):
         handoff_path = _extract_first_json_path(user_message)
@@ -2209,6 +2229,13 @@ def _execute_modeler_build_request(
     print(f"agent> {summary}")
     print(f"agent> {checkpoint_line}")
     print(f"agent> {run_dir_line}")
+    inference_suggestions = _build_inference_suggestions(
+        checkpoint_id=str(training.get("checkpoint_id", "")).strip(),
+        run_dir=str(training.get("run_dir", "")).strip(),
+        dataset_path=str(dataset.get("data_path", "")).strip(),
+    )
+    for line in inference_suggestions.get("lines", []):
+        print(f"agent> {line}")
     if chat_reply_only is not None:
         interpretation = _generate_modeling_interpretation(
             training=training,
@@ -2227,7 +2254,12 @@ def _execute_modeler_build_request(
                 "agent> LLM interpretation unavailable for this turn. "
                 "Using the deterministic model summary above."
             )
-    session_context["workflow_stage"] = "model_training_completed"
+    inference_prompt = (
+        "Run inference now with this selected model on data you provide? "
+        "Reply `yes` to continue or `no` to skip."
+    )
+    print(f"agent> {inference_prompt}")
+    session_context["workflow_stage"] = "awaiting_inference_decision"
     session_context["last_model_request"] = {
         "target_signal": target,
         "feature_signals": final_feature_columns,
@@ -2240,8 +2272,9 @@ def _execute_modeler_build_request(
         "lag_horizon_samples": int(training.get("lag_horizon_samples") or 0),
         "threshold_policy": threshold_policy if threshold_policy is not None else explicit_decision_threshold,
         "acceptance_check": last_loop_eval or {},
+        "inference_suggestions": inference_suggestions,
     }
-    response = f"{summary} {checkpoint_line}"
+    response = f"{summary} {checkpoint_line} {inference_prompt}"
     return {
         "response": response,
         "event": {
@@ -2257,6 +2290,8 @@ def _execute_modeler_build_request(
                 "comparison": comparison,
                 "task_profile": training.get("task_profile"),
                 "acceptance_check": last_loop_eval or {},
+                "inference_suggestions": inference_suggestions,
+                "workflow_stage": "awaiting_inference_decision",
             },
         },
     }
@@ -2264,6 +2299,229 @@ def _execute_modeler_build_request(
 
 def _normalize_modeler_model_family(requested_model: str) -> str | None:
     return normalize_candidate_model_family(requested_model)
+
+
+def _handle_modeler_inference_decision_turn(
+    *,
+    user_message: str,
+    session_context: dict[str, Any],
+    chat_reply_only: Callable[[str], str] | None,
+) -> dict[str, Any]:
+    lowered = user_message.strip().lower()
+    if lowered in {"y", "yes", "sure", "ok", "okay", "run"}:
+        session_context["workflow_stage"] = "awaiting_inference_data_path"
+        response = (
+            "Great. Paste a CSV/XLSX path for inference now. "
+            "You can also type `same` to reuse the currently loaded dataset, or `skip`."
+        )
+        print(f"agent> {response}")
+        return {
+            "response": response,
+            "event": {"status": "respond", "message": response, "tool_output": {"workflow_stage": "awaiting_inference_data_path"}},
+        }
+    if lowered in {"n", "no", "skip", "later", "not now"}:
+        session_context["workflow_stage"] = "model_training_completed"
+        response = "Inference skipped. You can run it later with the proposed `run-inference` command."
+        print(f"agent> {response}")
+        return {
+            "response": response,
+            "event": {"status": "respond", "message": response, "tool_output": {"workflow_stage": "model_training_completed"}},
+        }
+    direct_path = _resolve_modeler_inference_data_path(
+        user_message=user_message,
+        session_context=session_context,
+    )
+    if direct_path is not None:
+        return _run_modeler_inference_now(
+            inference_data_path=direct_path,
+            session_context=session_context,
+        )
+
+    if _looks_like_small_talk(lowered) and chat_reply_only is not None:
+        chat = chat_reply_only(user_message).strip()
+        reminder = "To continue, reply `yes` to run inference now or `no` to skip."
+        response = f"{chat}\n{reminder}" if chat else reminder
+        print(f"agent> {chat}" if chat else f"agent> {reminder}")
+        if chat:
+            print(f"agent> {reminder}")
+        return {
+            "response": response,
+            "event": {"status": "respond", "message": response, "tool_output": {"workflow_stage": "awaiting_inference_decision"}},
+        }
+    response = "Please reply `yes` to run inference now, `no` to skip, or paste an inference dataset path."
+    print(f"agent> {response}")
+    return {
+        "response": response,
+        "event": {"status": "respond", "message": response, "tool_output": {"workflow_stage": "awaiting_inference_decision"}},
+    }
+
+
+def _handle_modeler_inference_data_path_turn(
+    *,
+    user_message: str,
+    session_context: dict[str, Any],
+    chat_reply_only: Callable[[str], str] | None,
+) -> dict[str, Any]:
+    lowered = user_message.strip().lower()
+    if lowered in {"skip", "n", "no", "cancel"}:
+        session_context["workflow_stage"] = "model_training_completed"
+        response = "Inference skipped. You can run it later with the suggested `run-inference` command."
+        print(f"agent> {response}")
+        return {
+            "response": response,
+            "event": {"status": "respond", "message": response, "tool_output": {"workflow_stage": "model_training_completed"}},
+        }
+    direct_path = _resolve_modeler_inference_data_path(
+        user_message=user_message,
+        session_context=session_context,
+    )
+    if direct_path is None:
+        reminder = (
+            "Paste a valid CSV/XLSX path for inference, type `same` to reuse the current dataset, or `skip`."
+        )
+        if _looks_like_small_talk(lowered) and chat_reply_only is not None:
+            chat = chat_reply_only(user_message).strip()
+            if chat:
+                print(f"agent> {chat}")
+                print(f"agent> {reminder}")
+                response = f"{chat}\n{reminder}"
+            else:
+                print(f"agent> {reminder}")
+                response = reminder
+            return {
+                "response": response,
+                "event": {"status": "respond", "message": response, "tool_output": {"workflow_stage": "awaiting_inference_data_path"}},
+            }
+        print(f"agent> {reminder}")
+        return {
+            "response": reminder,
+            "event": {"status": "respond", "message": reminder, "tool_output": {"workflow_stage": "awaiting_inference_data_path"}},
+        }
+    return _run_modeler_inference_now(
+        inference_data_path=direct_path,
+        session_context=session_context,
+    )
+
+
+def _resolve_modeler_inference_data_path(
+    *,
+    user_message: str,
+    session_context: dict[str, Any],
+) -> Path | None:
+    text = user_message.strip()
+    lowered = text.lower()
+    if lowered == "same":
+        dataset = _modeler_loaded_dataset(session_context)
+        if dataset and str(dataset.get("data_path", "")).strip():
+            return Path(str(dataset["data_path"])).expanduser()
+        return None
+    if lowered == "default":
+        return _resolve_default_public_dataset_path()
+
+    detected = _extract_first_data_path(user_message)
+    if detected is not None:
+        return detected
+
+    stripped = text.strip().strip("\"'")
+    if not stripped:
+        return None
+    direct = Path(stripped).expanduser()
+    return direct if direct.exists() else None
+
+
+def _run_modeler_inference_now(
+    *,
+    inference_data_path: Path,
+    session_context: dict[str, Any],
+) -> dict[str, Any]:
+    last_request = (
+        session_context.get("last_model_request")
+        if isinstance(session_context.get("last_model_request"), dict)
+        else {}
+    )
+    checkpoint_id = str(last_request.get("checkpoint_id", "")).strip()
+    run_dir = str(last_request.get("run_dir", "")).strip()
+    if not checkpoint_id and not run_dir:
+        response = "No saved model reference is available for inference. Train a model first."
+        print(f"agent> {response}")
+        return {
+            "response": response,
+            "event": {"status": "respond", "message": response, "error": "inference_reference_missing"},
+        }
+
+    if not inference_data_path.exists():
+        response = f"Inference data path does not exist: {_path_for_display(inference_data_path)}"
+        print(f"agent> {response}")
+        return {
+            "response": response,
+            "event": {"status": "respond", "message": response, "error": "inference_data_missing"},
+        }
+
+    print(f"agent> Running inference on: {_path_for_display(inference_data_path)}")
+    try:
+        payload = run_inference_from_artifacts(
+            data_path=str(inference_data_path),
+            checkpoint_id=checkpoint_id or None,
+            run_dir=run_dir or None,
+        )
+    except Exception as exc:
+        response = (
+            "Inference failed: "
+            f"{str(exc).strip() or 'unknown runtime error'}"
+        )
+        print(f"agent> {response}")
+        return {
+            "response": response,
+            "event": {"status": "respond", "message": response, "error": "inference_runtime_error"},
+        }
+
+    metrics = (
+        payload.get("evaluation", {}).get("metrics")
+        if isinstance(payload.get("evaluation"), dict)
+        else {}
+    )
+    summary = (
+        "Inference complete: "
+        f"rows_scored={payload.get('prediction_count', 'n/a')}, "
+        f"dropped_rows={payload.get('dropped_rows_missing_features', 'n/a')}."
+    )
+    report_line = f"Inference report: {payload.get('report_path', 'n/a')}"
+    preds_line = f"Predictions: {payload.get('predictions_path', 'n/a')}"
+    print(f"agent> {summary}")
+    print(f"agent> {report_line}")
+    print(f"agent> {preds_line}")
+    if isinstance(metrics, dict) and metrics:
+        metric_keys = ("r2", "mae", "f1", "accuracy", "recall", "pr_auc")
+        metric_parts = [
+            f"{key}={_fmt_metric(metrics.get(key))}"
+            for key in metric_keys
+            if key in metrics
+        ]
+        if metric_parts:
+            print("agent> Inference eval: " + ", ".join(metric_parts) + ".")
+    recommendations = payload.get("recommendations")
+    if isinstance(recommendations, list):
+        for item in recommendations[:2]:
+            text = str(item).strip()
+            if text:
+                print(f"agent> Inference suggestion: {text}")
+
+    session_context["last_inference_result"] = payload
+    session_context["workflow_stage"] = "model_training_completed"
+    response = f"{summary} {report_line}"
+    return {
+        "response": response,
+        "event": {
+            "status": "respond",
+            "message": response,
+            "tool_output": {
+                "workflow_stage": "model_training_completed",
+                "inference_report_path": payload.get("report_path"),
+                "predictions_path": payload.get("predictions_path"),
+                "inference_metrics": metrics,
+            },
+        },
+    }
 
 
 def _fmt_metric(value: Any) -> str:
@@ -2420,6 +2678,46 @@ def _print_modeler_training_summary(*, training: dict[str, Any]) -> None:
                 text = str(item).strip()
                 if text:
                     print(f"agent> Suggestion: {text}")
+
+
+def _build_inference_suggestions(
+    *,
+    checkpoint_id: str,
+    run_dir: str,
+    dataset_path: str,
+) -> dict[str, Any]:
+    lines: list[str] = []
+    if not checkpoint_id and not run_dir:
+        return {"lines": lines}
+
+    lines.append(
+        "Next step: run inference with the selected model on new data you provide."
+    )
+    if checkpoint_id:
+        lines.append(
+            "Inference command (checkpoint): "
+            f"`corr2surrogate run-inference --checkpoint-id {checkpoint_id} --data-path <new_data.csv>`"
+        )
+    if run_dir:
+        lines.append(
+            "Inference command (run dir): "
+            f"`corr2surrogate run-inference --run-dir \"{run_dir}\" --data-path <new_data.csv>`"
+        )
+    if checkpoint_id and dataset_path:
+        try:
+            dataset_display = _path_for_display(Path(dataset_path))
+        except Exception:
+            dataset_display = dataset_path
+        lines.append(
+            "Quick smoke test on current dataset: "
+            f"`corr2surrogate run-inference --checkpoint-id {checkpoint_id} --data-path \"{dataset_display}\"`"
+        )
+    return {
+        "checkpoint_id": checkpoint_id,
+        "run_dir": run_dir,
+        "dataset_path": dataset_path,
+        "lines": lines,
+    }
 
 
 def _default_acceptance_criteria(*, task_type_hint: str | None = None) -> dict[str, float]:
