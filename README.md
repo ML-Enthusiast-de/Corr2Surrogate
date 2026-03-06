@@ -64,6 +64,7 @@ cd Corr2Surrogate
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 ```
 3. Set up local LLM runtime (Qwen 4B local profile):
@@ -90,6 +91,7 @@ cd Corr2Surrogate
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
 ```
 4. Set up local LLM runtime:
@@ -101,10 +103,25 @@ corr2surrogate setup-local-llm --provider llama_cpp
 ./.venv/bin/corr2surrogate run-agent-session --agent analyst
 ```
 
+## Optional Extras
+Install optional extras when you want richer local analytics:
+- `stats` adds SciPy-backed Kendall calculations.
+- `viz` adds Matplotlib plot artifacts.
+
+```bash
+python -m pip install -e ".[dev,stats,viz]"
+```
+
+PowerShell equivalent:
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[dev,stats,viz]"
+```
+
 ## Analyst Session Usage
 At startup you can:
 - paste a `.csv/.xlsx/.xls` path, or
 - type `default` to run the built-in public test dataset.
+- for fast first runs on large datasets, choose a small target subset and a reduced sample budget when prompted.
 
 Default dataset note:
 - `data/public/public_testbench_dataset_20k_minmax.csv` is sanitized and intentionally includes ~5% missing values in three representative signals (`B`, `D`, `F`), while all other signals and `time` remain complete. This lets users test missing-data handling and leakage warnings without collapsing row count when trying `drop_rows`.
@@ -412,6 +429,8 @@ Outputs are grouped by dataset slug under `reports/<dataset_slug>/`:
 - Agent 1 report now includes a dedicated "Model Strategy Recommendations (Agent 2 Planning)" section with probe-model scores and suggested search order.
 
 ## Quality and Security Checks
+CI now runs tests + leak scan on every push/PR via `.github/workflows/ci.yml`.
+
 Run tests:
 ```bash
 ./.venv/bin/python -m pytest
@@ -431,6 +450,13 @@ Windows equivalents:
 & .\.venv\Scripts\python.exe -m corr2surrogate.ui.cli scan-git-safety
 ```
 
+Public release checklist:
+1. Run `pytest` in a clean venv.
+2. Run `scan-git-safety`.
+3. Smoke test CLI help: `corr2surrogate --help`.
+4. Smoke test deterministic analysis on a public dataset.
+5. Confirm `data/private/`, `reports/`, and `artifacts/` contain no tracked files before push.
+
 ## Troubleshooting
 - `corr2surrogate` without path only works when the venv is active or the script is on `PATH`.
 - If `corr2surrogate` is not recognized on Windows, use:
@@ -444,3 +470,6 @@ corr2surrogate setup-local-llm
 
 ## License
 MIT (`LICENSE`)
+
+## Contributing
+See `CONTRIBUTING.md` for setup, quality gates, and PR expectations.
