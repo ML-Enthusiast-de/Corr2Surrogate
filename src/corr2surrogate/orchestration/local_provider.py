@@ -189,6 +189,11 @@ def _http_post_json(
         raise LocalProviderError(f"Provider connection error at {endpoint}: {exc}") from exc
     except TimeoutError as exc:
         raise LocalProviderError(f"Provider request timed out for {endpoint}.") from exc
+    except OSError as exc:
+        lowered = str(exc).lower()
+        if "timed out" in lowered or "timeout" in lowered:
+            raise LocalProviderError(f"Provider request timed out for {endpoint}.") from exc
+        raise LocalProviderError(f"Provider connection error at {endpoint}: {exc}") from exc
 
     try:
         return json.loads(raw)

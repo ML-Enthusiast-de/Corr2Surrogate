@@ -1,7 +1,9 @@
 from corr2surrogate.orchestration.agent_loop import AgentTurnEvent, AgentAction
 from corr2surrogate.orchestration.local_provider import (
     LocalLLMResponder,
+    LocalProviderError,
     LocalResponderConfig,
+    _http_post_json,
     _parse_action_payload,
 )
 
@@ -143,3 +145,19 @@ def test_local_responder_openai_includes_bearer_header(monkeypatch) -> None:
     assert output["action"] == "respond"
     assert output["message"] == "api-ok"
     assert captured["headers"].get("Authorization") == "Bearer dummy-token"
+
+
+def test_http_post_json_wraps_oserror_timeout(monkeypatch) -> None:
+    def _raise_timeout(*_args, **_kwargs):
+        raise OSError("timed out")
+
+    monkeypatch.setattr("corr2surrogate.orchestration.local_provider.urlopen", _raise_timeout)
+    try:
+        _http_post_json(
+            "http://127.0.0.1:8000/v1/chat/completions",
+            {"x": 1},
+            timeout_seconds=1,
+        )
+        assert False, "expected LocalProviderError"
+    except LocalProviderError as exc:
+        assert "timed out" in str(exc).lower()

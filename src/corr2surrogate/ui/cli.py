@@ -2237,12 +2237,15 @@ def _execute_modeler_build_request(
     for line in inference_suggestions.get("lines", []):
         print(f"agent> {line}")
     if chat_reply_only is not None:
-        interpretation = _generate_modeling_interpretation(
-            training=training,
-            target_signal=target,
-            requested_model_family=current_requested_model,
-            chat_reply_only=chat_reply_only,
-        )
+        try:
+            interpretation = _generate_modeling_interpretation(
+                training=training,
+                target_signal=target,
+                requested_model_family=current_requested_model,
+                chat_reply_only=chat_reply_only,
+            )
+        except Exception:
+            interpretation = ""
         if interpretation:
             print("agent> LLM interpretation:")
             for line in interpretation.splitlines():
@@ -3492,12 +3495,12 @@ def _generate_analysis_interpretation(
     chat_reply_only: Callable[[str], str],
 ) -> str:
     primary_prompt = _build_analysis_interpretation_prompt(analysis)
-    primary = chat_reply_only(primary_prompt).strip()
+    primary = _safe_chat_reply(chat_reply_only=chat_reply_only, prompt=primary_prompt)
     if primary and not _looks_like_llm_failure_message(primary):
         return primary
 
     compact_prompt = _build_compact_analysis_interpretation_prompt(analysis)
-    compact = chat_reply_only(compact_prompt).strip()
+    compact = _safe_chat_reply(chat_reply_only=chat_reply_only, prompt=compact_prompt)
     if compact and not _looks_like_llm_failure_message(compact):
         return compact
     return ""
@@ -3515,7 +3518,7 @@ def _generate_modeling_interpretation(
         target_signal=target_signal,
         requested_model_family=requested_model_family,
     )
-    primary = chat_reply_only(prompt).strip()
+    primary = _safe_chat_reply(chat_reply_only=chat_reply_only, prompt=prompt)
     if primary and not _looks_like_llm_failure_message(primary):
         return primary
     compact = (
@@ -3526,10 +3529,17 @@ def _generate_modeling_interpretation(
         "4) what to try next.\n"
         f"SUMMARY={dumps_json(_compact_modeling_summary(training, target_signal, requested_model_family), ensure_ascii=False)}"
     )
-    secondary = chat_reply_only(compact).strip()
+    secondary = _safe_chat_reply(chat_reply_only=chat_reply_only, prompt=compact)
     if secondary and not _looks_like_llm_failure_message(secondary):
         return secondary
     return ""
+
+
+def _safe_chat_reply(*, chat_reply_only: Callable[[str], str], prompt: str) -> str:
+    try:
+        return chat_reply_only(prompt).strip()
+    except Exception:
+        return ""
 
 
 def _build_modeling_interpretation_prompt(
@@ -5001,9 +5011,13 @@ def _is_provider_connection_error(error: Exception) -> bool:
     lowered = str(error).lower()
     markers = (
         "provider connection error",
+        "provider request timed out",
         "connection refused",
         "winerror 10061",
+        "winerror 10060",
         "failed to establish a new connection",
+        "timed out",
+        "timeout",
     )
     return any(marker in lowered for marker in markers)
 

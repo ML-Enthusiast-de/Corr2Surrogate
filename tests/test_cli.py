@@ -6,6 +6,9 @@ from corr2surrogate.ui.cli import (
     _build_analysis_interpretation_prompt,
     _extract_top3_correlations_global,
     _format_top3_correlations_line,
+    _generate_analysis_interpretation,
+    _generate_modeling_interpretation,
+    _is_provider_connection_error,
     _interpretation_mentions_top3,
     _suggest_default_analysis_targets,
     main,
@@ -3458,3 +3461,38 @@ def test_cli_modeler_handoff_trains_fraud_classifier(
     assert "Model build complete:" in output
     assert "test_recall=" in output
     assert "test_pr_auc=" in output
+
+
+def test_generate_modeling_interpretation_handles_chat_timeout() -> None:
+    def _raise_timeout(_prompt: str) -> str:
+        raise TimeoutError("timed out")
+
+    result = _generate_modeling_interpretation(
+        training={
+            "selected_model_family": "linear_ridge",
+            "best_validation_model_family": "linear_ridge",
+            "selected_metrics": {"test": {"r2": 0.9}},
+            "split": {},
+            "preprocessing": {},
+        },
+        target_signal="target",
+        requested_model_family="linear_ridge",
+        chat_reply_only=_raise_timeout,
+    )
+    assert result == ""
+
+
+def test_generate_analysis_interpretation_handles_chat_timeout() -> None:
+    def _raise_timeout(_prompt: str) -> str:
+        raise TimeoutError("timed out")
+
+    result = _generate_analysis_interpretation(
+        analysis={"status": "ok"},
+        chat_reply_only=_raise_timeout,
+    )
+    assert result == ""
+
+
+def test_is_provider_connection_error_detects_timeout_markers() -> None:
+    assert _is_provider_connection_error(TimeoutError("timed out")) is True
+    assert _is_provider_connection_error(RuntimeError("provider request timed out")) is True
