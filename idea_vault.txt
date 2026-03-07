@@ -1,0 +1,3 @@
+1. Corr2Surrogate should be called by another LLM and make use of the inputs without sacrificing implemented steps.
+OpenClaw support?
+2. At any step user/outside agent should be able to go to any step in the process like starting over 
