@@ -2,3 +2,5 @@
 OpenClaw support?
 2. At any step user/outside agent should be able to go to any step in the process like starting over 
 3. Added intell layer and compute budget. How do we make sure it runs/dependencies
+4. Data sec. top priority. dont manipulate original data
+5. Add noise to the process to boost exploration?
