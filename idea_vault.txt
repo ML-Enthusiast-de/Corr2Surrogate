@@ -4,3 +4,5 @@ OpenClaw support?
 3. Added intell layer and compute budget. How do we make sure it runs/dependencies
 4. Data sec. top priority. dont manipulate original data
 5. Add noise to the process to boost exploration?
+6. definition of local: pc, gpu, cluster - and how to make best use of abailable power
+7. slicing project, what is mvp, what needs to be in 1st demo? 
