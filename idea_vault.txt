@@ -6,3 +6,4 @@ OpenClaw support?
 5. Add noise to the process to boost exploration?
 6. definition of local: pc, gpu, cluster - and how to make best use of abailable power
 7. slicing project, what is mvp, what needs to be in 1st demo? 
+8. learn from experience/new frontier architecture?
