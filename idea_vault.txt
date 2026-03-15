@@ -7,3 +7,4 @@ OpenClaw support?
 6. definition of local: pc, gpu, cluster - and how to make best use of abailable power
 7. slicing project, what is mvp, what needs to be in 1st demo? 
 8. learn from experience/new frontier architecture?
+9. when suggesting new experiments focus on max imp/effort and if you assume its a physicsl system then stay within known gradients for new trajectories
