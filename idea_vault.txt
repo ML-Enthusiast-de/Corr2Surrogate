@@ -10,3 +10,4 @@ OpenClaw support?
 9. when suggesting new experiments focus on max imp/effort and if you assume its a physicsl system then stay within known gradients for new trajectories
 10. need to push updates from relaytic
 11. relaytic paper: compare modes (guided vs fully autonomous)
+12. support agent stores
